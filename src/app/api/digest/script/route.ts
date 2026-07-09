@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
 import { writePodcastScript } from "@/lib/brain";
+import { checkUsage } from "@/lib/limits";
 import { apiError } from "@/lib/errors";
 
 export const maxDuration = 300;
@@ -27,12 +28,21 @@ export async function POST(req: NextRequest) {
     if (!episode?.markdown_path) {
       return NextResponse.json({ error: "Episode not found" }, { status: 404 });
     }
+    // Only an unfinished draft is resumable — a 'ready' episode's script is
+    // never cleared, so without this a replayed/late call would silently
+    // re-run (and re-bill) script generation against a finished brief.
+    if (episode.status !== "draft") {
+      return apiError("Digest script error", "episode not draft", "Episode is not resumable", 409);
+    }
 
     const { data: mdFile, error: dlErr } = await db()
       .storage.from("episodes")
       .download(episode.markdown_path);
     if (dlErr || !mdFile) throw new Error(`Markdown download failed: ${dlErr?.message}`);
     const markdown = await mdFile.text();
+
+    // Gate right before the paid Grok call, after the free DB/storage reads above.
+    await checkUsage(userId, "digest_script");
 
     const script = await writePodcastScript(
       markdown,
