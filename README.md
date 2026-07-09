@@ -199,3 +199,5 @@ Personal tool, built and run by [@im-trustworthy](https://github.com/im-trustwor
 currently private and may be open-sourced later. Unit tests cover the pure library logic
 (`npm test`); route handlers and the pipeline are exercised end-to-end rather than mocked.
 License: TBD — treat as all-rights-reserved until one is added.
+
+Deferred / planned work — and why some of it is blocked upstream — lives in [ROADMAP.md](ROADMAP.md).
