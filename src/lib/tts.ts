@@ -35,17 +35,25 @@ async function renderLine(
 }
 
 /**
- * Renders the dialogue line-by-line with each host's voice and stitches the
- * segments. ElevenLabs returns headerless MPEG audio streams at a fixed
- * format, so direct concatenation produces a valid playable MP3.
+ * Renders dialogue lines with each host's voice and stitches the segments.
+ * ElevenLabs returns headerless MPEG audio streams at a fixed format, so
+ * direct concatenation produces a valid playable MP3. `context` carries the
+ * neighboring lines when rendering a mid-script chunk, for prosody continuity.
  */
 export async function renderPodcast(
   lines: ScriptLine[],
-  onProgress?: (done: number, total: number) => void
+  onProgress?: (done: number, total: number) => void,
+  context: { previousLine?: string; nextLine?: string } = {}
 ): Promise<Buffer> {
   const segments: Buffer[] = [];
   for (let i = 0; i < lines.length; i++) {
-    segments.push(await renderLine(lines[i], lines[i - 1]?.line, lines[i + 1]?.line));
+    segments.push(
+      await renderLine(
+        lines[i],
+        lines[i - 1]?.line ?? context.previousLine,
+        lines[i + 1]?.line ?? context.nextLine
+      )
+    );
     onProgress?.(i + 1, lines.length);
   }
   return Buffer.concat(segments);

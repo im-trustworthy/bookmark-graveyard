@@ -5,14 +5,12 @@ import {
   selectBookmarksForDigest,
   stalenessPass,
   writeMarkdownDigest,
-  writePodcastScript,
 } from "@/lib/brain";
-import { estimateDurationSeconds, renderPodcast } from "@/lib/tts";
 import { signEpisodeUrls } from "@/lib/episodes";
 
-export const maxDuration = 800;
+export const maxDuration = 300;
 
-interface DigestRequest {
+interface PrepareRequest {
   format: "markdown" | "audio" | "both";
   from?: string;
   to?: string;
@@ -21,13 +19,14 @@ interface DigestRequest {
   targetMinutes?: number;
 }
 
+// Stage 1: select -> freshness -> outline -> compose markdown. For markdown-only
+// briefs this completes the episode; for audio the client continues to /script.
 export async function POST(req: NextRequest) {
   const userId = await getSessionUserId();
   if (!userId) return NextResponse.json({ error: "Not logged in" }, { status: 401 });
 
-  const body = (await req.json()) as DigestRequest;
+  const body = (await req.json()) as PrepareRequest;
   const format = ["markdown", "audio", "both"].includes(body.format) ? body.format : "both";
-  const targetMinutes = Math.min(Math.max(body.targetMinutes ?? 20, 5), 30);
 
   try {
     const { included, excludedAsMisleading } = await selectBookmarksForDigest(userId, body);
@@ -45,29 +44,14 @@ export async function POST(req: NextRequest) {
     });
 
     const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-");
-    const base = `${userId}/${stamp}`;
-    const storage = db().storage.from("episodes");
-
-    const markdownPath = `${base}/brief.md`;
-    const { error: mdErr } = await storage.upload(markdownPath, Buffer.from(markdown, "utf8"), {
-      contentType: "text/markdown",
-    });
+    const markdownPath = `${userId}/${stamp}/brief.md`;
+    const { error: mdErr } = await db()
+      .storage.from("episodes")
+      .upload(markdownPath, Buffer.from(markdown, "utf8"), { contentType: "text/markdown" });
     if (mdErr) throw new Error(`Markdown upload failed: ${mdErr.message}`);
 
-    let audioPath: string | null = null;
-    let durationSeconds: number | null = null;
-    if (format !== "markdown") {
-      const script = await writePodcastScript(markdown, targetMinutes);
-      const mp3 = await renderPodcast(script);
-      durationSeconds = estimateDurationSeconds(script);
-      audioPath = `${base}/brief.mp3`;
-      const { error: mp3Err } = await storage.upload(audioPath, mp3, {
-        contentType: "audio/mpeg",
-      });
-      if (mp3Err) throw new Error(`Audio upload failed: ${mp3Err.message}`);
-    }
-
     const dropped = included.filter((b) => verdicts.get(b.tweet_id) === "stale").length;
+    const markdownOnly = format === "markdown";
     const title = `Bookmark Brief — ${new Date().toLocaleDateString("en-US", {
       month: "long",
       day: "numeric",
@@ -80,22 +64,21 @@ export async function POST(req: NextRequest) {
         user_id: userId,
         title,
         format,
+        status: markdownOnly ? "ready" : "draft",
         date_from: body.from ?? null,
         date_to: body.to ?? null,
         topics: body.topics ?? [],
         markdown_path: markdownPath,
-        audio_path: audioPath,
-        duration_seconds: durationSeconds,
         bookmark_count: included.length - dropped,
       })
       .select()
       .single();
     if (epErr) throw new Error(`Episode save failed: ${epErr.message}`);
 
-    const signed = await signEpisodeUrls(episode);
     return NextResponse.json({
-      episode: signed,
+      episode: await signEpisodeUrls(episode),
       markdown,
+      done: markdownOnly,
       stats: {
         considered: included.length,
         droppedAsStale: dropped,
@@ -103,7 +86,7 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (err) {
-    console.error("Digest error:", err);
+    console.error("Digest prepare error:", err);
     const message = err instanceof Error ? err.message : "Digest generation failed";
     return NextResponse.json({ error: message }, { status: 500 });
   }

@@ -62,6 +62,9 @@ export default function Dashboard({
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createStage, setCreateStage] = useState<string | null>(null);
+  const [createProgress, setCreateProgress] = useState<number | null>(null); // 0..1, null = indeterminate
+  const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [result, setResult] = useState<{ episode: Episode; markdown: string; stats: { considered: number; droppedAsStale: number; excludedAsMisleading: number } } | null>(null);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
@@ -141,36 +144,79 @@ export default function Dashboard({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [totalBookmarks]);
 
+  // Ticking clock while a brief is being created, so it never looks frozen
+  useEffect(() => {
+    if (!createStartedAt) return;
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - createStartedAt) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [createStartedAt]);
+
+  async function post(url: string, payload: Record<string, unknown>) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error ?? `${url} failed`);
+    return body;
+  }
+
   async function createBrief() {
     setCreating(true);
     setErrorMessage(null);
     setResult(null);
-    setCreateStage(
-      format === "markdown" ? "Analyzing & writing your brief…" : "Analyzing, writing & recording… (audio takes a few minutes)"
-    );
+    setCreateStartedAt(Date.now());
+    setElapsed(0);
     try {
-      const res = await fetch("/api/digest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          format,
-          from,
-          to,
-          topics: selectedTopics,
-          // Hand-picked posts take precedence over date/topic filters
-          tweetIds: selected.size > 0 ? [...selected] : undefined,
-          targetMinutes: 20,
-        }),
+      // Stage 1: analyze, check freshness, outline, write the markdown brief
+      setCreateStage("Reading your posts & writing the brief…");
+      setCreateProgress(null);
+      const prepared = await post("/api/digest/prepare", {
+        format,
+        from,
+        to,
+        topics: selectedTopics,
+        // Hand-picked posts take precedence over date/topic filters
+        tweetIds: selected.size > 0 ? [...selected] : undefined,
+        targetMinutes: 20,
       });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.error ?? "Generation failed");
-      setResult(body);
+      if (prepared.done) {
+        setResult(prepared);
+        await loadEpisodes();
+        return;
+      }
+      const episodeId = prepared.episode.id;
+
+      // Stage 2: two-host show script
+      setCreateStage("Writing the show script…");
+      const { totalLines } = await post("/api/digest/script", { episodeId, targetMinutes: 20 });
+
+      // Stage 3: render audio in short chunks with real progress
+      let cursor = 0;
+      setCreateProgress(0);
+      while (cursor < totalLines) {
+        setCreateStage(`Recording audio — line ${cursor + 1} of ${totalLines}`);
+        const rendered = await post("/api/digest/render", { episodeId, cursor });
+        cursor = rendered.nextCursor;
+        setCreateProgress(Math.min(cursor / totalLines, 1));
+        if (rendered.done) break;
+      }
+
+      // Stage 4: stitch & publish
+      setCreateStage("Mixing & publishing…");
+      setCreateProgress(null);
+      const finalized = await post("/api/digest/finalize", { episodeId });
+
+      setResult({ ...prepared, episode: finalized.episode, done: true });
       await loadEpisodes();
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Generation failed");
     } finally {
       setCreating(false);
       setCreateStage(null);
+      setCreateProgress(null);
+      setCreateStartedAt(null);
     }
   }
 
@@ -333,11 +379,36 @@ export default function Dashboard({
           className="w-full py-4 rounded-2xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:hover:bg-sky-500 text-white font-semibold text-lg transition"
         >
           {creating
-            ? createStage
+            ? "Creating your brief…"
             : selected.size > 0
               ? `Create my brief (${selected.size} selected)`
               : `Create my brief (all ${bookmarks.length} shown)`}
         </button>
+        {creating && (
+          <div className="rounded-2xl border border-zinc-800 p-4 space-y-3 -mt-4">
+            <div className="flex items-center justify-between text-sm">
+              <span className="text-zinc-300">{createStage}</span>
+              <span className="text-zinc-600 tabular-nums">
+                {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
+              </span>
+            </div>
+            <div className="h-2 rounded-full bg-zinc-800 overflow-hidden">
+              {createProgress === null ? (
+                <div className="h-full w-1/3 rounded-full bg-sky-500/80 animate-[slide_1.4s_ease-in-out_infinite]" />
+              ) : (
+                <div
+                  className="h-full rounded-full bg-sky-500 transition-[width] duration-500"
+                  style={{ width: `${Math.round(createProgress * 100)}%` }}
+                />
+              )}
+            </div>
+            {createProgress !== null && (
+              <p className="text-xs text-zinc-600 text-right tabular-nums">
+                {Math.round(createProgress * 100)}%
+              </p>
+            )}
+          </div>
+        )}
         {selected.size > 0 && !creating && (
           <p className="text-xs text-zinc-500 -mt-4 text-center">
             Using only your hand-picked posts.{" "}
