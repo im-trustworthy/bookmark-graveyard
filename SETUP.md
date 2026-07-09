@@ -32,6 +32,11 @@ The project `bookmark-brief` is already created with the full schema.
 2. Paste it into `.env.local` as `XAI_API_KEY`.
 3. Your existing credits cover this; a full sync + weekly digest is typically well under $1.
 
+The app uses a two-tier model blend for token efficiency (overridable in `.env.local`):
+- `XAI_MODEL_FAST` (default `grok-4.20-0309-non-reasoning`) — per-post categorization,
+  image reading (vision), staleness checks
+- `XAI_MODEL_SMART` (default `grok-4.5`) — digest outline, composition, and podcast script
+
 ## 4. ElevenLabs (5 min)
 
 1. Go to https://elevenlabs.io → your profile → **API Keys** → create a key.

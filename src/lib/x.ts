@@ -127,6 +127,13 @@ export async function fetchMe(accessToken: string): Promise<XUser> {
   return (await res.json()).data;
 }
 
+export interface ReferencedTweet {
+  type: string;
+  id: string;
+  text: string | null;
+  author_handle: string | null;
+}
+
 export interface BookmarkedTweet {
   tweet_id: string;
   author_handle: string | null;
@@ -136,6 +143,7 @@ export interface BookmarkedTweet {
   public_metrics: unknown;
   entities: unknown;
   media: unknown;
+  referenced: ReferencedTweet[];
   raw: unknown;
 }
 
@@ -155,9 +163,9 @@ export async function fetchAllBookmarks(
     const params = new URLSearchParams({
       max_results: "100",
       "tweet.fields": "created_at,text,note_tweet,public_metrics,entities,attachments,author_id",
-      expansions: "author_id,attachments.media_keys",
+      expansions: "author_id,attachments.media_keys,referenced_tweets.id,referenced_tweets.id.author_id",
       "user.fields": "username,name",
-      "media.fields": "type,url,preview_image_url,alt_text",
+      "media.fields": "type,url,preview_image_url,alt_text,variants,duration_ms",
     });
     if (nextToken) params.set("pagination_token", nextToken);
 
@@ -186,10 +194,25 @@ export async function fetchAllBookmarks(
     const mediaByKey = new Map<string, unknown>(
       (body.includes?.media ?? []).map((m: { media_key: string }) => [m.media_key, m])
     );
+    const includedTweets = new Map<
+      string,
+      { text?: string; note_tweet?: { text: string }; author_id?: string; entities?: unknown }
+    >((body.includes?.tweets ?? []).map((t: { id: string }) => [t.id, t]));
 
     for (const tweet of body.data ?? []) {
       const author = users.get(tweet.author_id);
       const mediaKeys: string[] = tweet.attachments?.media_keys ?? [];
+      const referenced: ReferencedTweet[] = (tweet.referenced_tweets ?? []).map(
+        (ref: { type: string; id: string }) => {
+          const full = includedTweets.get(ref.id);
+          return {
+            type: ref.type,
+            id: ref.id,
+            text: full?.note_tweet?.text ?? full?.text ?? null,
+            author_handle: full?.author_id ? (users.get(full.author_id)?.username ?? null) : null,
+          };
+        }
+      );
       results.push({
         tweet_id: tweet.id,
         author_handle: author?.username ?? null,
@@ -200,7 +223,8 @@ export async function fetchAllBookmarks(
         public_metrics: tweet.public_metrics ?? null,
         entities: tweet.entities ?? null,
         media: mediaKeys.map((k) => mediaByKey.get(k)).filter(Boolean),
-        raw: tweet,
+        referenced,
+        raw: { ...tweet, _includes_tweets: referenced.map((r) => r.id) },
       });
     }
 

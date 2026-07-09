@@ -108,22 +108,24 @@ export default function Dashboard({
       if (!res.ok) throw new Error(body.error ?? "Sync failed");
       await loadBookmarks();
 
-      // Then analyze in short chunks; topic tags fill in as each chunk lands.
+      // Then ingest sources + analyze in short chunks; tags fill in as chunks land.
       let pending: number = body.pendingAnalysis ?? 0;
       const toAnalyze = pending;
       while (pending > 0) {
-        setSyncStage(`Analyzing topics… ${toAnalyze - pending} of ${toAnalyze} done`);
+        setSyncStage(
+          `Reading linked articles & media, analyzing topics… ${toAnalyze - pending} of ${toAnalyze} done`
+        );
         const enrichRes = await fetch("/api/enrich", { method: "POST" });
         const enrichBody = await enrichRes.json();
         if (!enrichRes.ok) throw new Error(enrichBody.error ?? "Analysis failed");
-        if (!enrichBody.enriched && enrichBody.remaining > 0) {
+        if (!enrichBody.enriched && !enrichBody.ingested && enrichBody.remaining > 0) {
           throw new Error(`Analysis stalled with ${enrichBody.remaining} bookmarks left — try again`);
         }
         pending = enrichBody.remaining;
         await loadBookmarks();
       }
       setSyncMessage(
-        `Synced ${body.fetched} bookmarks (${body.new} new${toAnalyze ? `, ${toAnalyze} analyzed` : ""}).`
+        `Synced ${body.fetched} bookmarks (${body.new} new${toAnalyze ? `, ${toAnalyze} analyzed with sources` : ""}).`
       );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Sync failed");
