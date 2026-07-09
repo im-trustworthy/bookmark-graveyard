@@ -17,6 +17,7 @@ interface DigestRequest {
   from?: string;
   to?: string;
   topics?: string[];
+  tweetIds?: string[];
   targetMinutes?: number;
 }
 

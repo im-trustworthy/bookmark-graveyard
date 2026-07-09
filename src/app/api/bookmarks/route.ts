@@ -10,24 +10,25 @@ export async function GET(req: NextRequest) {
   const to = req.nextUrl.searchParams.get("to");
   const topics = req.nextUrl.searchParams.get("topics")?.split(",").filter(Boolean) ?? [];
 
-  let query = db()
+  const { data, error } = await db()
     .from("bookmarks")
     .select(
       "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, bookmark_analysis(topics, summary, content_type, credibility)"
     )
     .eq("user_id", userId)
-    .order("first_seen_at", { ascending: false })
+    .eq("hidden", false)
+    .order("tweet_created_at", { ascending: false, nullsFirst: false })
     .limit(1000);
-
-  if (from) query = query.gte("first_seen_at", from);
-  if (to) query = query.lte("first_seen_at", `${to}T23:59:59Z`);
-
-  const { data, error } = await query;
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
-  // Topic filter applies to the joined analysis row (done here: PostgREST can't
-  // filter parent rows by child array overlap without an RPC).
+  // Date range + topic filters applied here: dates use the post's date (what the
+  // UI displays), keeping posts with no date; topics live on the joined analysis row.
+  const toBound = to ? `${to}T23:59:59Z` : null;
   const rows = (data ?? []).filter((b) => {
+    if (b.tweet_created_at) {
+      if (from && b.tweet_created_at < from) return false;
+      if (toBound && b.tweet_created_at > toBound) return false;
+    }
     if (topics.length === 0) return true;
     const analysis = Array.isArray(b.bookmark_analysis)
       ? b.bookmark_analysis[0]
