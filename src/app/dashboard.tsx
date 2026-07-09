@@ -32,6 +32,27 @@ interface Episode {
   audio_url: string | null;
 }
 
+type ResumableStage = "needs_script" | "rendering" | "needs_finalize";
+
+interface ResumableDraft {
+  episodeId: string;
+  stage: ResumableStage;
+  totalLines: number;
+  nextCursor: number;
+  title?: string;
+  createdAt?: string;
+}
+
+interface DigestStatusResponse {
+  episodeId: string | null;
+  stage: ResumableStage | "ready" | "none";
+  totalLines: number;
+  nextCursor: number;
+  markdownReady: boolean;
+  title?: string;
+  createdAt?: string;
+}
+
 function analysisOf(b: Bookmark): Analysis | null {
   if (!b.bookmark_analysis) return null;
   return Array.isArray(b.bookmark_analysis) ? (b.bookmark_analysis[0] ?? null) : b.bookmark_analysis;
@@ -66,8 +87,14 @@ export default function Dashboard({
   const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [result, setResult] = useState<{ episode: Episode; markdown: string; stats: { considered: number; droppedAsStale: number; excludedAsMisleading: number } } | null>(null);
+  const [result, setResult] = useState<{
+    episode: Episode;
+    markdown?: string;
+    stats?: { considered: number; droppedAsStale: number; excludedAsMisleading: number };
+  } | null>(null);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
+  const [resumable, setResumable] = useState<ResumableDraft | null>(null);
+  const [discarding, setDiscarding] = useState(false);
 
   const loadBookmarks = useCallback(async () => {
     setLoading(true);
@@ -91,6 +118,30 @@ export default function Dashboard({
     if (res.ok) setEpisodes((await res.json()).episodes ?? []);
   }, []);
 
+  // Checks for an interrupted brief generation (refresh, network blip, TTS
+  // hiccup) so it can be offered back as "Resume" instead of silently lost.
+  const checkResumable = useCallback(async () => {
+    try {
+      const res = await fetch("/api/digest/status");
+      if (!res.ok) return;
+      const body = (await res.json()) as DigestStatusResponse;
+      if (body.episodeId && (body.stage === "needs_script" || body.stage === "rendering" || body.stage === "needs_finalize")) {
+        setResumable({
+          episodeId: body.episodeId,
+          stage: body.stage,
+          totalLines: body.totalLines,
+          nextCursor: body.nextCursor,
+          title: body.title,
+          createdAt: body.createdAt,
+        });
+      } else {
+        setResumable(null);
+      }
+    } catch {
+      // Best-effort: the resume banner is a convenience, not the critical path.
+    }
+  }, []);
+
   useEffect(() => {
     loadBookmarks();
   }, [loadBookmarks]);
@@ -98,6 +149,10 @@ export default function Dashboard({
   useEffect(() => {
     loadEpisodes();
   }, [loadEpisodes]);
+
+  useEffect(() => {
+    checkResumable();
+  }, [checkResumable]);
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -162,12 +217,59 @@ export default function Dashboard({
     return body;
   }
 
+  // Stages 2-4 (script -> render loop -> finalize), shared by a fresh
+  // generation and a resumed one. `cursor`/`skipScript` let a resume jump in
+  // partway: skipScript reuses an already-written script, and the render
+  // loop's own `while (cursor < totalLines)` guard means a cursor that's
+  // already at totalLines (the needs_finalize case) just falls through
+  // straight to finalize with no branching required.
+  async function runAudioStages(
+    episodeId: string,
+    opts: { skipScript?: boolean; totalLines?: number; cursor?: number } = {}
+  ) {
+    let totalLines = opts.totalLines ?? 0;
+    if (!opts.skipScript) {
+      setCreateStage("Writing the show script…");
+      setCreateProgress(null);
+      const scripted = await post("/api/digest/script", { episodeId, targetMinutes: 20 });
+      totalLines = scripted.totalLines;
+    }
+
+    let cursor = opts.cursor ?? 0;
+    setCreateProgress(totalLines > 0 ? Math.min(cursor / totalLines, 1) : 0);
+    while (cursor < totalLines) {
+      setCreateStage(`Recording audio — line ${cursor + 1} of ${totalLines}`);
+      const rendered = await post("/api/digest/render", { episodeId, cursor });
+      cursor = rendered.nextCursor;
+      setCreateProgress(Math.min(cursor / totalLines, 1));
+      if (rendered.done) break;
+    }
+
+    setCreateStage("Mixing & publishing…");
+    setCreateProgress(null);
+    return post("/api/digest/finalize", { episodeId });
+  }
+
+  // On any stage failure the draft row is left in place on purpose (nothing
+  // here deletes it) so it's resumable — the error message says so whenever
+  // we got far enough to have a draft, and refreshes the banner immediately.
+  function reportCreateError(err: unknown, episodeId: string | undefined) {
+    const base = err instanceof Error ? err.message : "Generation failed";
+    setErrorMessage(
+      episodeId
+        ? `${base} — this brief is saved as a draft, so you can resume it instead of starting over.`
+        : base
+    );
+    if (episodeId) checkResumable();
+  }
+
   async function createBrief() {
     setCreating(true);
     setErrorMessage(null);
     setResult(null);
     setCreateStartedAt(Date.now());
     setElapsed(0);
+    let episodeId: string | undefined;
     try {
       // Stage 1: analyze, check freshness, outline, write the markdown brief
       setCreateStage("Reading your posts & writing the brief…");
@@ -186,37 +288,63 @@ export default function Dashboard({
         await loadEpisodes();
         return;
       }
-      const episodeId = prepared.episode.id;
+      episodeId = prepared.episode.id as string;
+      setResumable(null); // starting fresh supersedes any stale resumable draft
 
-      // Stage 2: two-host show script
-      setCreateStage("Writing the show script…");
-      const { totalLines } = await post("/api/digest/script", { episodeId, targetMinutes: 20 });
-
-      // Stage 3: render audio in short chunks with real progress
-      let cursor = 0;
-      setCreateProgress(0);
-      while (cursor < totalLines) {
-        setCreateStage(`Recording audio — line ${cursor + 1} of ${totalLines}`);
-        const rendered = await post("/api/digest/render", { episodeId, cursor });
-        cursor = rendered.nextCursor;
-        setCreateProgress(Math.min(cursor / totalLines, 1));
-        if (rendered.done) break;
-      }
-
-      // Stage 4: stitch & publish
-      setCreateStage("Mixing & publishing…");
-      setCreateProgress(null);
-      const finalized = await post("/api/digest/finalize", { episodeId });
-
-      setResult({ ...prepared, episode: finalized.episode, done: true });
+      const finalized = await runAudioStages(episodeId);
+      setResult({ episode: finalized.episode, markdown: prepared.markdown, stats: prepared.stats });
       await loadEpisodes();
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Generation failed");
+      reportCreateError(err, episodeId);
     } finally {
       setCreating(false);
       setCreateStage(null);
       setCreateProgress(null);
       setCreateStartedAt(null);
+    }
+  }
+
+  async function resumeBrief() {
+    if (!resumable) return;
+    const { episodeId, stage, totalLines, nextCursor } = resumable;
+    setCreating(true);
+    setErrorMessage(null);
+    setResult(null);
+    setCreateStartedAt(Date.now());
+    setElapsed(0);
+    try {
+      const finalized = await runAudioStages(episodeId, {
+        skipScript: stage !== "needs_script",
+        totalLines,
+        cursor: nextCursor,
+      });
+      setResult({ episode: finalized.episode });
+      setResumable(null);
+      await loadEpisodes();
+    } catch (err) {
+      reportCreateError(err, episodeId);
+    } finally {
+      setCreating(false);
+      setCreateStage(null);
+      setCreateProgress(null);
+      setCreateStartedAt(null);
+    }
+  }
+
+  async function discardResumable() {
+    if (!resumable) return;
+    setDiscarding(true);
+    try {
+      const res = await fetch(`/api/digest/status?episodeId=${resumable.episodeId}`, { method: "DELETE" });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.error ?? "Couldn't discard draft");
+      }
+      setResumable(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : "Couldn't discard draft");
+    } finally {
+      setDiscarding(false);
     }
   }
 
@@ -302,6 +430,34 @@ export default function Dashboard({
         )}
         {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
         {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
+
+        {/* Resumable draft banner */}
+        {resumable && !creating && (
+          <section className="rounded-2xl border border-amber-800/60 bg-amber-950/20 p-4 flex items-center justify-between gap-3 flex-wrap">
+            <p className="text-sm text-amber-200">
+              A brief from{" "}
+              {resumable.createdAt
+                ? new Date(resumable.createdAt).toLocaleDateString("en-US", { month: "long", day: "numeric" })
+                : "earlier"}{" "}
+              stopped partway.
+            </p>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                onClick={resumeBrief}
+                className="text-sm px-4 py-1.5 rounded-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-medium transition"
+              >
+                Resume
+              </button>
+              <button
+                onClick={discardResumable}
+                disabled={discarding}
+                className="text-sm px-4 py-1.5 rounded-full border border-amber-800/60 text-amber-200 hover:border-amber-600 disabled:opacity-50 transition"
+              >
+                {discarding ? "Discarding…" : "Discard"}
+              </button>
+            </div>
+          </section>
+        )}
 
         {/* Format picker */}
         <section className="space-y-2">
@@ -422,13 +578,15 @@ export default function Dashboard({
         {result && (
           <section className="rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5 space-y-4">
             <h2 className="font-semibold">{result.episode.title}</h2>
-            <p className="text-sm text-zinc-400">
-              {result.stats.considered} bookmarks considered
-              {result.stats.droppedAsStale > 0 && `, ${result.stats.droppedAsStale} dropped as stale`}
-              {result.stats.excludedAsMisleading > 0 &&
-                `, ${result.stats.excludedAsMisleading} excluded per Community Notes`}
-              .
-            </p>
+            {result.stats && (
+              <p className="text-sm text-zinc-400">
+                {result.stats.considered} bookmarks considered
+                {result.stats.droppedAsStale > 0 && `, ${result.stats.droppedAsStale} dropped as stale`}
+                {result.stats.excludedAsMisleading > 0 &&
+                  `, ${result.stats.excludedAsMisleading} excluded per Community Notes`}
+                .
+              </p>
+            )}
             {result.episode.audio_url && (
               <audio controls src={result.episode.audio_url} className="w-full" />
             )}
@@ -452,12 +610,14 @@ export default function Dashboard({
                 </a>
               )}
             </div>
-            <details>
-              <summary className="text-sm text-zinc-400 cursor-pointer">Preview markdown</summary>
-              <pre className="mt-3 text-xs text-zinc-300 whitespace-pre-wrap max-h-96 overflow-y-auto">
-                {result.markdown}
-              </pre>
-            </details>
+            {result.markdown && (
+              <details>
+                <summary className="text-sm text-zinc-400 cursor-pointer">Preview markdown</summary>
+                <pre className="mt-3 text-xs text-zinc-300 whitespace-pre-wrap max-h-96 overflow-y-auto">
+                  {result.markdown}
+                </pre>
+              </details>
+            )}
           </section>
         )}
 
