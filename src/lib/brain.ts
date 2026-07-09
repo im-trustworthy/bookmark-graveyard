@@ -37,17 +37,25 @@ interface EnrichmentResult {
   }[];
 }
 
-/** Enriches bookmarks that have no analysis row yet. Returns count enriched. */
-export async function enrichNewBookmarks(userId: string): Promise<number> {
+/**
+ * Enriches bookmarks that have no analysis row yet, up to `limit` per call so
+ * HTTP requests stay short — the client loops until `remaining` hits zero.
+ * Batches of 20 posts per Grok call, 3 calls in flight at a time.
+ */
+export async function enrichNewBookmarks(
+  userId: string,
+  limit = Infinity
+): Promise<{ enriched: number; remaining: number }> {
   const { data: pending } = await db()
     .from("bookmarks")
     .select("tweet_id, author_handle, text, tweet_created_at, bookmark_analysis(tweet_id)")
     .eq("user_id", userId);
-  const todo = (pending ?? []).filter((b) => {
+  const allTodo = (pending ?? []).filter((b) => {
     const a = b.bookmark_analysis;
     return !a || (Array.isArray(a) && a.length === 0);
   });
-  if (todo.length === 0) return 0;
+  const todo = allTodo.slice(0, limit);
+  if (todo.length === 0) return { enriched: 0, remaining: 0 };
 
   const { data: topicRows } = await db().from("topics").select("name").eq("user_id", userId);
   let taxonomy = (topicRows ?? []).map((t) => t.name);
@@ -68,9 +76,11 @@ export async function enrichNewBookmarks(userId: string): Promise<number> {
     return misleading ? "misleading" : "disputed";
   };
 
+  const batches: (typeof todo)[] = [];
+  for (let i = 0; i < todo.length; i += 20) batches.push(todo.slice(i, i + 20));
+
   let enriched = 0;
-  for (let i = 0; i < todo.length; i += 20) {
-    const batch = todo.slice(i, i + 20);
+  const processBatch = async (batch: typeof todo) => {
     const result = await grokJson<EnrichmentResult>(
       `You analyze a user's bookmarked X (Twitter) posts for a personal digest app.
 For each post return: topics (1-3 tags), a one-sentence summary, key factual claims (0-3),
@@ -93,7 +103,7 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
     const valid = (result.items ?? []).filter((item) =>
       batch.some((b) => b.tweet_id === item.tweet_id)
     );
-    if (valid.length === 0) continue;
+    if (valid.length === 0) return;
 
     const { error } = await db()
       .from("bookmark_analysis")
@@ -122,8 +132,23 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
         .upsert(newTopics.map((name) => ({ user_id: userId, name })));
       taxonomy = [...taxonomy, ...newTopics];
     }
-  }
-  return enriched;
+  };
+
+  // Concurrency pool of 3 Grok calls; a failed batch stays pending for the next pass.
+  const queue = [...batches];
+  await Promise.all(
+    Array.from({ length: Math.min(3, queue.length) }, async () => {
+      for (let batch = queue.shift(); batch; batch = queue.shift()) {
+        try {
+          await processBatch(batch);
+        } catch (err) {
+          console.error("Enrichment batch failed:", err);
+        }
+      }
+    })
+  );
+
+  return { enriched, remaining: allTodo.length - enriched };
 }
 
 // ---------------------------------------------------------------------------

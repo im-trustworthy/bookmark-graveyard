@@ -149,6 +149,7 @@ export async function fetchAllBookmarks(
 ): Promise<BookmarkedTweet[]> {
   const results: BookmarkedTweet[] = [];
   let nextToken: string | undefined;
+  let rateLimitWaits = 0;
 
   for (let page = 0; page < 10; page++) {
     const params = new URLSearchParams({
@@ -164,8 +165,10 @@ export async function fetchAllBookmarks(
       headers: { Authorization: `Bearer ${accessToken}` },
     });
     if (res.status === 429) {
+      // Bounded backoff: keep a partial sync rather than hanging the request.
+      if (++rateLimitWaits > 2) break;
       const reset = Number(res.headers.get("x-rate-limit-reset")) * 1000;
-      const waitMs = Math.min(Math.max(reset - Date.now(), 1000), 60_000);
+      const waitMs = Math.min(Math.max(reset - Date.now(), 1000), 30_000);
       await new Promise((r) => setTimeout(r, waitMs));
       page--;
       continue;

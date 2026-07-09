@@ -54,8 +54,10 @@ export default function Dashboard({
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [allTopics, setAllTopics] = useState<string[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
+  const [totalBookmarks, setTotalBookmarks] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
+  const [syncStage, setSyncStage] = useState<string | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createStage, setCreateStage] = useState<string | null>(null);
@@ -68,12 +70,16 @@ export default function Dashboard({
     const params = new URLSearchParams({ from, to });
     if (selectedTopics.length > 0) params.set("topics", selectedTopics.join(","));
     const res = await fetch(`/api/bookmarks?${params}`);
+    let total = null;
     if (res.ok) {
       const body = await res.json();
       setBookmarks(body.bookmarks ?? []);
       setAllTopics(body.allTopics ?? []);
+      total = body.total ?? 0;
+      setTotalBookmarks(total);
     }
     setLoading(false);
+    return total;
   }, [from, to, selectedTopics]);
 
   const loadEpisodes = useCallback(async () => {
@@ -89,25 +95,48 @@ export default function Dashboard({
     loadEpisodes();
   }, [loadEpisodes]);
 
-  async function sync() {
+  const sync = useCallback(async () => {
     setSyncing(true);
     setSyncMessage(null);
     setErrorMessage(null);
     try {
+      // Fast: fetch from X + store. Bookmarks appear immediately.
+      setSyncStage("Pulling bookmarks from X…");
       const res = await fetch("/api/sync", { method: "POST" });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Sync failed");
-      setSyncMessage(
-        `Synced ${body.fetched} bookmarks (${body.new} new${body.enriched ? `, ${body.enriched} analyzed` : ""}).` +
-          (body.enrichError ? ` Analysis skipped: ${body.enrichError}` : "")
-      );
       await loadBookmarks();
+
+      // Then analyze in short chunks; topic tags fill in as each chunk lands.
+      let pending: number = body.pendingAnalysis ?? 0;
+      const toAnalyze = pending;
+      while (pending > 0) {
+        setSyncStage(`Analyzing topics… ${toAnalyze - pending} of ${toAnalyze} done`);
+        const enrichRes = await fetch("/api/enrich", { method: "POST" });
+        const enrichBody = await enrichRes.json();
+        if (!enrichRes.ok) throw new Error(enrichBody.error ?? "Analysis failed");
+        if (!enrichBody.enriched && enrichBody.remaining > 0) {
+          throw new Error(`Analysis stalled with ${enrichBody.remaining} bookmarks left — try again`);
+        }
+        pending = enrichBody.remaining;
+        await loadBookmarks();
+      }
+      setSyncMessage(
+        `Synced ${body.fetched} bookmarks (${body.new} new${toAnalyze ? `, ${toAnalyze} analyzed` : ""}).`
+      );
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Sync failed");
     } finally {
       setSyncing(false);
+      setSyncStage(null);
     }
-  }
+  }, [loadBookmarks]);
+
+  // First visit: pull bookmarks automatically instead of waiting for a click.
+  useEffect(() => {
+    if (totalBookmarks === 0 && !syncing) sync();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [totalBookmarks]);
 
   async function createBrief() {
     setCreating(true);
@@ -171,7 +200,7 @@ export default function Dashboard({
               disabled={syncing}
               className="text-sm px-4 py-2 rounded-full border border-zinc-700 hover:border-zinc-500 disabled:opacity-50 transition"
             >
-              {syncing ? "Syncing…" : "Sync bookmarks"}
+              {syncing ? "Syncing…" : "Re-sync"}
             </button>
             <form action="/api/auth/logout" method="post">
               <button className="text-sm px-4 py-2 rounded-full text-zinc-500 hover:text-zinc-300 transition">
@@ -181,6 +210,12 @@ export default function Dashboard({
           </div>
         </header>
 
+        {syncStage && (
+          <p className="text-sm text-sky-400 flex items-center gap-2">
+            <span className="inline-block w-3 h-3 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
+            {syncStage}
+          </p>
+        )}
         {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
         {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
 
@@ -314,7 +349,9 @@ export default function Dashboard({
           </h2>
           {!loading && bookmarks.length === 0 && (
             <p className="text-sm text-zinc-500">
-              Nothing in this range yet — hit “Sync bookmarks” or widen the dates.
+              {syncing
+                ? "Pulling your bookmarks from X — they'll appear here in a few seconds…"
+                : "Nothing in this range — widen the dates or hit Re-sync."}
             </p>
           )}
           <ul className="space-y-3">
