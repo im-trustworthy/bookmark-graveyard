@@ -4,14 +4,36 @@ import { db } from "@/lib/supabase";
 import { setSession } from "@/lib/session";
 import { exchangeCode, fetchMe, storeTokens } from "@/lib/x";
 
+// Fixed, closed set of redirect codes — never build this from a caught error's
+// message or any request-derived value, so nothing sensitive can leak into a URL
+// that ends up in browser history / referrer headers / server access logs.
+type AuthErrorCode = "auth_failed" | "not_allowed";
+
+function authErrorRedirect(code: AuthErrorCode): NextResponse {
+  const res = NextResponse.redirect(`${appUrl()}/?error=${code}`);
+  // Clear the one-shot PKCE cookies on every exit path, not just success — see the
+  // state-comparison note below for why that matters beyond plain cleanliness.
+  res.cookies.delete("bb_pkce");
+  res.cookies.delete("bb_state");
+  return res;
+}
+
 export async function GET(req: NextRequest) {
   const code = req.nextUrl.searchParams.get("code");
   const state = req.nextUrl.searchParams.get("state");
   const verifier = req.cookies.get("bb_pkce")?.value;
   const expectedState = req.cookies.get("bb_state")?.value;
 
+  // Plain `!==` (not timingSafeEqual) is safe here: `state` is a fresh 16-byte
+  // random nonce per login attempt, and — because authErrorRedirect deletes
+  // bb_state unconditionally on every path below, including this mismatch check —
+  // it is single-use no matter the outcome. A timing attack needs many comparisons
+  // against the same fixed secret to extract it byte-by-byte; here the secret is
+  // discarded after the first attempt, so there's nothing to accumulate signal
+  // against. Contrast with the session HMAC in lib/crypto.ts (verifySignature),
+  // which guards a long-lived, replayable cookie and does need timingSafeEqual.
   if (!code || !verifier || !state || state !== expectedState) {
-    return NextResponse.redirect(`${appUrl()}/?error=auth_failed`);
+    return authErrorRedirect("auth_failed");
   }
 
   try {
@@ -41,7 +63,7 @@ export async function GET(req: NextRequest) {
       .select("id, is_allowed")
       .single();
     if (error || !user) throw new Error(error?.message ?? "upsert failed");
-    if (!user.is_allowed) return NextResponse.redirect(`${appUrl()}/?error=not_allowed`);
+    if (!user.is_allowed) return authErrorRedirect("not_allowed");
 
     await storeTokens(user.id, tokens);
     await setSession(user.id);
@@ -51,7 +73,8 @@ export async function GET(req: NextRequest) {
     res.cookies.delete("bb_state");
     return res;
   } catch (err) {
+    // Detail stays server-side; the redirect only ever carries the fixed code.
     console.error("OAuth callback error:", err);
-    return NextResponse.redirect(`${appUrl()}/?error=auth_failed`);
+    return authErrorRedirect("auth_failed");
   }
 }
