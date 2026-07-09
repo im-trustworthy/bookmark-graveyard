@@ -41,8 +41,15 @@ export async function GET(req: NextRequest) {
     .eq("user_id", userId)
     .order("name");
 
+  // Unfiltered library size — lets the UI distinguish "empty filters" from "never synced"
+  const { count: total } = await db()
+    .from("bookmarks")
+    .select("tweet_id", { count: "exact", head: true })
+    .eq("user_id", userId);
+
   return NextResponse.json({
     bookmarks: rows,
     allTopics: (topicRows ?? []).map((t) => t.name),
+    total: total ?? 0,
   });
 }
