@@ -171,6 +171,8 @@ export interface DigestFilters {
   from?: string;
   to?: string;
   topics?: string[];
+  /** Explicit hand-picked selection; when set, date/topic filters don't apply. */
+  tweetIds?: string[];
 }
 
 export async function selectBookmarksForDigest(
@@ -183,14 +185,26 @@ export async function selectBookmarksForDigest(
       "tweet_id, author_handle, author_name, text, tweet_created_at, bookmark_analysis(topics, summary, content_type, credibility)"
     )
     .eq("user_id", userId)
-    .order("first_seen_at", { ascending: false });
-  if (filters.from) query = query.gte("first_seen_at", filters.from);
-  if (filters.to) query = query.lte("first_seen_at", `${filters.to}T23:59:59Z`);
+    .eq("hidden", false)
+    .order("tweet_created_at", { ascending: false, nullsFirst: false });
+  if (filters.tweetIds && filters.tweetIds.length > 0) {
+    query = query.in("tweet_id", filters.tweetIds);
+  }
 
   const { data, error } = await query;
   if (error) throw new Error(error.message);
 
-  const rows: DigestBookmark[] = (data ?? []).map((b) => {
+  // Date filter matches the browse list: the post's date, keeping undated posts.
+  const useDates = !filters.tweetIds?.length;
+  const toBound = filters.to ? `${filters.to}T23:59:59Z` : null;
+  const dateFiltered = (data ?? []).filter((b) => {
+    if (!useDates || !b.tweet_created_at) return true;
+    if (filters.from && b.tweet_created_at < filters.from) return false;
+    if (toBound && b.tweet_created_at > toBound) return false;
+    return true;
+  });
+
+  const rows: DigestBookmark[] = dateFiltered.map((b) => {
     const a = Array.isArray(b.bookmark_analysis) ? b.bookmark_analysis[0] : b.bookmark_analysis;
     return {
       tweet_id: b.tweet_id,
@@ -206,7 +220,7 @@ export async function selectBookmarksForDigest(
   });
 
   const topicFiltered =
-    filters.topics && filters.topics.length > 0
+    useDates && filters.topics && filters.topics.length > 0
       ? rows.filter((r) => r.topics.some((t) => filters.topics!.includes(t)))
       : rows;
 

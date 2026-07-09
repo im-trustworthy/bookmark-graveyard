@@ -52,6 +52,7 @@ export default function Dashboard({
   const [from, setFrom] = useState(isoDaysAgo(7));
   const [to, setTo] = useState(isoDaysAgo(0));
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [allTopics, setAllTopics] = useState<string[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [totalBookmarks, setTotalBookmarks] = useState<number | null>(null);
@@ -149,7 +150,15 @@ export default function Dashboard({
       const res = await fetch("/api/digest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ format, from, to, topics: selectedTopics, targetMinutes: 20 }),
+        body: JSON.stringify({
+          format,
+          from,
+          to,
+          topics: selectedTopics,
+          // Hand-picked posts take precedence over date/topic filters
+          tweetIds: selected.size > 0 ? [...selected] : undefined,
+          targetMinutes: 20,
+        }),
       });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Generation failed");
@@ -167,6 +176,33 @@ export default function Dashboard({
     setSelectedTopics((prev) =>
       prev.includes(topic) ? prev.filter((t) => t !== topic) : [...prev, topic]
     );
+
+  const toggleSelected = (tweetId: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(tweetId)) next.delete(tweetId);
+      else next.add(tweetId);
+      return next;
+    });
+
+  async function hideBookmark(tweetId: string) {
+    // Optimistic: drop from the list immediately, persist in the background.
+    setBookmarks((prev) => prev.filter((b) => b.tweet_id !== tweetId));
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.delete(tweetId);
+      return next;
+    });
+    const res = await fetch("/api/bookmarks/hide", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ tweet_id: tweetId }),
+    });
+    if (!res.ok) {
+      setErrorMessage("Couldn't remove that bookmark — it may reappear on reload.");
+      await loadBookmarks();
+    }
+  }
 
   const formatOptions: { value: Format; label: string }[] = useMemo(
     () => [
@@ -263,9 +299,7 @@ export default function Dashboard({
                 className="ml-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-100 [color-scheme:dark]"
               />
             </label>
-            <span className="text-xs text-zinc-600">
-              Dates reflect when the app first saw each bookmark.
-            </span>
+            <span className="text-xs text-zinc-600">Filters by the post&apos;s date.</span>
           </div>
           {allTopics.length > 0 ? (
             <div className="flex flex-wrap gap-2">
@@ -293,11 +327,23 @@ export default function Dashboard({
         {/* Create button */}
         <button
           onClick={createBrief}
-          disabled={creating || bookmarks.length === 0}
+          disabled={creating || (selected.size === 0 && bookmarks.length === 0)}
           className="w-full py-4 rounded-2xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:hover:bg-sky-500 text-white font-semibold text-lg transition"
         >
-          {creating ? createStage : `Create my brief (${bookmarks.length} bookmarks)`}
+          {creating
+            ? createStage
+            : selected.size > 0
+              ? `Create my brief (${selected.size} selected)`
+              : `Create my brief (all ${bookmarks.length} shown)`}
         </button>
+        {selected.size > 0 && !creating && (
+          <p className="text-xs text-zinc-500 -mt-4 text-center">
+            Using only your hand-picked posts.{" "}
+            <button onClick={() => setSelected(new Set())} className="text-sky-400 hover:underline">
+              Clear selection
+            </button>
+          </p>
+        )}
 
         {/* Result */}
         {result && (
@@ -344,9 +390,14 @@ export default function Dashboard({
 
         {/* Bookmark list */}
         <section className="space-y-3">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
-            Your bookmarks {loading ? "…" : `(${bookmarks.length})`}
-          </h2>
+          <div className="flex items-baseline justify-between">
+            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+              Your bookmarks {loading ? "…" : `(${bookmarks.length})`}
+            </h2>
+            <span className="text-xs text-zinc-600">
+              Click to hand-pick posts · × removes for good
+            </span>
+          </div>
           {!loading && bookmarks.length === 0 && (
             <p className="text-sm text-zinc-500">
               {syncing
@@ -357,20 +408,43 @@ export default function Dashboard({
           <ul className="space-y-3">
             {bookmarks.map((b) => {
               const a = analysisOf(b);
+              const isSelected = selected.has(b.tweet_id);
               return (
-                <li key={b.tweet_id} className="rounded-xl border border-zinc-800 p-4 space-y-2">
+                <li
+                  key={b.tweet_id}
+                  onClick={() => toggleSelected(b.tweet_id)}
+                  className={`rounded-xl border p-4 space-y-2 cursor-pointer transition ${
+                    isSelected
+                      ? "border-sky-500 bg-sky-500/10"
+                      : "border-zinc-800 hover:border-zinc-600"
+                  }`}
+                >
                   <div className="flex items-baseline justify-between gap-2">
                     <a
                       href={`https://x.com/${b.author_handle ?? "i"}/status/${b.tweet_id}`}
                       target="_blank"
                       rel="noreferrer"
+                      onClick={(e) => e.stopPropagation()}
                       className="text-sm font-medium hover:underline"
                     >
                       {b.author_name ?? "Unknown"}{" "}
                       <span className="text-zinc-500">@{b.author_handle}</span>
                     </a>
-                    <span className="text-xs text-zinc-600 shrink-0">
-                      {b.tweet_created_at?.slice(0, 10)}
+                    <span className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs text-zinc-600">
+                        {b.tweet_created_at?.slice(0, 10)}
+                      </span>
+                      <button
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          hideBookmark(b.tweet_id);
+                        }}
+                        title="Remove from list and future briefs"
+                        aria-label="Remove bookmark"
+                        className="w-5 h-5 flex items-center justify-center rounded-full text-zinc-600 hover:text-red-400 hover:bg-red-950/50 transition text-sm leading-none"
+                      >
+                        ×
+                      </button>
                     </span>
                   </div>
                   <p className="text-sm text-zinc-300 line-clamp-3">{b.text}</p>
