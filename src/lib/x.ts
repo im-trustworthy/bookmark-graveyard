@@ -91,7 +91,24 @@ export async function storeTokens(userId: string, tokens: TokenResponse) {
   if (error) throw new Error(`Failed to store tokens: ${error.message}`);
 }
 
-/** Returns a valid access token for the user, refreshing (with rotation) if expired. */
+function accessTokenIfFresh(row: {
+  access_token_enc?: string | null;
+  token_expires_at?: string | null;
+}): string | null {
+  const expiresAt = row.token_expires_at ? new Date(row.token_expires_at).getTime() : 0;
+  return row.access_token_enc && expiresAt > Date.now() + 60_000
+    ? decrypt(row.access_token_enc)
+    : null;
+}
+
+/**
+ * Returns a valid access token for the user, refreshing (with rotation) if
+ * expired. Concurrency-safe: X invalidates a refresh token on use, so two
+ * parallel refreshes of the same token must not race. We compare-and-swap on
+ * the refresh-token ciphertext we read, and fall back to whatever a concurrent
+ * request stored — so a losing refresh never overwrites the row with a
+ * now-stale token (which would permanently strand the login).
+ */
 export async function getAccessToken(userId: string): Promise<string> {
   const { data: user, error } = await db()
     .from("users")
@@ -100,13 +117,51 @@ export async function getAccessToken(userId: string): Promise<string> {
     .single();
   if (error || !user) throw new Error("User not found");
 
-  const expiresAt = user.token_expires_at ? new Date(user.token_expires_at).getTime() : 0;
-  if (user.access_token_enc && expiresAt > Date.now() + 60_000) {
-    return decrypt(user.access_token_enc);
-  }
+  const fresh = accessTokenIfFresh(user);
+  if (fresh) return fresh;
   if (!user.refresh_token_enc) throw new Error("No refresh token — please log in again");
-  const tokens = await refreshTokens(decrypt(user.refresh_token_enc));
-  await storeTokens(userId, tokens);
+
+  const oldRefreshEnc = user.refresh_token_enc;
+  let tokens: TokenResponse;
+  try {
+    tokens = await refreshTokens(decrypt(oldRefreshEnc));
+  } catch (err) {
+    // Our refresh token may have just been rotated out from under us by a
+    // concurrent request. If a fresh access token is now stored, use it.
+    const { data: latest } = await db()
+      .from("users")
+      .select("access_token_enc, token_expires_at")
+      .eq("id", userId)
+      .single();
+    const recovered = latest && accessTokenIfFresh(latest);
+    if (recovered) return recovered;
+    throw err;
+  }
+
+  // Compare-and-swap: only persist if the refresh token we used is still the
+  // stored one. If a concurrent refresh already replaced it, defer to that.
+  const update: Record<string, unknown> = {
+    access_token_enc: encrypt(tokens.access_token),
+    token_expires_at: new Date(Date.now() + tokens.expires_in * 1000).toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  if (tokens.refresh_token) update.refresh_token_enc = encrypt(tokens.refresh_token);
+  const { data: swapped } = await db()
+    .from("users")
+    .update(update)
+    .eq("id", userId)
+    .eq("refresh_token_enc", oldRefreshEnc)
+    .select("id");
+
+  if (!swapped || swapped.length === 0) {
+    const { data: latest } = await db()
+      .from("users")
+      .select("access_token_enc, token_expires_at")
+      .eq("id", userId)
+      .single();
+    const recovered = latest && accessTokenIfFresh(latest);
+    if (recovered) return recovered;
+  }
   return tokens.access_token;
 }
 
