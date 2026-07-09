@@ -5,6 +5,11 @@ const API = "https://api.elevenlabs.io/v1";
 // Turbo = 0.5 credits/char, roughly doubles what a Creator subscription can render per month.
 const MODEL = process.env.ELEVENLABS_MODEL ?? "eleven_turbo_v2_5";
 
+// Script lines rendered per /api/digest/render call (and per uploaded chunk file).
+// Shared with the render route and the status route's resume-cursor math — keep
+// them importing this instead of redeclaring the number so they can't drift.
+export const LINES_PER_CALL = 12;
+
 function voiceFor(speaker: "A" | "B"): string {
   return speaker === "A" ? env("ELEVENLABS_VOICE_HOST_A") : env("ELEVENLABS_VOICE_HOST_B");
 }

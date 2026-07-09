@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
-import { renderPodcast } from "@/lib/tts";
+import { renderPodcast, LINES_PER_CALL } from "@/lib/tts";
+import { apiError } from "@/lib/errors";
 import type { ScriptLine } from "@/lib/brain";
 
 export const maxDuration = 300;
-
-const LINES_PER_CALL = 12;
 
 // Stage 3 (audio): render the next chunk of script lines to an MP3 segment.
 // The client loops, advancing `cursor`, so each request stays ~30-60s.
@@ -55,8 +54,6 @@ export async function POST(req: NextRequest) {
       done: nextCursor >= script.length,
     });
   } catch (err) {
-    console.error("Digest render error:", err);
-    const message = err instanceof Error ? err.message : "Audio rendering failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return apiError("Digest render error", err, "Audio rendering failed");
   }
 }

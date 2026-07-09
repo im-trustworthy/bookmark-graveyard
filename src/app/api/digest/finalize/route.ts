@@ -3,6 +3,7 @@ import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
 import { estimateDurationSeconds } from "@/lib/tts";
 import { signEpisodeUrls } from "@/lib/episodes";
+import { apiError } from "@/lib/errors";
 import type { ScriptLine } from "@/lib/brain";
 
 export const maxDuration = 300;
@@ -70,8 +71,6 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ episode: await signEpisodeUrls(updated) });
   } catch (err) {
-    console.error("Digest finalize error:", err);
-    const message = err instanceof Error ? err.message : "Finalize failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return apiError("Digest finalize error", err, "Finalize failed");
   }
 }
