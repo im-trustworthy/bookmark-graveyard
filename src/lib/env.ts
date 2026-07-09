@@ -1,3 +1,5 @@
+import "server-only";
+
 const required = [
   "NEXT_PUBLIC_SUPABASE_URL",
   "SUPABASE_SERVICE_ROLE_KEY",
