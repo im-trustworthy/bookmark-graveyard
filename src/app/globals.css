@@ -1,8 +1,11 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  /* Bookmark Brief is dark-themed only (zinc-950/zinc-100) — no light
+     variant, so these stay fixed rather than following OS preference. */
+  --background: var(--color-zinc-950);
+  --foreground: var(--color-zinc-100);
 }
 
 @theme inline {
@@ -12,17 +15,9 @@
   --font-mono: var(--font-geist-mono);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
 }
 
 /* Indeterminate progress bar sweep */
