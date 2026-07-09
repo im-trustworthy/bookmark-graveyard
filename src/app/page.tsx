@@ -28,29 +28,37 @@ export default async function Home({
   if (user) return <Dashboard user={user} />;
 
   return (
-    <main className="min-h-screen flex items-center justify-center bg-zinc-950 text-zinc-100 px-6">
-      <div className="max-w-md text-center space-y-6">
-        <div className="text-5xl">🎧</div>
-        <h1 className="text-3xl font-semibold tracking-tight">Bookmark Brief</h1>
-        <p className="text-zinc-400 leading-relaxed">
-          Your X bookmarks, turned into a weekly podcast. Sign in, pick a date range and topics,
-          and get a markdown summary or a two-host audio brief — fact-checked against Community
-          Notes, with stale news filtered out.
-        </p>
+    <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-zinc-950 px-6 text-zinc-100">
+      <div
+        aria-hidden="true"
+        className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,_rgba(14,165,233,0.14),_transparent_60%)]"
+      />
+      <div className="relative max-w-md space-y-8 text-center">
+        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-sky-500/10 text-4xl ring-1 ring-sky-500/30">
+          🎧
+        </div>
+        <div className="space-y-3">
+          <h1 className="text-3xl font-semibold tracking-tight">Bookmark Brief</h1>
+          <p className="leading-relaxed text-zinc-400">
+            Your X bookmarks, turned into a weekly podcast. Sign in, pick a date range and topics,
+            and get a markdown summary or a two-host audio brief — fact-checked against Community
+            Notes, with stale news filtered out.
+          </p>
+        </div>
         {error === "not_allowed" && (
-          <p className="text-amber-400 text-sm">
+          <p className="rounded-xl border border-amber-800/60 bg-amber-950/20 px-4 py-3 text-sm text-amber-300">
             This account isn&apos;t on the allowlist for this instance.
           </p>
         )}
         {error === "auth_failed" && (
-          <p className="text-red-400 text-sm">
+          <p className="rounded-xl border border-red-900/60 bg-red-950/20 px-4 py-3 text-sm text-red-300">
             Sign-in didn&apos;t complete — please try again. (If this keeps happening, check the
             X app credentials in .env.local.)
           </p>
         )}
         <a
           href="/api/auth/login"
-          className="inline-block bg-zinc-100 text-zinc-950 font-medium px-6 py-3 rounded-full hover:bg-white transition"
+          className="inline-flex items-center justify-center gap-2 rounded-full bg-zinc-100 px-6 py-3 font-medium text-zinc-950 transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
         >
           Sign in with X
         </a>

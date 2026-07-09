@@ -1,6 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 type Format = "markdown" | "audio" | "both";
 
@@ -393,47 +395,57 @@ export default function Dashboard({
     <main className="min-h-screen bg-zinc-950 text-zinc-100">
       <div className="max-w-3xl mx-auto px-6 py-10 space-y-8">
         {/* Header */}
-        <header className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
+        <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex min-w-0 items-center gap-3">
             {user.avatar_url && (
               // eslint-disable-next-line @next/next/no-img-element
-              <img src={user.avatar_url} alt="" className="w-10 h-10 rounded-full" />
+              <img
+                src={user.avatar_url}
+                alt=""
+                className="h-10 w-10 shrink-0 rounded-full ring-1 ring-zinc-800"
+              />
             )}
-            <div>
-              <h1 className="text-xl font-semibold tracking-tight">
+            <div className="min-w-0">
+              <h1 className="truncate text-xl font-semibold tracking-tight">
                 Welcome back, @{user.handle}
               </h1>
               <p className="text-sm text-zinc-400">Let&apos;s create your summary.</p>
             </div>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={sync}
               disabled={syncing}
-              className="text-sm px-4 py-2 rounded-full border border-zinc-700 hover:border-zinc-500 disabled:opacity-50 transition"
+              aria-label={syncing ? "Syncing bookmarks" : "Sync bookmarks"}
+              className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
             >
               {syncing ? "Syncing…" : "Re-sync"}
             </button>
             <form action="/api/auth/logout" method="post">
-              <button className="text-sm px-4 py-2 rounded-full text-zinc-500 hover:text-zinc-300 transition">
+              <button
+                aria-label="Log out"
+                className="rounded-full px-4 py-2 text-sm text-zinc-500 transition hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+              >
                 Log out
               </button>
             </form>
           </div>
         </header>
 
-        {syncStage && (
-          <p className="text-sm text-sky-400 flex items-center gap-2">
-            <span className="inline-block w-3 h-3 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
-            {syncStage}
-          </p>
-        )}
-        {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
-        {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
+        <div className="space-y-2">
+          {syncStage && (
+            <p className="flex items-center gap-2 text-sm text-sky-400">
+              <span className="inline-block h-3 w-3 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
+              {syncStage}
+            </p>
+          )}
+          {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
+          {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
+        </div>
 
         {/* Resumable draft banner */}
         {resumable && !creating && (
-          <section className="rounded-2xl border border-amber-800/60 bg-amber-950/20 p-4 flex items-center justify-between gap-3 flex-wrap">
+          <section className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-800/60 bg-amber-950/20 p-4">
             <p className="text-sm text-amber-200">
               A brief from{" "}
               {resumable.createdAt
@@ -441,17 +453,17 @@ export default function Dashboard({
                 : "earlier"}{" "}
               stopped partway.
             </p>
-            <div className="flex items-center gap-2 shrink-0">
+            <div className="flex shrink-0 items-center gap-2">
               <button
                 onClick={resumeBrief}
-                className="text-sm px-4 py-1.5 rounded-full bg-amber-500 hover:bg-amber-400 text-zinc-950 font-medium transition"
+                className="rounded-full bg-amber-500 px-4 py-1.5 text-sm font-medium text-zinc-950 transition hover:bg-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
               >
                 Resume
               </button>
               <button
                 onClick={discardResumable}
                 disabled={discarding}
-                className="text-sm px-4 py-1.5 rounded-full border border-amber-800/60 text-amber-200 hover:border-amber-600 disabled:opacity-50 transition"
+                className="rounded-full border border-amber-800/60 px-4 py-1.5 text-sm text-amber-200 transition hover:border-amber-600 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
               >
                 {discarding ? "Discarding…" : "Discard"}
               </button>
@@ -464,14 +476,15 @@ export default function Dashboard({
           <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
             How would you like it?
           </h2>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             {formatOptions.map((opt) => (
               <button
                 key={opt.value}
                 onClick={() => setFormat(opt.value)}
-                className={`px-4 py-2 rounded-full text-sm border transition ${
+                aria-pressed={format === opt.value}
+                className={`rounded-full border px-4 py-2 text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
                   format === opt.value
-                    ? "bg-zinc-100 text-zinc-950 border-zinc-100 font-medium"
+                    ? "border-zinc-100 bg-zinc-100 font-medium text-zinc-950"
                     : "border-zinc-700 hover:border-zinc-500"
                 }`}
               >
@@ -482,7 +495,7 @@ export default function Dashboard({
         </section>
 
         {/* Filters */}
-        <section className="rounded-2xl border border-zinc-800 p-5 space-y-4">
+        <section className="space-y-4 rounded-2xl border border-zinc-800 p-5">
           <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">Filters</h2>
           <div className="flex flex-wrap items-center gap-3">
             <label className="text-sm text-zinc-400">
@@ -491,7 +504,7 @@ export default function Dashboard({
                 type="date"
                 value={from}
                 onChange={(e) => setFrom(e.target.value)}
-                className="ml-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-100 [color-scheme:dark]"
+                className="ml-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-100 [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               />
             </label>
             <label className="text-sm text-zinc-400">
@@ -500,7 +513,7 @@ export default function Dashboard({
                 type="date"
                 value={to}
                 onChange={(e) => setTo(e.target.value)}
-                className="ml-1 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-zinc-100 [color-scheme:dark]"
+                className="ml-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-100 [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               />
             </label>
             <span className="text-xs text-zinc-600">Filters by the post&apos;s date.</span>
@@ -511,9 +524,10 @@ export default function Dashboard({
                 <button
                   key={topic}
                   onClick={() => toggleTopic(topic)}
-                  className={`px-3 py-1 rounded-full text-xs border transition ${
+                  aria-pressed={selectedTopics.includes(topic)}
+                  className={`rounded-full border px-3 py-1 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
                     selectedTopics.includes(topic)
-                      ? "bg-sky-500/20 border-sky-500 text-sky-300"
+                      ? "border-sky-500 bg-sky-500/20 text-sky-300"
                       : "border-zinc-700 text-zinc-400 hover:border-zinc-500"
                   }`}
                 >
@@ -529,54 +543,59 @@ export default function Dashboard({
         </section>
 
         {/* Create button */}
-        <button
-          onClick={createBrief}
-          disabled={creating || (selected.size === 0 && bookmarks.length === 0)}
-          className="w-full py-4 rounded-2xl bg-sky-500 hover:bg-sky-400 disabled:opacity-40 disabled:hover:bg-sky-500 text-white font-semibold text-lg transition"
-        >
-          {creating
-            ? "Creating your brief…"
-            : selected.size > 0
-              ? `Create my brief (${selected.size} selected)`
-              : `Create my brief (all ${bookmarks.length} shown)`}
-        </button>
-        {creating && (
-          <div className="rounded-2xl border border-zinc-800 p-4 space-y-3 -mt-4">
-            <div className="flex items-center justify-between text-sm">
-              <span className="text-zinc-300">{createStage}</span>
-              <span className="text-zinc-600 tabular-nums">
-                {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
-              </span>
-            </div>
-            <div className="h-2 rounded-full bg-zinc-800 overflow-hidden">
-              {createProgress === null ? (
-                <div className="h-full w-1/3 rounded-full bg-sky-500/80 animate-[slide_1.4s_ease-in-out_infinite]" />
-              ) : (
-                <div
-                  className="h-full rounded-full bg-sky-500 transition-[width] duration-500"
-                  style={{ width: `${Math.round(createProgress * 100)}%` }}
-                />
+        <div className="space-y-3">
+          <button
+            onClick={createBrief}
+            disabled={creating || (selected.size === 0 && bookmarks.length === 0)}
+            className="w-full rounded-2xl bg-sky-500 py-4 text-lg font-semibold text-white transition hover:bg-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:hover:bg-zinc-800"
+          >
+            {creating
+              ? "Creating your brief…"
+              : selected.size > 0
+                ? `Create my brief (${selected.size} selected)`
+                : `Create my brief (all ${bookmarks.length} shown)`}
+          </button>
+          {creating && (
+            <div className="space-y-3 rounded-2xl border border-zinc-800 p-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-zinc-300">{createStage}</span>
+                <span className="tabular-nums text-zinc-600">
+                  {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
+                </span>
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
+                {createProgress === null ? (
+                  <div className="h-full w-1/3 rounded-full bg-sky-500/80 animate-[slide_1.4s_ease-in-out_infinite]" />
+                ) : (
+                  <div
+                    className="h-full rounded-full bg-sky-500 transition-[width] duration-500"
+                    style={{ width: `${Math.round(createProgress * 100)}%` }}
+                  />
+                )}
+              </div>
+              {createProgress !== null && (
+                <p className="text-right text-xs tabular-nums text-zinc-600">
+                  {Math.round(createProgress * 100)}%
+                </p>
               )}
             </div>
-            {createProgress !== null && (
-              <p className="text-xs text-zinc-600 text-right tabular-nums">
-                {Math.round(createProgress * 100)}%
-              </p>
-            )}
-          </div>
-        )}
-        {selected.size > 0 && !creating && (
-          <p className="text-xs text-zinc-500 -mt-4 text-center">
-            Using only your hand-picked posts.{" "}
-            <button onClick={() => setSelected(new Set())} className="text-sky-400 hover:underline">
-              Clear selection
-            </button>
-          </p>
-        )}
+          )}
+          {selected.size > 0 && !creating && (
+            <p className="text-center text-xs text-zinc-500">
+              Using only your hand-picked posts.{" "}
+              <button
+                onClick={() => setSelected(new Set())}
+                className="rounded text-sky-400 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+              >
+                Clear selection
+              </button>
+            </p>
+          )}
+        </div>
 
         {/* Result */}
         {result && (
-          <section className="rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5 space-y-4">
+          <section className="space-y-4 rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5">
             <h2 className="font-semibold">{result.episode.title}</h2>
             {result.stats && (
               <p className="text-sm text-zinc-400">
@@ -588,14 +607,19 @@ export default function Dashboard({
               </p>
             )}
             {result.episode.audio_url && (
-              <audio controls src={result.episode.audio_url} className="w-full" />
+              <audio
+                controls
+                src={result.episode.audio_url}
+                aria-label={`Audio for ${result.episode.title}`}
+                className="w-full"
+              />
             )}
-            <div className="flex gap-3">
+            <div className="flex flex-wrap gap-3">
               {result.episode.markdown_url && (
                 <a
                   href={result.episode.markdown_url}
                   download="bookmark-brief.md"
-                  className="text-sm px-4 py-2 rounded-full border border-zinc-700 hover:border-zinc-500 transition"
+                  className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .md
                 </a>
@@ -604,18 +628,22 @@ export default function Dashboard({
                 <a
                   href={result.episode.audio_url}
                   download="bookmark-brief.mp3"
-                  className="text-sm px-4 py-2 rounded-full border border-zinc-700 hover:border-zinc-500 transition"
+                  className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .mp3
                 </a>
               )}
             </div>
             {result.markdown && (
-              <details>
-                <summary className="text-sm text-zinc-400 cursor-pointer">Preview markdown</summary>
-                <pre className="mt-3 text-xs text-zinc-300 whitespace-pre-wrap max-h-96 overflow-y-auto">
-                  {result.markdown}
-                </pre>
+              <details className="group">
+                <summary className="cursor-pointer rounded text-sm text-zinc-400 transition hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500">
+                  Preview markdown
+                </summary>
+                <div className="mt-3 max-h-96 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
+                  <div className="prose prose-invert prose-sm max-w-none prose-headings:text-zinc-100 prose-strong:text-zinc-100 prose-code:text-zinc-200 prose-a:text-sky-400 prose-a:no-underline hover:prose-a:underline">
+                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.markdown}</ReactMarkdown>
+                  </div>
+                </div>
               </details>
             )}
           </section>
@@ -646,7 +674,7 @@ export default function Dashboard({
                 <li
                   key={b.tweet_id}
                   onClick={() => toggleSelected(b.tweet_id)}
-                  className={`rounded-xl border p-4 space-y-2 cursor-pointer transition ${
+                  className={`cursor-pointer space-y-2 rounded-xl border p-4 transition ${
                     isSelected
                       ? "border-sky-500 bg-sky-500/10"
                       : "border-zinc-800 hover:border-zinc-600"
@@ -658,12 +686,12 @@ export default function Dashboard({
                       target="_blank"
                       rel="noreferrer"
                       onClick={(e) => e.stopPropagation()}
-                      className="text-sm font-medium hover:underline"
+                      className="min-w-0 truncate rounded text-sm font-medium hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
                     >
                       {b.author_name ?? "Unknown"}{" "}
                       <span className="text-zinc-500">@{b.author_handle}</span>
                     </a>
-                    <span className="flex items-center gap-2 shrink-0">
+                    <span className="flex shrink-0 items-center gap-2">
                       <span className="text-xs text-zinc-600">
                         {b.tweet_created_at?.slice(0, 10)}
                       </span>
@@ -673,8 +701,8 @@ export default function Dashboard({
                           hideBookmark(b.tweet_id);
                         }}
                         title="Remove from list and future briefs"
-                        aria-label="Remove bookmark"
-                        className="w-5 h-5 flex items-center justify-center rounded-full text-zinc-600 hover:text-red-400 hover:bg-red-950/50 transition text-sm leading-none"
+                        aria-label={`Remove bookmark from ${b.author_name ?? "Unknown"}`}
+                        className="flex h-5 w-5 items-center justify-center rounded-full text-sm leading-none text-zinc-600 transition hover:bg-red-950/50 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
                       >
                         ×
                       </button>
@@ -685,18 +713,18 @@ export default function Dashboard({
                     {(a?.topics ?? []).map((t) => (
                       <span
                         key={t}
-                        className="text-[11px] px-2 py-0.5 rounded-full bg-zinc-800 text-zinc-400"
+                        className="rounded-full bg-zinc-800 px-2 py-0.5 text-[11px] text-zinc-400"
                       >
                         {t}
                       </span>
                     ))}
                     {a?.credibility === "misleading" && (
-                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-900/50 text-red-300">
+                      <span className="rounded-full bg-red-900/50 px-2 py-0.5 text-[11px] text-red-300">
                         ⚠ Community Noted
                       </span>
                     )}
                     {a?.credibility === "disputed" && (
-                      <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-900/50 text-amber-300">
+                      <span className="rounded-full bg-amber-900/50 px-2 py-0.5 text-[11px] text-amber-300">
                         note pending
                       </span>
                     )}
@@ -715,23 +743,32 @@ export default function Dashboard({
             </h2>
             <ul className="space-y-3">
               {episodes.map((ep) => (
-                <li
-                  key={ep.id}
-                  className="rounded-xl border border-zinc-800 p-4 flex flex-col gap-2"
-                >
-                  <div className="flex items-baseline justify-between">
-                    <span className="text-sm font-medium">{ep.title}</span>
+                <li key={ep.id} className="space-y-3 rounded-xl border border-zinc-800 p-4">
+                  <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+                    <span className="text-sm font-medium text-zinc-100">{ep.title}</span>
                     <span className="text-xs text-zinc-600">
+                      {new Date(ep.created_at).toLocaleDateString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                      })}
+                      {" · "}
                       {ep.bookmark_count ?? "?"} posts
                       {ep.duration_seconds ? ` · ${Math.round(ep.duration_seconds / 60)} min` : ""}
                     </span>
                   </div>
-                  {ep.audio_url && <audio controls src={ep.audio_url} className="w-full h-10" />}
+                  {ep.audio_url && (
+                    <audio
+                      controls
+                      src={ep.audio_url}
+                      aria-label={`Audio for ${ep.title}`}
+                      className="w-full"
+                    />
+                  )}
                   {ep.markdown_url && (
                     <a
                       href={ep.markdown_url}
                       download
-                      className="text-xs text-sky-400 hover:underline w-fit"
+                      className="inline-block w-fit rounded text-xs text-zinc-500 transition hover:text-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
                     >
                       Download markdown
                     </a>
