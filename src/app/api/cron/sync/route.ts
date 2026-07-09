@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { syncUser } from "@/lib/sync";
 import { enrichNewBookmarks } from "@/lib/brain";
+import { ingestPending } from "@/lib/ingest";
 
 export const maxDuration = 300;
 
@@ -22,8 +23,9 @@ export async function GET(req: NextRequest) {
   for (const user of users ?? []) {
     try {
       const sync = await syncUser(user.id);
+      const ingest = await ingestPending(user.id);
       const enrich = await enrichNewBookmarks(user.id);
-      results[user.handle] = { ...sync, ...enrich };
+      results[user.handle] = { ...sync, ...ingest, ...enrich };
     } catch (err) {
       results[user.handle] = { error: err instanceof Error ? err.message : String(err) };
     }

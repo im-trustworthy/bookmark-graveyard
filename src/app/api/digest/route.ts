@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
     }
 
     const verdicts = await stalenessPass(included);
-    const markdown = await writeMarkdownDigest(included, verdicts, excludedAsMisleading, {
+    const markdown = await writeMarkdownDigest(userId, included, verdicts, excludedAsMisleading, {
       from: body.from,
       to: body.to,
     });

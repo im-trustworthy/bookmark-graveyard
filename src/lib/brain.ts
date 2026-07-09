@@ -1,27 +1,7 @@
-import OpenAI from "openai";
+import "server-only";
 import { db } from "./supabase";
-import { env } from "./env";
-
-// xAI's API is OpenAI-compatible.
-function grok(): OpenAI {
-  return new OpenAI({ apiKey: env("XAI_API_KEY"), baseURL: "https://api.x.ai/v1" });
-}
-
-const MODEL = process.env.XAI_MODEL ?? "grok-4";
-
-async function grokJson<T>(system: string, user: string): Promise<T> {
-  const res = await grok().chat.completions.create({
-    model: MODEL,
-    messages: [
-      { role: "system", content: system },
-      { role: "user", content: user },
-    ],
-    response_format: { type: "json_object" },
-    temperature: 0.3,
-  });
-  const content = res.choices[0]?.message?.content ?? "{}";
-  return JSON.parse(content) as T;
-}
+import { grokJson, grokText, FAST_MODEL, SMART_MODEL } from "./grok";
+import type { ReferencedTweet } from "./x";
 
 // ---------------------------------------------------------------------------
 // Enrichment: topics, summary, claims, news-vs-evergreen, credibility
@@ -40,7 +20,8 @@ interface EnrichmentResult {
 /**
  * Enriches bookmarks that have no analysis row yet, up to `limit` per call so
  * HTTP requests stay short — the client loops until `remaining` hits zero.
- * Batches of 20 posts per Grok call, 3 calls in flight at a time.
+ * Uses the FAST model; includes ingested source material so topics/summaries
+ * reflect the article/media substance, not just the post text.
  */
 export async function enrichNewBookmarks(
   userId: string,
@@ -48,8 +29,9 @@ export async function enrichNewBookmarks(
 ): Promise<{ enriched: number; remaining: number }> {
   const { data: pending } = await db()
     .from("bookmarks")
-    .select("tweet_id, author_handle, text, tweet_created_at, bookmark_analysis(tweet_id)")
-    .eq("user_id", userId);
+    .select("tweet_id, author_handle, text, tweet_created_at, referenced, bookmark_analysis(tweet_id)")
+    .eq("user_id", userId)
+    .not("ingested_at", "is", null); // analyze only after sources are ingested
   const allTodo = (pending ?? []).filter((b) => {
     const a = b.bookmark_analysis;
     return !a || (Array.isArray(a) && a.length === 0);
@@ -59,6 +41,8 @@ export async function enrichNewBookmarks(
 
   const { data: topicRows } = await db().from("topics").select("name").eq("user_id", userId);
   let taxonomy = (topicRows ?? []).map((t) => t.name);
+
+  const sourcesByTweet = await loadSources(userId, todo.map((b) => b.tweet_id));
 
   // Community Notes flags for these tweets (populated by the nightly public-dataset job)
   const { data: notes } = await db()
@@ -82,10 +66,12 @@ export async function enrichNewBookmarks(
   let enriched = 0;
   const processBatch = async (batch: typeof todo) => {
     const result = await grokJson<EnrichmentResult>(
+      FAST_MODEL,
       `You analyze a user's bookmarked X (Twitter) posts for a personal digest app.
 For each post return: topics (1-3 tags), a one-sentence summary, key factual claims (0-3),
 and content_type: "news" (time-sensitive events), "evergreen" (advice, ideas, resources that stay useful),
 "opinion", or "other".
+Base your analysis on ALL provided material (post, quoted post, linked article, media transcript/description).
 Topic rules: STRONGLY prefer reusing tags from the existing taxonomy. Only coin a new tag when nothing fits.
 Tags are short Title Case noun phrases like "AI Tools", "Startup Advice", "Health".
 Existing taxonomy: ${JSON.stringify(taxonomy)}
@@ -95,7 +81,15 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
           tweet_id: b.tweet_id,
           author: b.author_handle,
           posted: b.tweet_created_at,
-          text: b.text.slice(0, 2000),
+          text: b.text,
+          quoted: ((b.referenced ?? []) as ReferencedTweet[])
+            .map((r) => r.text)
+            .filter(Boolean)
+            .join("\n")
+            .slice(0, 1200) || undefined,
+          sources: (sourcesByTweet.get(b.tweet_id) ?? [])
+            .filter((s) => s.content)
+            .map((s) => `[${s.kind}] ${s.title ?? ""} ${s.content!.slice(0, 800)}`),
         }))
       )
     );
@@ -152,7 +146,7 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
 }
 
 // ---------------------------------------------------------------------------
-// Digest: staleness pass + markdown + two-host script
+// Dossiers: everything we know about a bookmark, assembled for synthesis
 // ---------------------------------------------------------------------------
 
 export interface DigestBookmark {
@@ -165,7 +159,77 @@ export interface DigestBookmark {
   summary: string | null;
   content_type: string;
   credibility: string;
+  referenced: ReferencedTweet[];
 }
+
+interface SourceRow {
+  tweet_id: string;
+  kind: string;
+  url: string;
+  title: string | null;
+  content: string | null;
+}
+
+async function loadSources(userId: string, tweetIds: string[]): Promise<Map<string, SourceRow[]>> {
+  const map = new Map<string, SourceRow[]>();
+  if (tweetIds.length === 0) return map;
+  const { data } = await db()
+    .from("bookmark_sources")
+    .select("tweet_id, kind, url, title, content")
+    .eq("user_id", userId)
+    .eq("status", "ok")
+    .in("tweet_id", tweetIds);
+  for (const row of data ?? []) {
+    const list = map.get(row.tweet_id) ?? [];
+    list.push(row);
+    map.set(row.tweet_id, list);
+  }
+  return map;
+}
+
+export function postUrl(b: { author_handle: string | null; tweet_id: string }): string {
+  return `https://x.com/${b.author_handle ?? "i"}/status/${b.tweet_id}`;
+}
+
+/** One self-contained text block per bookmark: post + quotes + articles + media. */
+function buildDossier(
+  b: DigestBookmark,
+  sources: SourceRow[],
+  extra: { caveats: string[] }
+): string {
+  const lines: string[] = [
+    `### POST ${b.tweet_id}`,
+    `Author: ${b.author_name ?? "Unknown"} (@${b.author_handle ?? "unknown"})`,
+    `URL: ${postUrl(b)}`,
+    `Posted: ${b.tweet_created_at ?? "unknown"}`,
+    ...(extra.caveats.length ? [`Caveats: ${extra.caveats.join("; ")}`] : []),
+    `Post text: ${b.text}`,
+  ];
+  for (const ref of b.referenced ?? []) {
+    if (ref.text) {
+      lines.push(
+        `${ref.type === "quoted" ? "Quoted post" : "In reply to"} ${
+          ref.author_handle ? `by @${ref.author_handle}` : ""
+        }: ${ref.text.slice(0, 1500)}`
+      );
+    }
+  }
+  for (const s of sources) {
+    if (!s.content) continue;
+    if (s.kind === "article") {
+      lines.push(`Linked article "${s.title ?? s.url}" (${s.url}): ${s.content.slice(0, 4000)}`);
+    } else if (s.kind === "video") {
+      lines.push(`Video ${s.title ?? "transcript"}: ${s.content.slice(0, 3000)}`);
+    } else {
+      lines.push(`Image content: ${s.content.slice(0, 1200)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Selection + staleness
+// ---------------------------------------------------------------------------
 
 export interface DigestFilters {
   from?: string;
@@ -182,7 +246,7 @@ export async function selectBookmarksForDigest(
   let query = db()
     .from("bookmarks")
     .select(
-      "tweet_id, author_handle, author_name, text, tweet_created_at, bookmark_analysis(topics, summary, content_type, credibility)"
+      "tweet_id, author_handle, author_name, text, tweet_created_at, referenced, bookmark_analysis(topics, summary, content_type, credibility)"
     )
     .eq("user_id", userId)
     .eq("hidden", false)
@@ -212,6 +276,7 @@ export async function selectBookmarksForDigest(
       author_name: b.author_name,
       text: b.text,
       tweet_created_at: b.tweet_created_at,
+      referenced: (b.referenced ?? []) as ReferencedTweet[],
       topics: a?.topics ?? [],
       summary: a?.summary ?? null,
       content_type: a?.content_type ?? "other",
@@ -247,6 +312,7 @@ export async function stalenessPass(
   for (let i = 0; i < newsItems.length; i += 25) {
     const batch = newsItems.slice(i, i + 25);
     const result = await grokJson<StalenessResult>(
+      FAST_MODEL,
       `Today is ${today}. For each time-sensitive post, judge its relevance for a weekly digest:
 "keep" = still relevant/interesting, "stale" = old news with no remaining value,
 "evolved" = worth mentioning but the story has likely developed since (digest should caveat it).
@@ -268,60 +334,96 @@ Respond with JSON: {"items":[{"tweet_id","verdict"}]}`,
   return verdicts;
 }
 
+// ---------------------------------------------------------------------------
+// Digest: outline (SMART) -> compose (SMART), grounded in full dossiers
+// ---------------------------------------------------------------------------
+
+interface Outline {
+  overview: string;
+  sections: { title: string; tweet_ids: string[]; angle: string }[];
+}
+
 export async function writeMarkdownDigest(
+  userId: string,
   bookmarks: DigestBookmark[],
   verdicts: Map<string, "keep" | "stale" | "evolved">,
   excluded: DigestBookmark[],
   dateRange: { from?: string; to?: string }
 ): Promise<string> {
   const kept = bookmarks.filter((b) => verdicts.get(b.tweet_id) !== "stale");
-  const payload = kept.map((b) => ({
-    url: `https://x.com/${b.author_handle ?? "i"}/status/${b.tweet_id}`,
-    author: b.author_name ? `${b.author_name} (@${b.author_handle})` : `@${b.author_handle}`,
-    posted: b.tweet_created_at,
-    topics: b.topics,
-    summary: b.summary,
-    text: b.text.slice(0, 1500),
-    caveats: [
-      b.credibility === "disputed" ? "has a pending/unrated Community Note — treat with care" : null,
-      verdicts.get(b.tweet_id) === "evolved" ? "story has likely developed since this was posted" : null,
-    ].filter(Boolean),
-  }));
+  const sourcesByTweet = await loadSources(userId, kept.map((b) => b.tweet_id));
 
-  const res = await grok().chat.completions.create({
-    model: MODEL,
-    messages: [
-      {
-        role: "system",
-        content: `You write a personal weekly digest of the user's bookmarked X posts, in markdown.
-Structure: start with "# Your Bookmark Brief" and the date range, then a 2-3 sentence overview,
-then one "## <Topic>" section per topic group (group related topics; aim for 3-7 sections).
-Within each section, synthesize the posts into flowing insight — don't just list them. Every post you
-draw on must be cited inline as a markdown link on the author's name, e.g. [@handle](url).
-Mention any caveats naturally. End with "## Worth a deeper look" — the 3 most substantive items.
-${
-  excluded.length > 0
-    ? `After that, add "## Excluded as disputed" briefly listing ${excluded.length} post(s) omitted because Community Notes rated them misleading (links only, one line each).`
-    : ""
+  const dossiers = kept.map((b) =>
+    buildDossier(b, sourcesByTweet.get(b.tweet_id) ?? [], {
+      caveats: [
+        b.credibility === "disputed"
+          ? "has a pending/unrated Community Note — treat claims with care"
+          : "",
+        verdicts.get(b.tweet_id) === "evolved"
+          ? "story has likely developed since this was posted"
+          : "",
+      ].filter(Boolean),
+    })
+  );
+
+  // Stage 1 — outline: group posts into a narrative structure before writing.
+  const outline = await grokJson<Outline>(
+    SMART_MODEL,
+    `You are the editorial planner for a personal weekly digest built from the reader's own X bookmarks.
+Given post dossiers (post + quoted posts + linked articles + media transcripts), design the digest structure:
+- 3-7 thematic sections; group related posts even across topics; strongest material first
+- Every post must appear in exactly one section
+- For each section give an "angle": the through-line or insight connecting its posts (1-2 sentences)
+- "overview": 2-3 sentences capturing the week's big threads
+Respond with JSON: {"overview": string, "sections":[{"title", "tweet_ids": string[], "angle"}]}`,
+    dossiers.join("\n\n")
+  );
+
+  const sectionForId = new Map<string, string>();
+  for (const s of outline.sections ?? []) {
+    for (const id of s.tweet_ids ?? []) sectionForId.set(id, s.title);
+  }
+  const orphans = kept.filter((b) => !sectionForId.has(b.tweet_id));
+
+  // Stage 2 — compose: write the digest section by section, grounded in dossiers.
+  const composePayload = {
+    dateRange,
+    overview: outline.overview,
+    sections: (outline.sections ?? []).map((s) => ({
+      title: s.title,
+      angle: s.angle,
+      dossiers: (s.tweet_ids ?? [])
+        .map((id) => dossiers[kept.findIndex((b) => b.tweet_id === id)])
+        .filter(Boolean),
+    })),
+    unplaced: orphans.map((b) => buildDossier(b, sourcesByTweet.get(b.tweet_id) ?? [], { caveats: [] })),
+    excluded: excluded.map((b) => ({ url: postUrl(b), author: `@${b.author_handle}` })),
+  };
+
+  return grokText(
+    SMART_MODEL,
+    `You write the reader's personal weekly digest, "Bookmark Brief", in markdown, from their own X bookmarks.
+Follow the provided outline exactly (sections, order, angles). Rules:
+- Start with "# Your Bookmark Brief" + the date range, then the overview paragraph.
+- One "## <Section title>" per outline section. SYNTHESIZE the dossiers into flowing insight along the
+  section's angle — weave posts together, don't list them. Draw on the article excerpts and transcripts,
+  not just post text; pull out the sharpest specific facts, numbers, and takeaways.
+- ATTRIBUTION IS MANDATORY: every idea is credited inline to its creator as a markdown link on the
+  creator's name — format: [Author Name (@handle)](post URL). Every post in a section must be cited.
+  When a linked article has a different author/publication, name it in prose ("writing in ...").
+- Mention caveats naturally where they exist (disputed notes, evolved stories).
+- Place any "unplaced" dossiers in the most fitting section.
+- End with "## Worth a deeper look" — the 3 most substantive items with one-line reasons.
+${composePayload.excluded.length > 0 ? `- Then add "## Excluded as disputed": one line per omitted post (Community Notes rated them misleading), links only.` : ""}
+- Tone: smart, warm, specific. No filler, no hype.`,
+    JSON.stringify(composePayload),
+    { temperature: 0.5 }
+  );
 }
-Write for listening/reading pleasure: smart, warm, no filler.`,
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          dateRange,
-          posts: payload,
-          excluded: excluded.map((b) => ({
-            url: `https://x.com/${b.author_handle ?? "i"}/status/${b.tweet_id}`,
-            author: `@${b.author_handle}`,
-          })),
-        }),
-      },
-    ],
-    temperature: 0.6,
-  });
-  return res.choices[0]?.message?.content ?? "";
-}
+
+// ---------------------------------------------------------------------------
+// Podcast script
+// ---------------------------------------------------------------------------
 
 export interface ScriptLine {
   speaker: "A" | "B";
@@ -335,11 +437,16 @@ export async function writePodcastScript(
 ): Promise<ScriptLine[]> {
   const wordBudget = Math.min(targetMinutes, 30) * 150;
   const result = await grokJson<{ lines: ScriptLine[] }>(
+    SMART_MODEL,
     `You write a two-host podcast script from a digest of the listener's own X bookmarks.
 Host A ("Alex") is curious and steers the show; Host B ("Blake") is the analyst who adds depth.
-Style: NotebookLM-like — conversational, enthusiastic but not cheesy, builds on each other,
-occasional brief reactions. Open by welcoming the listener to their weekly Bookmark Brief;
-close with a quick recap. Attribute ideas to the original posters by handle when natural.
+Style: NotebookLM-like — conversational, enthusiastic but not cheesy, hosts build on each other,
+react briefly, ask each other real questions. Open by welcoming the listener to their weekly
+Bookmark Brief; close with a quick recap.
+CREDIT CREATORS BY NAME: whenever discussing a post's content, the hosts say the creator's actual
+name naturally in speech ("Sarah Chen made a great point about...", "there's a thread from Naval on...").
+Never read out URLs or @-handles letter by letter; use the human name (fall back to the handle as a
+spoken word). Credit article authors/publications the same way when the material comes from an article.
 Total length: about ${wordBudget} words (${Math.min(targetMinutes, 30)} minutes at 150 wpm) — do not exceed it.
 Respond with JSON: {"lines":[{"speaker":"A"|"B","line":"..."}]}`,
     markdown
