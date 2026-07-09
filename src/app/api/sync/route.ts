@@ -1,18 +1,21 @@
 import { NextResponse } from "next/server";
 import { getSessionUserId } from "@/lib/session";
 import { syncUser } from "@/lib/sync";
+import { apiError } from "@/lib/errors";
+import { checkUsage } from "@/lib/limits";
 
 export const maxDuration = 300;
 
 export async function POST() {
   const userId = await getSessionUserId();
-  if (!userId) return NextResponse.json({ error: "Not logged in" }, { status: 401 });
+  if (!userId) return apiError("POST /api/sync", "no session", "Not logged in", 401);
 
   try {
+    // Cap before touching the X API — checkUsage throws UsageLimitError (-> 429) once
+    // today's per-user sync budget is spent.
+    await checkUsage(userId, "sync");
     return NextResponse.json(await syncUser(userId));
   } catch (err) {
-    console.error("Sync error:", err);
-    const message = err instanceof Error ? err.message : "Sync failed";
-    return NextResponse.json({ error: message }, { status: 500 });
+    return apiError("POST /api/sync", err, "Sync failed");
   }
 }
