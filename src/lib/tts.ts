@@ -60,6 +60,6 @@ export async function renderPodcast(
 }
 
 export function estimateDurationSeconds(lines: ScriptLine[]): number {
-  const words = lines.reduce((n, l) => n + l.line.split(/\s+/).length, 0);
+  const words = lines.reduce((n, l) => n + l.line.split(/\s+/).filter(Boolean).length, 0);
   return Math.round((words / 150) * 60);
 }
