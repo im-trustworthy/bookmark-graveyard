@@ -55,9 +55,9 @@ the turbo model this app uses by default. A weekly ~20-minute brief fits comfort
 npm run dev
 ```
 
-Open http://localhost:3000 → **Sign in with X** → **Sync bookmarks** → set filters →
-**Create my brief**. First sync pulls up to your 800 most recent bookmarks (an X API limit);
-after that, regular syncs keep growing your library beyond 800.
+Open http://localhost:3000 → **Sign in with X** (bookmarks sync automatically on first login) →
+set filters → **Create my brief**. First sync pulls up to your 800 most recent bookmarks (an X API
+limit); after that, **Re-sync** keeps growing your library beyond 800.
 
 ## Optional: Community Notes fact-check job
 
