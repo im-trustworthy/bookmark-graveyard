@@ -11,6 +11,7 @@ export async function GET() {
     .from("episodes")
     .select()
     .eq("user_id", userId)
+    .eq("status", "ready") // hide drafts abandoned mid-generation
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });

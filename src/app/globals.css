@@ -24,3 +24,13 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Indeterminate progress bar sweep */
+@keyframes slide {
+  0% {
+    margin-left: -33%;
+  }
+  100% {
+    margin-left: 100%;
+  }
+}
