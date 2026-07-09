@@ -26,7 +26,7 @@ interface SourceRow {
 // Articles
 // ---------------------------------------------------------------------------
 
-function isPrivateHost(hostname: string): boolean {
+export function isPrivateHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
   return (
     h === "localhost" ||
@@ -38,7 +38,7 @@ function isPrivateHost(hostname: string): boolean {
   );
 }
 
-function extractArticleUrls(entities: unknown, referenced: ReferencedTweet[]): string[] {
+export function extractArticleUrls(entities: unknown, referenced: ReferencedTweet[]): string[] {
   const urls: string[] = [];
   const fromEntities = (e: unknown) => {
     const list =
