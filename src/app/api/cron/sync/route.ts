@@ -6,8 +6,13 @@ export const maxDuration = 300;
 
 // Weekly sync for all allowed users (Vercel cron, see vercel.json).
 export async function GET(req: NextRequest) {
+  // Fail closed: without a configured CRON_SECRET this endpoint stays disabled,
+  // so a deployed instance can't be made to burn X/Grok credits by anyone who finds the URL.
   const secret = process.env.CRON_SECRET;
-  if (secret && req.headers.get("authorization") !== `Bearer ${secret}`) {
+  if (!secret) {
+    return NextResponse.json({ error: "CRON_SECRET not configured" }, { status: 503 });
+  }
+  if (req.headers.get("authorization") !== `Bearer ${secret}`) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
