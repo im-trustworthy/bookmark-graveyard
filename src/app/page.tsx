@@ -56,14 +56,15 @@ export default async function Home({
         {/* Visible branding is the wordmark image; keep a screen-reader heading */}
         <h1 className="sr-only">Bookmark Graveyard</h1>
         {/* Fixed 320px on every viewport (fits a 375px phone inside the px-6
-            gutters) so the mark reads as a stamp, not a banner. */}
+            gutters) so the mark reads as a stamp, not a banner. Transparent
+            cutout — the art carries its own baked-in drop shadow. */}
         <Image
-          src="/logo.jpg"
+          src="/logo.png"
           alt="Bookmark Graveyard"
           width={320}
-          height={160}
+          height={206}
           priority
-          className="mx-auto w-[320px] border-[6px] border-black shadow-2xl shadow-black/70"
+          className="mx-auto w-[320px]"
         />
         <p className="text-lg tracking-wide text-zinc-300">
           Raise your bookmarks from the dead.
