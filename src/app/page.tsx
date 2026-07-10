@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { getSessionUserId } from "@/lib/session";
 import { db } from "@/lib/supabase";
 import Dashboard from "./dashboard";
@@ -52,17 +53,21 @@ export default async function Home({
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,_rgba(14,165,233,0.14),_transparent_60%)]"
       />
       <div className="relative max-w-md space-y-8 text-center">
-        <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-sky-500/10 text-4xl ring-1 ring-sky-500/30">
-          🎧
-        </div>
-        <div className="space-y-3">
-          <h1 className="text-3xl font-semibold tracking-tight">Bookmark Brief</h1>
-          <p className="leading-relaxed text-zinc-400">
-            Your X bookmarks, turned into a weekly podcast. Sign in, pick a date range and topics,
-            and get a markdown summary or a two-host audio brief — fact-checked against Community
-            Notes, with stale news filtered out.
-          </p>
-        </div>
+        {/* Visible branding is the wordmark image; keep a screen-reader heading */}
+        <h1 className="sr-only">Bookmark Graveyard</h1>
+        {/* Fixed 320px on every viewport (fits a 375px phone inside the px-6
+            gutters) so the mark reads as a stamp, not a banner. */}
+        <Image
+          src="/logo.jpg"
+          alt="Bookmark Graveyard"
+          width={320}
+          height={160}
+          priority
+          className="mx-auto w-[320px] border-[6px] border-black shadow-2xl shadow-black/70"
+        />
+        <p className="text-lg tracking-wide text-zinc-300">
+          Raise your bookmarks from the dead.
+        </p>
         {error === "not_allowed" && (
           <p className="rounded-xl border border-amber-800/60 bg-amber-950/20 px-4 py-3 text-sm text-amber-300">
             This account isn&apos;t on the allowlist for this instance.
