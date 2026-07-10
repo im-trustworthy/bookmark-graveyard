@@ -406,7 +406,7 @@ export default function Dashboard({
               />
             )}
             <div className="min-w-0">
-              <h1 className="truncate text-xl font-semibold tracking-tight">
+              <h1 className="truncate font-heading text-2xl tracking-wide sm:text-3xl">
                 Welcome back, @{user.handle}
               </h1>
               <p className="text-sm text-zinc-400">Let&apos;s create your summary.</p>
@@ -473,7 +473,7 @@ export default function Dashboard({
 
         {/* Format picker */}
         <section className="space-y-2">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+          <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
             How would you like it?
           </h2>
           <div className="flex flex-wrap gap-2">
@@ -496,7 +496,7 @@ export default function Dashboard({
 
         {/* Filters */}
         <section className="space-y-4 rounded-2xl border border-zinc-800 p-5">
-          <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">Filters</h2>
+          <h2 className="font-heading text-2xl tracking-wide text-zinc-100">Filters</h2>
           <div className="flex flex-wrap items-center gap-3">
             <label className="text-sm text-zinc-400">
               From{" "}
@@ -547,7 +547,7 @@ export default function Dashboard({
           <button
             onClick={createBrief}
             disabled={creating || (selected.size === 0 && bookmarks.length === 0)}
-            className="w-full rounded-2xl bg-sky-500 py-4 text-lg font-semibold text-white transition hover:bg-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:hover:bg-zinc-800"
+            className="w-full rounded-2xl bg-sky-500 py-4 font-heading text-xl tracking-wide text-white transition hover:bg-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:hover:bg-zinc-800"
           >
             {creating
               ? "Creating your brief…"
@@ -596,7 +596,7 @@ export default function Dashboard({
         {/* Result */}
         {result && (
           <section className="space-y-4 rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5">
-            <h2 className="font-semibold">{result.episode.title}</h2>
+            <h2 className="font-heading text-2xl tracking-wide">{result.episode.title}</h2>
             {result.stats && (
               <p className="text-sm text-zinc-400">
                 {result.stats.considered} bookmarks considered
@@ -652,7 +652,7 @@ export default function Dashboard({
         {/* Bookmark list */}
         <section className="space-y-3">
           <div className="flex items-baseline justify-between">
-            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+            <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
               Your bookmarks {loading ? "…" : `(${bookmarks.length})`}
             </h2>
             <span className="text-xs text-zinc-600">
@@ -738,14 +738,14 @@ export default function Dashboard({
         {/* Episode history */}
         {episodes.length > 0 && (
           <section className="space-y-3">
-            <h2 className="text-sm font-medium text-zinc-400 uppercase tracking-wide">
+            <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
               Previous briefs
             </h2>
             <ul className="space-y-3">
               {episodes.map((ep) => (
                 <li key={ep.id} className="space-y-3 rounded-xl border border-zinc-800 p-4">
                   <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-                    <span className="text-sm font-medium text-zinc-100">{ep.title}</span>
+                    <span className="font-heading text-lg tracking-wide text-zinc-100">{ep.title}</span>
                     <span className="text-xs text-zinc-600">
                       {new Date(ep.created_at).toLocaleDateString("en-US", {
                         month: "short",
