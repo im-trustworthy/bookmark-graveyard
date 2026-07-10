@@ -68,8 +68,10 @@ function isoDaysAgo(days: number): string {
 
 export default function Dashboard({
   user,
+  greeting = "Welcome back",
 }: {
   user: { handle: string; display_name: string | null; avatar_url: string | null };
+  greeting?: string;
 }) {
   const [format, setFormat] = useState<Format>("both");
   const [from, setFrom] = useState(isoDaysAgo(7));
@@ -410,8 +412,8 @@ export default function Dashboard({
   const formatOptions: { value: Format; label: string }[] = useMemo(
     () => [
       { value: "markdown", label: "Markdown" },
-      { value: "audio", label: "Audio" },
-      { value: "both", label: "Markdown + Audio" },
+      { value: "audio", label: "Podcast" },
+      { value: "both", label: "Markdown + Podcast" },
     ],
     []
   );
@@ -456,9 +458,9 @@ export default function Dashboard({
             )}
             <div className="min-w-0">
               <h1 className="truncate font-heading text-2xl tracking-wide sm:text-3xl">
-                Welcome back, @{user.handle}
+                {greeting}, @{user.handle}
               </h1>
-              <p className="text-sm text-zinc-400">Let&apos;s create your summary.</p>
+              <p className="text-sm text-zinc-400">Let&apos;s revive your bookmarks.</p>
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
@@ -531,7 +533,7 @@ export default function Dashboard({
         {/* Format picker */}
         <section className="space-y-2">
           <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
-            How would you like it?
+            How would you like your summary?
           </h2>
           <div className="flex flex-wrap gap-2">
             {formatOptions.map((opt) => (
