@@ -392,7 +392,26 @@ export default function Dashboard({
   );
 
   return (
-    <main className="min-h-screen bg-zinc-950 text-zinc-100">
+    <main className="relative min-h-screen text-zinc-100">
+      {/* Background video — same treatment as the landing page: muted +
+          playsInline for mobile autoplay, loops, restarts on refresh,
+          object-cover for every viewport, hidden under prefers-reduced-motion
+          (body's zinc-950 remains). Fixed so it holds through scrolling. */}
+      <video
+        aria-hidden="true"
+        autoPlay
+        muted
+        loop
+        playsInline
+        preload="auto"
+        disablePictureInPicture
+        className="pointer-events-none fixed inset-0 -z-20 h-full w-full object-cover motion-reduce:hidden"
+      >
+        <source src="/main-page-bg.mp4" type="video/mp4" />
+      </video>
+      {/* Scrim: light enough to keep the scene visible — the glass panels
+          add their own local darkening + blur where text needs contrast */}
+      <div aria-hidden="true" className="pointer-events-none fixed inset-0 -z-10 bg-zinc-950/65" />
       <div className="max-w-3xl mx-auto px-6 py-10 space-y-8">
         {/* Header */}
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -417,7 +436,7 @@ export default function Dashboard({
               onClick={sync}
               disabled={syncing}
               aria-label={syncing ? "Syncing bookmarks" : "Sync bookmarks"}
-              className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+              className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
             >
               {syncing ? "Syncing…" : "Re-sync"}
             </button>
@@ -445,7 +464,7 @@ export default function Dashboard({
 
         {/* Resumable draft banner */}
         {resumable && !creating && (
-          <section className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-800/60 bg-amber-950/20 p-4">
+          <section className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-amber-400/25 bg-amber-500/10 p-4 backdrop-blur-xl">
             <p className="text-sm text-amber-200">
               A brief from{" "}
               {resumable.createdAt
@@ -485,7 +504,7 @@ export default function Dashboard({
                 className={`rounded-full border px-4 py-2 text-sm transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
                   format === opt.value
                     ? "border-zinc-100 bg-zinc-100 font-medium text-zinc-950"
-                    : "border-zinc-700 hover:border-zinc-500"
+                    : "border-white/15 bg-white/5 backdrop-blur-md hover:border-white/30"
                 }`}
               >
                 {opt.label}
@@ -495,7 +514,7 @@ export default function Dashboard({
         </section>
 
         {/* Filters */}
-        <section className="space-y-4 rounded-2xl border border-zinc-800 p-5">
+        <section className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.06] p-5 shadow-lg shadow-black/20 backdrop-blur-xl">
           <h2 className="font-heading text-2xl tracking-wide text-zinc-100">Filters</h2>
           <div className="flex flex-wrap items-center gap-3">
             <label className="text-sm text-zinc-400">
@@ -504,7 +523,7 @@ export default function Dashboard({
                 type="date"
                 value={from}
                 onChange={(e) => setFrom(e.target.value)}
-                className="ml-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-100 [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+                className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               />
             </label>
             <label className="text-sm text-zinc-400">
@@ -513,7 +532,7 @@ export default function Dashboard({
                 type="date"
                 value={to}
                 onChange={(e) => setTo(e.target.value)}
-                className="ml-1 rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-1.5 text-zinc-100 [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+                className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
               />
             </label>
             <span className="text-xs text-zinc-600">Filters by the post&apos;s date.</span>
@@ -528,7 +547,7 @@ export default function Dashboard({
                   className={`rounded-full border px-3 py-1 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
                     selectedTopics.includes(topic)
                       ? "border-sky-500 bg-sky-500/20 text-sky-300"
-                      : "border-zinc-700 text-zinc-400 hover:border-zinc-500"
+                      : "border-white/15 bg-white/5 text-zinc-300 backdrop-blur-md hover:border-white/30"
                   }`}
                 >
                   {topic}
@@ -556,7 +575,7 @@ export default function Dashboard({
                 : `Create my brief (all ${bookmarks.length} shown)`}
           </button>
           {creating && (
-            <div className="space-y-3 rounded-2xl border border-zinc-800 p-4">
+            <div className="space-y-3 rounded-2xl border border-white/10 bg-white/[0.06] p-4 shadow-lg shadow-black/20 backdrop-blur-xl">
               <div className="flex items-center justify-between text-sm">
                 <span className="text-zinc-300">{createStage}</span>
                 <span className="tabular-nums text-zinc-600">
@@ -595,7 +614,7 @@ export default function Dashboard({
 
         {/* Result */}
         {result && (
-          <section className="space-y-4 rounded-2xl border border-emerald-800/60 bg-emerald-950/20 p-5">
+          <section className="space-y-4 rounded-2xl border border-emerald-400/25 bg-emerald-500/10 p-5 backdrop-blur-xl">
             <h2 className="font-heading text-2xl tracking-wide">{result.episode.title}</h2>
             {result.stats && (
               <p className="text-sm text-zinc-400">
@@ -619,7 +638,7 @@ export default function Dashboard({
                 <a
                   href={result.episode.markdown_url}
                   download="bookmark-brief.md"
-                  className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+                  className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .md
                 </a>
@@ -628,7 +647,7 @@ export default function Dashboard({
                 <a
                   href={result.episode.audio_url}
                   download="bookmark-brief.mp3"
-                  className="rounded-full border border-zinc-700 px-4 py-2 text-sm transition hover:border-zinc-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+                  className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .mp3
                 </a>
@@ -639,7 +658,7 @@ export default function Dashboard({
                 <summary className="cursor-pointer rounded text-sm text-zinc-400 transition hover:text-zinc-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500">
                   Preview markdown
                 </summary>
-                <div className="mt-3 max-h-96 overflow-y-auto rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
+                <div className="mt-3 max-h-96 overflow-y-auto rounded-xl border border-white/10 bg-zinc-950/40 p-4 backdrop-blur-md">
                   <div className="prose prose-invert prose-sm max-w-none prose-headings:text-zinc-100 prose-strong:text-zinc-100 prose-code:text-zinc-200 prose-a:text-sky-400 prose-a:no-underline hover:prose-a:underline">
                     <ReactMarkdown remarkPlugins={[remarkGfm]}>{result.markdown}</ReactMarkdown>
                   </div>
@@ -674,10 +693,10 @@ export default function Dashboard({
                 <li
                   key={b.tweet_id}
                   onClick={() => toggleSelected(b.tweet_id)}
-                  className={`cursor-pointer space-y-2 rounded-xl border p-4 transition ${
+                  className={`cursor-pointer space-y-2 rounded-xl border p-4 backdrop-blur-md transition ${
                     isSelected
-                      ? "border-sky-500 bg-sky-500/10"
-                      : "border-zinc-800 hover:border-zinc-600"
+                      ? "border-sky-400/60 bg-sky-400/15"
+                      : "border-white/10 bg-white/[0.04] hover:border-white/25"
                   }`}
                 >
                   <div className="flex items-baseline justify-between gap-2">
@@ -743,7 +762,7 @@ export default function Dashboard({
             </h2>
             <ul className="space-y-3">
               {episodes.map((ep) => (
-                <li key={ep.id} className="space-y-3 rounded-xl border border-zinc-800 p-4">
+                <li key={ep.id} className="space-y-3 rounded-xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur-md">
                   <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
                     <span className="font-heading text-lg tracking-wide text-zinc-100">{ep.title}</span>
                     <span className="text-xs text-zinc-600">
