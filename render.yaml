@@ -1,0 +1,59 @@
+# Render Blueprint — in the Render dashboard: New + → Blueprint → pick this repo.
+# Render prompts for every `sync: false` value on first deploy (same values as
+# .env.local, plus GATE_PASSWORD for the site-wide password wall and CRON_SECRET
+# for the weekly sync). See SETUP.md → "Deploy on Render".
+services:
+  - type: web
+    name: bookmark-graveyard
+    runtime: node
+    plan: starter # `free` also works: sleeps when idle, ~1 min cold start
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: GATE_PASSWORD
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: X_CLIENT_ID
+        sync: false
+      - key: X_CLIENT_SECRET
+        sync: false
+      - key: XAI_API_KEY
+        sync: false
+      - key: ELEVENLABS_API_KEY
+        sync: false
+      - key: ELEVENLABS_VOICE_HOST_A
+        sync: false
+      - key: ELEVENLABS_VOICE_HOST_B
+        sync: false
+      - key: APP_ENCRYPTION_KEY
+        sync: false
+      - key: SESSION_SECRET
+        sync: false
+      - key: APP_URL
+        sync: false # e.g. https://bookmarks.allensantamaria.com
+      - key: ALLOWED_X_USER_IDS
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+
+  # Weekly bookmark sync — same Friday-noon-UTC schedule vercel.json used.
+  # Calls the app's own bearer-protected endpoint, which the password wall
+  # in src/proxy.ts deliberately leaves reachable.
+  - type: cron
+    name: bookmark-graveyard-weekly-sync
+    runtime: node
+    schedule: "0 12 * * 5"
+    buildCommand: "true"
+    startCommand: curl -fsS --max-time 600 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/sync"
+    envVars:
+      - key: CRON_SECRET
+        sync: false
+      - key: APP_URL
+        sync: false
