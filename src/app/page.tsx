@@ -66,7 +66,7 @@ export default async function Home({
           priority
           className="mx-auto w-[320px]"
         />
-        <p className="text-lg tracking-wide text-zinc-300">
+        <p className="font-metal text-[38px] leading-tight text-white sm:text-[52px] [text-shadow:0_0_18px_rgba(56,189,248,0.4),0_0_55px_rgba(56,189,248,0.18)]">
           Raise your bookmarks from the dead.
         </p>
         {error === "not_allowed" && (
@@ -82,7 +82,7 @@ export default async function Home({
         )}
         <a
           href="/api/auth/login"
-          className="inline-flex items-center justify-center gap-2 rounded-full bg-zinc-100 px-6 py-3 font-medium text-zinc-950 transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+          className="inline-flex items-center justify-center gap-2 rounded-full bg-zinc-100 px-7 py-3 font-heading text-lg tracking-wide text-zinc-950 transition hover:bg-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
         >
           Sign in with X
         </a>

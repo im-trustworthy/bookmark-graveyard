@@ -2,22 +2,37 @@
 @plugin "@tailwindcss/typography";
 
 :root {
-  /* Bookmark Brief is dark-themed only (zinc-950/zinc-100) — no light
-     variant, so these stay fixed rather than following OS preference. */
+  /* Bookmark Brief is dark-themed only — no light variant, so these stay
+     fixed rather than following OS preference. Body text sits slightly
+     below pure white (#e5e5e5) for long-reading comfort on dark. */
   --background: var(--color-zinc-950);
-  --foreground: var(--color-zinc-100);
+  --foreground: var(--color-zinc-200);
 }
 
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  /* Inter for all body/UI text; `font-heading` = Anton for headlines and
+     primary buttons; `font-metal` = Metal Mania, hero tagline only. */
+  --font-sans: var(--font-inter);
+  --font-heading: var(--font-anton);
+  --font-metal: var(--font-metal-mania);
   --font-mono: var(--font-geist-mono);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
+  /* 16px base on mobile, 17px from tablet up; generous leading reads far
+     better on dark backgrounds. */
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+@media (min-width: 640px) {
+  body {
+    font-size: 17px;
+  }
 }
 
 /* Indeterminate progress bar sweep */
