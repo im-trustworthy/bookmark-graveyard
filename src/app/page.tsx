@@ -29,6 +29,24 @@ export default async function Home({
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-zinc-950 px-6 text-zinc-100">
+      {/* Background video. muted + playsInline are required for mobile autoplay
+          (iOS/Android block un-muted autoplay); loop keeps it running; object-cover
+          scales/crops it to fill any viewport (phone, tablet, desktop). Hidden for
+          prefers-reduced-motion users — the zinc/gradient backdrop remains. */}
+      <video
+        aria-hidden="true"
+        autoPlay
+        muted
+        loop
+        playsInline
+        preload="auto"
+        disablePictureInPicture
+        className="pointer-events-none absolute inset-0 h-full w-full object-cover motion-reduce:hidden"
+      >
+        <source src="/homepage.mp4" type="video/mp4" />
+      </video>
+      {/* Scrim + accent glow above the video so the copy stays readable */}
+      <div aria-hidden="true" className="pointer-events-none absolute inset-0 bg-zinc-950/70" />
       <div
         aria-hidden="true"
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_top,_rgba(14,165,233,0.14),_transparent_60%)]"
