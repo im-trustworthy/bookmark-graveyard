@@ -604,7 +604,7 @@ export default function Dashboard({
           <button
             onClick={createBrief}
             disabled={creating || (selected.size === 0 && bookmarks.length === 0)}
-            className="w-full rounded-2xl bg-sky-500 py-4 font-heading text-xl tracking-wide text-white transition hover:bg-sky-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:bg-zinc-800 disabled:text-zinc-500 disabled:hover:bg-zinc-800"
+            className="relative w-full overflow-hidden rounded-2xl border border-white/10 bg-gradient-to-b from-zinc-800 via-zinc-950 to-black py-4 font-heading text-xl tracking-wide text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.28),inset_0_-3px_8px_rgba(0,0,0,0.9),0_10px_30px_rgba(0,0,0,0.55)] transition before:pointer-events-none before:absolute before:inset-x-3 before:top-1 before:h-[45%] before:rounded-t-xl before:bg-gradient-to-b before:from-white/15 before:to-transparent hover:from-zinc-700 active:translate-y-px active:from-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 disabled:cursor-not-allowed disabled:border-white/5 disabled:bg-none disabled:bg-zinc-900 disabled:text-zinc-600 disabled:shadow-none disabled:before:hidden"
           >
             {creating
               ? "Creating your brief…"
