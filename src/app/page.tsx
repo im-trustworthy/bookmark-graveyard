@@ -66,7 +66,10 @@ export default async function Home({
           priority
           className="mx-auto w-[320px]"
         />
-        <p className="font-metal text-[38px] leading-tight text-white sm:text-[52px] [text-shadow:0_0_18px_rgba(56,189,248,0.4),0_0_55px_rgba(56,189,248,0.18)]">
+        {/* Sized so the line never wraps: the phrase measures ~14.15x its
+            font-size in Metal Mania, so 23px ≈ 325px (mobile) and
+            28px ≈ 396px (desktop) — always a touch wider than the 320px mark. */}
+        <p className="font-metal whitespace-nowrap text-[23px] leading-tight text-white sm:text-[28px] [text-shadow:0_0_18px_rgba(56,189,248,0.4),0_0_55px_rgba(56,189,248,0.18)]">
           Raise your bookmarks from the dead.
         </p>
         {error === "not_allowed" && (
