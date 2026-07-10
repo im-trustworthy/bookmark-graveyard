@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -97,6 +97,31 @@ export default function Dashboard({
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [resumable, setResumable] = useState<ResumableDraft | null>(null);
   const [discarding, setDiscarding] = useState(false);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [bgOn, setBgOn] = useState(true);
+
+  // Honor the saved background preference. Runs post-hydration, so it also
+  // pauses the autoPlay that may have already kicked off.
+  useEffect(() => {
+    if (localStorage.getItem("bb_bg") === "off") {
+      setBgOn(false);
+      bgVideoRef.current?.pause();
+    }
+  }, []);
+
+  function toggleBackground() {
+    const next = !bgOn;
+    setBgOn(next);
+    localStorage.setItem("bb_bg", next ? "on" : "off");
+    const video = bgVideoRef.current;
+    if (!video) return;
+    if (next) {
+      // Called inside the click gesture, so playback starts immediately
+      video.play().catch(() => {});
+    } else {
+      video.pause();
+    }
+  }
 
   const loadBookmarks = useCallback(async () => {
     setLoading(true);
@@ -398,6 +423,7 @@ export default function Dashboard({
           object-cover for every viewport, hidden under prefers-reduced-motion
           (body's zinc-950 remains). Fixed so it holds through scrolling. */}
       <video
+        ref={bgVideoRef}
         aria-hidden="true"
         autoPlay
         muted
@@ -405,13 +431,17 @@ export default function Dashboard({
         playsInline
         preload="auto"
         disablePictureInPicture
-        className="pointer-events-none fixed inset-0 -z-20 h-full w-full object-cover motion-reduce:hidden"
+        className={`pointer-events-none fixed inset-0 -z-20 h-full w-full object-cover motion-reduce:hidden ${bgOn ? "" : "hidden"}`}
       >
         <source src="/main-page-bg.mp4" type="video/mp4" />
       </video>
       {/* Scrim: light enough to keep the scene visible — the glass panels
-          add their own local darkening + blur where text needs contrast */}
-      <div aria-hidden="true" className="pointer-events-none fixed inset-0 -z-10 bg-zinc-950/65" />
+          add their own local darkening + blur where text needs contrast.
+          With the background stopped it goes fully opaque black. */}
+      <div
+        aria-hidden="true"
+        className={`pointer-events-none fixed inset-0 -z-10 ${bgOn ? "bg-zinc-950/65" : "bg-black"}`}
+      />
       <div className="max-w-3xl mx-auto px-6 py-10 space-y-8">
         {/* Header */}
         <header className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
@@ -432,6 +462,14 @@ export default function Dashboard({
             </div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
+            <button
+              onClick={toggleBackground}
+              aria-pressed={bgOn}
+              aria-label={bgOn ? "Stop background animation" : "Start background animation"}
+              className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+            >
+              {bgOn ? "Stop background" : "Start background"}
+            </button>
             <button
               onClick={sync}
               disabled={syncing}
