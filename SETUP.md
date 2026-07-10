@@ -73,6 +73,29 @@ reading notes on arbitrary posts). A daily GitHub Actions job does the matching:
 
 Until this job runs, everything works — posts just won't carry Community-Notes flags yet.
 
+## Deploy on Render (password-protected)
+
+The app ships with a site-wide password wall (`src/proxy.ts`): every visitor gets a
+password prompt before anything — even the landing page — is served. The X-OAuth
+allowlist still protects the actual data behind it.
+
+1. Push this repo to GitHub, then in the [Render dashboard](https://dashboard.render.com):
+   **New + → Blueprint** → pick this repo. `render.yaml` creates the web service plus the
+   weekly Friday sync cron.
+2. Render prompts for the env vars: paste every value from `.env.local`, plus
+   - `GATE_PASSWORD` — the site password (share it with whoever should get in)
+   - `CRON_SECRET` — any long random string (protects `/api/cron/sync`)
+   - `APP_URL` — the public URL, e.g. `https://bookmarks.example.com`
+3. Custom domain: web service → **Settings → Custom Domains** → add
+   `bookmarks.example.com`, then add the CNAME Render shows you at your DNS
+   provider (same place example.com's DNS lives).
+4. Add `https://bookmarks.example.com/api/auth/callback/x` as a callback URI in
+   your X app (step 2.4 above).
+5. Set `ALLOWED_X_USER_IDS` to your own X user ID so the password isn't the only wall.
+
+A static site can link here — the
+password check itself is server-side in this app, since a static site can't keep a secret.
+
 ## Optional: deploy + weekly automation (Vercel)
 
 1. Push to GitHub → import the repo at https://vercel.com → add every variable from
