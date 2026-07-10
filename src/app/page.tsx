@@ -3,6 +3,19 @@ import { getSessionUserId } from "@/lib/session";
 import { db } from "@/lib/supabase";
 import Dashboard from "./dashboard";
 
+// Rotating dashboard greeting — picked server-side per page load so SSR HTML
+// and hydration agree (Math.random() in the client component would mismatch).
+const GREETINGS = [
+  "Welcome back",
+  "Hello",
+  "Welcome",
+  "Glad you're here",
+  "Time to revive",
+  "Boo",
+  "Back from the dead",
+  "The graveyard stirs",
+];
+
 export default async function Home({
   searchParams,
 }: {
@@ -26,7 +39,10 @@ export default async function Home({
     // Env not configured yet — fall through to the landing page.
   }
 
-  if (user) return <Dashboard user={user} />;
+  if (user) {
+    const greeting = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
+    return <Dashboard user={user} greeting={greeting} />;
+  }
 
   return (
     <main className="relative flex min-h-screen items-center justify-center overflow-hidden bg-zinc-950 px-6 text-zinc-100">
