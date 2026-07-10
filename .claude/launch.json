@@ -6,6 +6,25 @@
       "runtimeExecutable": "npm",
       "runtimeArgs": ["run", "dev"],
       "port": 3000
+    },
+    {
+      "name": "dev-alt",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "-p", "3100"],
+      "port": 3100
+    },
+    {
+      "name": "talk-to-allen-static",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": [
+        "-y",
+        "http-server",
+        "/private/tmp/claude-501/-Users-allen-Desktop-x-bookmark/6e2d86e8-4d52-4ba2-9306-5ef76f51cb7f/scratchpad/talk-to-allen",
+        "-p",
+        "4173",
+        "-c-1"
+      ],
+      "port": 4173
     }
   ]
 }
