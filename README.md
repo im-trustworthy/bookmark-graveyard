@@ -46,7 +46,7 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
 ### Credibility & staleness
 - A daily GitHub Actions job (`.github/workflows/community-notes.yml`, 06:30 UTC) streams X's
   public Community Notes dataset and matches notes against your bookmarked `tweet_id`s — there's no
-  API for reading notes on an arbitrary post, so this reads the same bulk TSV dumps X publishes.
+  API for reading notes on an arbitrary post, so this reads the same bulk zipped TSV dumps X publishes.
 - Posts with a note classified `MISINFORMED_OR_POTENTIALLY_MISLEADING` **and** currently rated
   helpful are excluded from digests entirely (listed separately, as links only). Posts with any
   other note are kept, but the digest is told to caveat them.
@@ -102,7 +102,7 @@ Next.js API routes  (src/app/api/**)
 Unattended jobs, outside the request path:
 
   GitHub Actions (daily, 06:30 UTC)
-    scripts/community-notes-sync.mjs --> X's public Community Notes TSV dumps
+    scripts/community-notes-sync.mjs --> X's public Community Notes zipped TSV dumps
                                       --> Supabase `community_notes` table
 
   Vercel Cron (Fridays, vercel.json)
