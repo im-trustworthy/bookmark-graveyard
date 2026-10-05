@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
 import { estimateDurationSeconds, LINES_PER_CALL } from "@/lib/tts";
+import { mp3DurationSeconds, stripMp3Headers } from "@/lib/mp3";
 import { signEpisodeUrls } from "@/lib/episodes";
 import { apiError } from "@/lib/errors";
 import type { ScriptLine } from "@/lib/brain";
@@ -79,16 +80,20 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    // MP3 segments share one fixed encoding, so byte concatenation is valid.
+    // Chunks share one fixed CBR encoding, so byte concatenation is valid.
+    // Chunks are rendered header-free (src/lib/tts.ts); stripping again here
+    // keeps chunks from an older deploy from reintroducing mid-stream Info
+    // headers that break seeking. Idempotent on clean input.
     const buffers: Buffer[] = [];
     for (const file of chunkFiles) {
       const { data, error } = await storage.download(`${base}/chunks/${file.name}`);
       if (error || !data) throw new Error(`Chunk download failed: ${error?.message}`);
       buffers.push(Buffer.from(await data.arrayBuffer()));
     }
+    const audio = stripMp3Headers(Buffer.concat(buffers));
 
     const audioPath = `${base}/brief.mp3`;
-    const { error: upErr } = await storage.upload(audioPath, Buffer.concat(buffers), {
+    const { error: upErr } = await storage.upload(audioPath, audio, {
       contentType: "audio/mpeg",
       upsert: true,
     });
@@ -100,7 +105,9 @@ export async function POST(req: NextRequest) {
       .from("episodes")
       .update({
         audio_path: audioPath,
-        duration_seconds: estimateDurationSeconds(script),
+        // Real length from the frames we just stitched; the word-count estimate is
+        // only a fallback if the parser somehow finds no frames.
+        duration_seconds: Math.round(mp3DurationSeconds(audio)) || estimateDurationSeconds(script),
         status: "ready",
       })
       .eq("user_id", userId)
