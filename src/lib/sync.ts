@@ -5,6 +5,8 @@ export interface SyncResult {
   fetched: number;
   new: number;
   pendingAnalysis: number;
+  /** The newly stored bookmarks, so the UI can tell which fall outside its date window. */
+  newBookmarks: { tweet_id: string; tweet_created_at: string | null }[];
 }
 
 /** Fetches bookmarks from X and stores them. Fast — analysis runs separately. */
@@ -35,5 +37,10 @@ export async function syncUser(userId: string): Promise<SyncResult> {
     ).count ?? 0;
   const pendingAnalysis = (await countRows("bookmarks")) - (await countRows("bookmark_analysis"));
 
-  return { fetched: bookmarks.length, new: fresh.length, pendingAnalysis };
+  return {
+    fetched: bookmarks.length,
+    new: fresh.length,
+    pendingAnalysis,
+    newBookmarks: fresh.map((b) => ({ tweet_id: b.tweet_id, tweet_created_at: b.tweet_created_at })),
+  };
 }
