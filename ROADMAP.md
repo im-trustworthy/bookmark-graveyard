@@ -76,3 +76,32 @@ Non-blocking for personal use; worth doing before a public multi-user deploy.
   VM/container with internal network reach.
 - **Multi-draft resume.** Only the newest draft surfaces for resume; older
   orphaned drafts are invisible until the newer one resolves.
+
+---
+
+## "Saved between" date mode — BACKLOGGED (2026-10-05)
+
+**What we want:** a switch on the dashboard date filter, "Posted between" vs
+"Saved between", so a two-week window shows what the user *bookmarked* in the
+last two weeks regardless of how old the post is. "Saved" would filter on
+`bookmarks.first_seen_at` (the moment a sync first saw the bookmark), because
+X's API does not expose when a post was bookmarked.
+
+**Why it's deferred:** accuracy equals sync frequency. Until an unattended
+nightly sync runs, "saved" dates cluster on whichever day the user happened to
+hit the sync button, which is more misleading than having no mode at all. The
+cron endpoint already exists (`/api/cron/sync`, bearer-protected) but nothing
+schedules it, and the Render deploy still fails closed (503) because its env
+vars were never set. Separately, every bookmark from before the app was first
+connected shares one `first_seen_at` and would need a "saved before you
+connected" bucket in the UI.
+
+**Unblock condition:** nightly sync in place — Render env vars pasted, a daily
+scheduler (e.g. a GitHub Actions cron calling the endpoint with `CRON_SECRET`),
+and early-stop pagination in `fetchAllBookmarks` (X returns newest-saved first,
+so stop at the first page with nothing new; a daily check then costs one page).
+
+**Build sketch at that point:** add `mode=posted|saved` to `/api/bookmarks`
+(switch the filtered column; topic counts follow the same window), a toggle
+beside the pickers in `src/app/dashboard.tsx`, default to "saved", and a
+one-line hint per mode.
