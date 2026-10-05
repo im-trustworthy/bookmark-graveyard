@@ -181,9 +181,9 @@ regular HTTP request instead of needing a background job queue.
 - **X reads** — pay-per-use, bookmark reads are billed at $0.001/post. A first sync (~800 posts)
   costs under a dollar; weekly incremental syncs are pennies.
 - **Grok** — the two-tier model blend exists specifically for token efficiency. The FAST model
-  (`grok-4.20-0309-non-reasoning`, override with `XAI_MODEL_FAST`) does all the high-volume,
+  (`grok-4.3`, override with `XAI_MODEL_FAST`) does all the high-volume,
   low-reasoning work: image descriptions, per-post categorization, article-match verification,
-  staleness checks. The SMART model (`grok-4.5`, override with `XAI_MODEL_SMART`) is reserved for
+  staleness checks. The SMART model (`grok-4.7`, override with `XAI_MODEL_SMART`) is reserved for
   low-volume, high-value synthesis: digest outline, digest composition, podcast script, and live
   search. A full sync plus a weekly digest is typically well under $1 in xAI usage.
 - **ElevenLabs TTS is the dominant real cost.** Unlike Grok, there's no cheap tier for speech —
