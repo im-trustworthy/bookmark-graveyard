@@ -1,5 +1,6 @@
 import { env } from "./env";
 import type { ScriptLine } from "./brain";
+import { stripMp3Headers } from "./mp3";
 
 const API = "https://api.elevenlabs.io/v1";
 // Turbo = 0.5 credits/char, roughly doubles what a Creator subscription can render per month.
@@ -41,9 +42,12 @@ async function renderLine(
 
 /**
  * Renders dialogue lines with each host's voice and stitches the segments.
- * ElevenLabs returns headerless MPEG audio streams at a fixed format, so
- * direct concatenation produces a valid playable MP3. `context` carries the
- * neighboring lines when rendering a mid-script chunk, for prosody continuity.
+ * ElevenLabs returns each clip as a complete MP3 file (ID3 tag + Xing/Info
+ * header frame + fixed-format CBR audio frames). Only the audio frames are
+ * kept, so the concatenation is one clean stream that every player can
+ * measure and seek — see src/lib/mp3.ts for why that matters. `context`
+ * carries the neighboring lines when rendering a mid-script chunk, for
+ * prosody continuity.
  */
 export async function renderPodcast(
   lines: ScriptLine[],
@@ -53,10 +57,12 @@ export async function renderPodcast(
   const segments: Buffer[] = [];
   for (let i = 0; i < lines.length; i++) {
     segments.push(
-      await renderLine(
-        lines[i],
-        lines[i - 1]?.line ?? context.previousLine,
-        lines[i + 1]?.line ?? context.nextLine
+      stripMp3Headers(
+        await renderLine(
+          lines[i],
+          lines[i - 1]?.line ?? context.previousLine,
+          lines[i + 1]?.line ?? context.nextLine
+        )
       )
     );
     onProgress?.(i + 1, lines.length);
