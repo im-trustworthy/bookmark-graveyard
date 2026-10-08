@@ -7,7 +7,7 @@ Be kind. Assume good faith, keep feedback about the code, and welcome newcomers.
 
 ## Run it locally
 
-You need [Node.js](https://nodejs.org) 20 or newer and [git](https://git-scm.com). Then follow
+You need [Node.js](https://nodejs.org) 22 or newer and [git](https://git-scm.com). Then follow
 [SETUP.md](SETUP.md) to get your own Supabase project, X app and xAI key. In short:
 
 ```bash

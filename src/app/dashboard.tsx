@@ -1,6 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useEffectEvent,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import { describeSync, formatRange } from "@/lib/dashboard-text";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -181,6 +189,35 @@ function AudioRemoved({ episode }: { episode: Episode }) {
   );
 }
 
+// The "Stop background" preference, saved in localStorage as "bb_bg". It is read through
+// useSyncExternalStore instead of being copied into state by an effect. The server render and
+// hydration use "on" (there is no localStorage there), and a saved "off" takes over right after
+// hydration. The first read is cached, so a change made in another tab is picked up on the next
+// page load, not partway through this one.
+const BG_STORAGE_KEY = "bb_bg";
+let bgOnCache: boolean | null = null;
+const bgListeners = new Set<() => void>();
+
+function subscribeBackground(listener: () => void) {
+  bgListeners.add(listener);
+  return () => {
+    bgListeners.delete(listener);
+  };
+}
+
+function getBackgroundOn(): boolean {
+  bgOnCache ??= localStorage.getItem(BG_STORAGE_KEY) !== "off";
+  return bgOnCache;
+}
+
+const getBackgroundOnServer = () => true;
+
+function saveBackgroundOn(on: boolean) {
+  bgOnCache = on;
+  for (const listener of bgListeners) listener();
+  localStorage.setItem(BG_STORAGE_KEY, on ? "on" : "off");
+}
+
 export default function Dashboard({
   user,
   greeting = "Welcome back",
@@ -195,7 +232,6 @@ export default function Dashboard({
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [topicCounts, setTopicCounts] = useState<TopicCount[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
-  const [totalBookmarks, setTotalBookmarks] = useState<number | null>(null);
   const [libraryCount, setLibraryCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
@@ -219,21 +255,17 @@ export default function Dashboard({
   const [capacity, setCapacity] = useState<Capacity | null>(null);
   const [freeUp, setFreeUp] = useState<FreeUp>({ step: "idle" });
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
-  const [bgOn, setBgOn] = useState(true);
+  const bgOn = useSyncExternalStore(subscribeBackground, getBackgroundOn, getBackgroundOnServer);
 
-  // Honor the saved background preference. Runs post-hydration, so it also
-  // pauses the autoPlay that may have already kicked off.
+  // Keep the video paused while the background is off. This covers a saved "off" applied after
+  // hydration, which also pauses the autoPlay that may have already kicked off.
   useEffect(() => {
-    if (localStorage.getItem("bb_bg") === "off") {
-      setBgOn(false);
-      bgVideoRef.current?.pause();
-    }
-  }, []);
+    if (!bgOn) bgVideoRef.current?.pause();
+  }, [bgOn]);
 
   function toggleBackground() {
     const next = !bgOn;
-    setBgOn(next);
-    localStorage.setItem("bb_bg", next ? "on" : "off");
+    saveBackgroundOn(next);
     const video = bgVideoRef.current;
     if (!video) return;
     if (next) {
@@ -244,32 +276,65 @@ export default function Dashboard({
     }
   }
 
-  const loadBookmarks = useCallback(async () => {
-    setLoading(true);
+  // The bookmark list's query. Changing a filter changes it, and the fetch effect below reloads.
+  const bookmarkQuery = useMemo(() => {
     const params = new URLSearchParams({ from, to });
     if (selectedTopics.length > 0) params.set("topics", selectedTopics.join(","));
-    const res = await fetch(`/api/bookmarks?${params}`);
-    let total = null;
-    if (res.ok) {
-      const body = await res.json();
-      setBookmarks(body.bookmarks ?? []);
-      setTopicCounts(body.topics ?? []);
-      total = body.total ?? 0;
-      setTotalBookmarks(total);
-      setLibraryCount(body.library ?? total);
-    }
-    setLoading(false);
-    return total;
+    return params.toString();
   }, [from, to, selectedTopics]);
 
-  const loadEpisodes = useCallback(async () => {
-    const res = await fetch("/api/episodes");
-    if (res.ok) setEpisodes((await res.json()).episodes ?? []);
-  }, []);
+  // A filter change shows the loading state in the same render, not a render later from the fetch
+  // effect (react.dev, "You Might Not Need an Effect": adjusting state when a prop changes).
+  // `loading` starts out true, so the first load needs nothing here.
+  const [prevBookmarkQuery, setPrevBookmarkQuery] = useState(bookmarkQuery);
+  if (bookmarkQuery !== prevBookmarkQuery) {
+    setPrevBookmarkQuery(bookmarkQuery);
+    setLoading(true);
+  }
+
+  // Unfiltered library size from the last successful load, null until one lands. Nothing renders
+  // it: it only tells the first-visit auto-sync which load found the library empty, so it's a ref.
+  const libraryTotalRef = useRef<number | null>(null);
+
+  // GET /api/bookmarks and show the result. Resolves to true when this load found the library empty
+  // and the previous successful load didn't (or there was none yet): the first-visit case.
+  // Like the other loaders the effects below call, it sets state only inside a .then callback:
+  // react-hooks/set-state-in-effect treats a setState after an await in an async function as
+  // synchronous, so an effect calling one would be flagged.
+  const fetchBookmarks = useCallback(
+    (query: string) =>
+      fetch(`/api/bookmarks?${query}`).then(async (res) => {
+        let becameEmpty = false;
+        if (res.ok) {
+          const body = await res.json();
+          const total: number = body.total ?? 0;
+          becameEmpty = total === 0 && libraryTotalRef.current !== 0;
+          libraryTotalRef.current = total;
+          setBookmarks(body.bookmarks ?? []);
+          setTopicCounts(body.topics ?? []);
+          setLibraryCount(body.library ?? total);
+        }
+        setLoading(false);
+        return becameEmpty;
+      }),
+    []
+  );
+
+  // Reloads the list for the current filters, after a sync step or a failed hide.
+  const loadBookmarks = useCallback(() => {
+    setLoading(true);
+    return fetchBookmarks(bookmarkQuery);
+  }, [fetchBookmarks, bookmarkQuery]);
+
+  const loadEpisodes = useCallback(
+    () =>
+      fetch("/api/episodes").then(async (res) => {
+        if (res.ok) setEpisodes((await res.json()).episodes ?? []);
+      }),
+    []
+  );
 
   // Storage/database use for the status line and banner. Best-effort: purely informational.
-  // Uses .then() so the setState sits in a callback: an async function that sets state after an
-  // await trips react-hooks/set-state-in-effect when an effect calls it (as loadEpisodes does).
   const loadCapacity = useCallback(
     () =>
       fetch("/api/capacity")
@@ -283,43 +348,30 @@ export default function Dashboard({
 
   // Checks for an interrupted brief generation (refresh, network blip, TTS
   // hiccup) so it can be offered back as "Resume" instead of silently lost.
-  const checkResumable = useCallback(async () => {
-    try {
-      const res = await fetch("/api/digest/status");
-      if (!res.ok) return;
-      const body = (await res.json()) as DigestStatusResponse;
-      if (body.episodeId && (body.stage === "needs_script" || body.stage === "rendering" || body.stage === "needs_finalize")) {
-        setResumable({
-          episodeId: body.episodeId,
-          stage: body.stage,
-          totalLines: body.totalLines,
-          nextCursor: body.nextCursor,
-          title: body.title,
-          createdAt: body.createdAt,
-        });
-      } else {
-        setResumable(null);
-      }
-    } catch {
-      // Best-effort: the resume banner is a convenience, not the critical path.
-    }
-  }, []);
-
-  useEffect(() => {
-    loadBookmarks();
-  }, [loadBookmarks]);
-
-  useEffect(() => {
-    loadEpisodes();
-  }, [loadEpisodes]);
-
-  useEffect(() => {
-    loadCapacity();
-  }, [loadCapacity]);
-
-  useEffect(() => {
-    checkResumable();
-  }, [checkResumable]);
+  const checkResumable = useCallback(
+    () =>
+      fetch("/api/digest/status")
+        .then(async (res) => {
+          if (!res.ok) return;
+          const body = (await res.json()) as DigestStatusResponse;
+          if (body.episodeId && (body.stage === "needs_script" || body.stage === "rendering" || body.stage === "needs_finalize")) {
+            setResumable({
+              episodeId: body.episodeId,
+              stage: body.stage,
+              totalLines: body.totalLines,
+              nextCursor: body.nextCursor,
+              title: body.title,
+              createdAt: body.createdAt,
+            });
+          } else {
+            setResumable(null);
+          }
+        })
+        .catch(() => {
+          // Best-effort: the resume banner is a convenience, not the critical path.
+        }),
+    []
+  );
 
   const sync = useCallback(async () => {
     setSyncing(true);
@@ -359,11 +411,30 @@ export default function Dashboard({
     }
   }, [loadBookmarks, from, to]);
 
-  // First visit: pull bookmarks automatically instead of waiting for a click.
+  // First visit: an empty library means nothing has been synced yet, so pull bookmarks
+  // automatically instead of waiting for a click, unless a sync is already running. An Effect
+  // Event, so it sees the current `syncing` and `sync` without the fetch effect depending on them.
+  const onLibraryFoundEmpty = useEffectEvent(() => {
+    if (!syncing) sync();
+  });
+
   useEffect(() => {
-    if (totalBookmarks === 0 && !syncing) sync();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [totalBookmarks]);
+    fetchBookmarks(bookmarkQuery).then((becameEmpty) => {
+      if (becameEmpty) onLibraryFoundEmpty();
+    });
+  }, [fetchBookmarks, bookmarkQuery]);
+
+  useEffect(() => {
+    loadEpisodes();
+  }, [loadEpisodes]);
+
+  useEffect(() => {
+    loadCapacity();
+  }, [loadCapacity]);
+
+  useEffect(() => {
+    checkResumable();
+  }, [checkResumable]);
 
   // Ticking clock while a brief is being created, so it never looks frozen
   useEffect(() => {
@@ -989,7 +1060,7 @@ export default function Dashboard({
               {result.episode.markdown_url && (
                 <a
                   href={result.episode.markdown_url}
-                  download="bookmark-brief.md"
+                  download="bookmark-graveyard-brief.md"
                   className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .md
@@ -998,7 +1069,7 @@ export default function Dashboard({
               {result.episode.audio_url && (
                 <a
                   href={result.episode.audio_url}
-                  download="bookmark-brief.mp3"
+                  download="bookmark-graveyard-brief.mp3"
                   className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
                 >
                   Download .mp3

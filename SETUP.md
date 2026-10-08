@@ -5,7 +5,7 @@ optional, since audio briefs can run on your xAI key instead (step 4). Fill in `
 steps 1–4 (about 20–25 minutes, one-time), then run `npm run setup` (step 5): it checks every value,
 generates the two app secrets, and creates the database.
 
-Start with `cp .env.example .env.local`. You can host the finished app anywhere that runs Node 20+
+Start with `cp .env.example .env.local`. You can host the finished app anywhere that runs Node 22+
 and takes environment variables; see the deployment sections at the end. The short, illustrated
 version of this guide is the [README](README.md).
 
@@ -197,7 +197,7 @@ Until this job runs, everything works — posts just won't carry Community-Notes
 
 ## Deploying (any host)
 
-Bookmark Graveyard runs on any host that supports Node.js 20+ and takes environment variables:
+Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environment variables:
 `npm ci && npm run build`, then `npm start`. Render is what the author uses (below); Vercel works
 too (the next section). Neither is required.
 

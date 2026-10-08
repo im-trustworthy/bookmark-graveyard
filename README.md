@@ -17,7 +17,7 @@ are the ones you bring keys for.
 
 ## What you need
 
-You need three accounts, one optional account, and a computer with [Node.js](https://nodejs.org) 20
+You need three accounts, one optional account, and a computer with [Node.js](https://nodejs.org) 22
 or newer (npm comes with it) and [git](https://git-scm.com).
 
 An API key is a long password that lets this app use a service for you. You make one on each
@@ -200,7 +200,7 @@ The `/api/cron/sync` address then syncs and analyzes new bookmarks for everyone 
 
 ## Deploy anywhere
 
-Bookmark Graveyard is a standard Node.js app. Use any host that runs Node 20+ and takes environment
+Bookmark Graveyard is a standard Node.js app. Use any host that runs Node 22+ and takes environment
 variables. [Render](https://render.com) is what the author uses. [Vercel](https://vercel.com) works
 too. Neither is required.
 
