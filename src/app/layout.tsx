@@ -37,8 +37,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Bookmark Brief",
-  description: "Your X bookmarks, turned into a weekly podcast.",
+  title: "Bookmark Graveyard",
+  description: "Raise your X bookmarks from the dead: a weekly brief and podcast made from what you saved.",
 };
 
 export default function RootLayout({

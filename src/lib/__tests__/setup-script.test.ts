@@ -143,7 +143,7 @@ describe("parseEnvFile", () => {
 
 describe("placeholder detection", () => {
   const example = [
-    "# Bookmark Brief — environment variables",
+    "# Bookmark Graveyard — environment variables",
     "NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co",
     "XAI_API_KEY=your-xai-api-key",
     "# ELEVENLABS_API_KEY=your-elevenlabs-api-key",
@@ -236,6 +236,19 @@ describe("optionalStatus", () => {
     expect(rows).toContainEqual(["✓", "ALLOWED_X_USER_IDS", "2 X user IDs"]);
     expect(rows).toContainEqual(["✓", "CRON_SECRET", "set"]);
     expect(JSON.stringify(rows)).not.toMatch(/cron-secret-value|sk_secret_value/);
+  });
+
+  it("warns that an empty allowlist lets anyone in", () => {
+    expect(status({}).ALLOWED_X_USER_IDS).toBe(
+      "– empty: anyone who signs in with X can use this instance and its API keys; fine on your own computer, set it before deploying"
+    );
+  });
+
+  it("reports the optional site password wall without showing the password", () => {
+    expect(status({}).GATE_PASSWORD).toBe("– not set: no site password wall (optional)");
+    const rows = optionalStatus({ GATE_PASSWORD: "gate-secret-value" }, {});
+    expect(rows).toContainEqual(["✓", "GATE_PASSWORD", "set: site password wall on"]);
+    expect(JSON.stringify(rows)).not.toMatch(/gate-secret-value/);
   });
 });
 

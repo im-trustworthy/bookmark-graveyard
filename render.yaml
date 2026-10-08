@@ -1,7 +1,8 @@
 # Render Blueprint — in the Render dashboard: New + → Blueprint → pick this repo.
 # Render prompts for every `sync: false` value on first deploy (same values as
-# .env.local, plus GATE_PASSWORD for the site-wide password wall and CRON_SECRET
-# for the weekly sync). See SETUP.md → "Deploy on Render".
+# .env.local, plus CRON_SECRET for the weekly sync). The optional site password
+# wall is not listed here: add GATE_PASSWORD in the service's Environment tab if
+# you want one. See SETUP.md → "Deploy on Render".
 services:
   - type: web
     name: bookmark-graveyard
@@ -12,8 +13,6 @@ services:
     envVars:
       - key: NODE_VERSION
         value: "22"
-      - key: GATE_PASSWORD
-        sync: false
       - key: NEXT_PUBLIC_SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
@@ -51,8 +50,8 @@ services:
         sync: false
 
   # Weekly bookmark sync — same Friday-noon-UTC schedule vercel.json used.
-  # Calls the app's own bearer-protected endpoint, which the password wall
-  # in src/proxy.ts deliberately leaves reachable.
+  # Calls the app's own bearer-protected endpoint, which the optional password
+  # wall in src/proxy.ts deliberately leaves reachable.
   - type: cron
     name: bookmark-graveyard-weekly-sync
     runtime: node
