@@ -19,6 +19,12 @@ optional, since audio briefs can run on your xAI key instead (step 4). Fill in
    `npm run setup` can create the tables for you in step 5. Only that command uses it: never set it
    on your host.
 
+**Free tier notes.** The free plan's 1 GiB of file storage holds about 70 briefs of podcast audio
+(~13.5 MB each) before the app starts pruning the oldest audio automatically (the markdown always
+stays); the 500 MiB database is plenty. Free projects pause after about a week without activity,
+and the app errors until you unpause the project in the Supabase dashboard. A deployed instance's
+weekly sync keeps it awake.
+
 ## 2. X developer app (10–15 min)
 
 1. Go to https://developer.x.com and sign in with your X account.
