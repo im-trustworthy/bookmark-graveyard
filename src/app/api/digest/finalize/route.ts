@@ -5,6 +5,7 @@ import { estimateDurationSeconds, LINES_PER_CALL } from "@/lib/tts";
 import { mp3DurationSeconds, stripMp3Headers } from "@/lib/mp3";
 import { signEpisodeUrls } from "@/lib/episodes";
 import { apiError } from "@/lib/errors";
+import { CapacityError, ensureRoomFor } from "@/lib/capacity";
 import type { ScriptLine } from "@/lib/brain";
 
 export const maxDuration = 300;
@@ -92,6 +93,11 @@ export async function POST(req: NextRequest) {
     }
     const audio = stripMp3Headers(Buffer.concat(buffers));
 
+    // Past 90% full this prunes the oldest podcast audio first, or refuses
+    // (CapacityError → 507) while the chunks stay put for a later resume,
+    // instead of letting the upload run into the plan's storage limit.
+    await ensureRoomFor(audio.length);
+
     const audioPath = `${base}/brief.mp3`;
     const { error: upErr } = await storage.upload(audioPath, audio, {
       contentType: "audio/mpeg",
@@ -118,6 +124,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({ episode: await signEpisodeUrls(updated) });
   } catch (err) {
+    if (err instanceof CapacityError) return apiError("Digest finalize error", err, err.message, 507);
     return apiError("Digest finalize error", err, "Finalize failed");
   }
 }

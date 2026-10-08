@@ -38,6 +38,8 @@ interface Episode {
   created_at: string;
   markdown_url: string | null;
   audio_url: string | null;
+  // Set when pruning removed the audio to free space; the markdown stays.
+  audio_pruned_at: string | null;
 }
 
 type ResumableStage = "needs_script" | "rendering" | "needs_finalize";
@@ -72,6 +74,111 @@ function isoDaysAgo(days: number): string {
   const d = new Date();
   d.setDate(d.getDate() - days);
   return d.toISOString().slice(0, 10);
+}
+
+interface CapacityMeter {
+  usedBytes: number;
+  limitBytes: number;
+  ratio: number; // used / limit
+}
+
+// GET /api/capacity. `recommendation` is a ready-to-show sentence, null while the level is "ok".
+interface Capacity {
+  storage: CapacityMeter;
+  database: CapacityMeter;
+  level: "ok" | "warn" | "critical";
+  autoPrune: boolean;
+  keepRecent: number;
+  recommendation: string | null;
+}
+
+// POST /api/capacity/prune. With { dryRun: true } nothing is deleted and `pruned` is the preview.
+interface PruneResponse {
+  pruned: { episodeId: string; userId: string; title: string; createdAt: string }[];
+  usedBytes: number;
+  capacity: Capacity;
+}
+
+// The "Free up space" flow: preview (dry run) -> confirm -> prune.
+type FreeUp =
+  | { step: "idle" | "checking" | "pruning" | "empty" }
+  | { step: "confirm"; titles: string[] }
+  | { step: "done"; pct: number }
+  | { step: "error"; message: string };
+
+const percent = (m: CapacityMeter) => Math.round(m.ratio * 100);
+
+// Pruning only brings storage back down to this share of its limit (WARN_RATIO in
+// src/lib/capacity.ts), so it can free something only at or above it. Below that, a warning is
+// about the database alone and gets no "Free up space" button.
+const PRUNE_TARGET_RATIO = 0.8;
+
+// 1024-based, so the 1 GiB / 500 MiB free-tier limits read as 1.0 GB / 500.0 MB.
+function formatBytes(bytes: number): string {
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
+}
+
+// What the banner says about the Free up space flow, under the server's recommendation.
+function freeUpMessage(s: FreeUp): string | null {
+  switch (s.step) {
+    case "confirm": {
+      const n = s.titles.length;
+      const shown = s.titles.slice(0, 5).join(", ");
+      return `This removes the audio of ${n} older ${n === 1 ? "brief" : "briefs"} (markdown stays): ${shown}${n > 5 ? "…" : "."} Continue?`;
+    }
+    case "pruning":
+      return "Removing audio…";
+    case "empty":
+      return "Nothing to prune: your newest briefs are always kept.";
+    case "done":
+      return `Freed space: now ${s.pct}% used.`;
+    case "error":
+      return s.message;
+    default:
+      return null;
+  }
+}
+
+// The resumable banner's card, tinted by how full things are. "ok" only shows the
+// "Freed space" confirmation, once a prune has brought the level back down.
+const BANNER_TONES = {
+  warn: {
+    box: "border-amber-400/25 bg-amber-500/10",
+    text: "text-amber-200",
+    primary: "bg-amber-500 font-medium text-zinc-950 hover:bg-amber-400 focus-visible:ring-amber-300",
+    secondary: "border border-amber-800/60 text-amber-200 hover:border-amber-600 focus-visible:ring-amber-300",
+  },
+  critical: {
+    box: "border-red-400/25 bg-red-500/10",
+    text: "text-red-200",
+    primary: "bg-red-500 font-medium text-zinc-950 hover:bg-red-400 focus-visible:ring-red-300",
+    secondary: "border border-red-800/60 text-red-200 hover:border-red-600 focus-visible:ring-red-300",
+  },
+  ok: {
+    box: "border-emerald-400/25 bg-emerald-500/10",
+    text: "text-emerald-200",
+    primary: "bg-emerald-500 font-medium text-zinc-950 hover:bg-emerald-400 focus-visible:ring-emerald-300",
+    secondary: "border border-emerald-800/60 text-emerald-200 hover:border-emerald-600 focus-visible:ring-emerald-300",
+  },
+} as const;
+
+const BANNER_BUTTON =
+  "rounded-full px-4 py-1.5 text-sm transition disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950";
+
+// Stands where the player would be once pruning has removed an episode's audio.
+function AudioRemoved({ episode }: { episode: Episode }) {
+  if (episode.audio_url || !episode.audio_pruned_at) return null;
+  const when = new Date(episode.audio_pruned_at).toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+  });
+  return (
+    <p className="text-sm text-zinc-400">
+      Audio removed on {when} to free space — the markdown is still here.
+    </p>
+  );
 }
 
 export default function Dashboard({
@@ -109,6 +216,8 @@ export default function Dashboard({
   const [episodes, setEpisodes] = useState<Episode[]>([]);
   const [resumable, setResumable] = useState<ResumableDraft | null>(null);
   const [discarding, setDiscarding] = useState(false);
+  const [capacity, setCapacity] = useState<Capacity | null>(null);
+  const [freeUp, setFreeUp] = useState<FreeUp>({ step: "idle" });
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const [bgOn, setBgOn] = useState(true);
 
@@ -158,6 +267,20 @@ export default function Dashboard({
     if (res.ok) setEpisodes((await res.json()).episodes ?? []);
   }, []);
 
+  // Storage/database use for the status line and banner. Best-effort: purely informational.
+  // Uses .then() so the setState sits in a callback: an async function that sets state after an
+  // await trips react-hooks/set-state-in-effect when an effect calls it (as loadEpisodes does).
+  const loadCapacity = useCallback(
+    () =>
+      fetch("/api/capacity")
+        .then((res) => (res.ok ? (res.json() as Promise<Capacity>) : null))
+        .then((body) => {
+          if (body) setCapacity(body);
+        })
+        .catch(() => {}),
+    []
+  );
+
   // Checks for an interrupted brief generation (refresh, network blip, TTS
   // hiccup) so it can be offered back as "Resume" instead of silently lost.
   const checkResumable = useCallback(async () => {
@@ -189,6 +312,10 @@ export default function Dashboard({
   useEffect(() => {
     loadEpisodes();
   }, [loadEpisodes]);
+
+  useEffect(() => {
+    loadCapacity();
+  }, [loadCapacity]);
 
   useEffect(() => {
     checkResumable();
@@ -300,12 +427,15 @@ export default function Dashboard({
         : base
     );
     if (episodeId) checkResumable();
+    // Finalize answers 507 when storage is full and auto-prune is off: refresh the banner.
+    loadCapacity();
   }
 
   async function createBrief() {
     setCreating(true);
     setErrorMessage(null);
     setResult(null);
+    setFreeUp({ step: "idle" }); // a new brief makes any earlier "Freed space" line stale
     setCreateStartedAt(Date.now());
     setElapsed(0);
     let episodeId: string | undefined;
@@ -324,6 +454,7 @@ export default function Dashboard({
       });
       if (prepared.done) {
         setResult(prepared);
+        loadCapacity();
         await loadEpisodes();
         return;
       }
@@ -332,6 +463,7 @@ export default function Dashboard({
 
       const finalized = await runAudioStages(episodeId);
       setResult({ episode: finalized.episode, markdown: prepared.markdown, stats: prepared.stats });
+      loadCapacity();
       await loadEpisodes();
     } catch (err) {
       reportCreateError(err, episodeId);
@@ -349,6 +481,7 @@ export default function Dashboard({
     setCreating(true);
     setErrorMessage(null);
     setResult(null);
+    setFreeUp({ step: "idle" });
     setCreateStartedAt(Date.now());
     setElapsed(0);
     try {
@@ -359,6 +492,7 @@ export default function Dashboard({
       });
       setResult({ episode: finalized.episode });
       setResumable(null);
+      loadCapacity();
       await loadEpisodes();
     } catch (err) {
       reportCreateError(err, episodeId);
@@ -384,6 +518,45 @@ export default function Dashboard({
       setErrorMessage(err instanceof Error ? err.message : "Couldn't discard draft");
     } finally {
       setDiscarding(false);
+    }
+  }
+
+  // "Free up space": preview with a dry run, confirm, then prune for real. The server only ever
+  // touches the caller's own audio and always keeps their newest briefs.
+  async function startFreeUp() {
+    setFreeUp({ step: "checking" });
+    try {
+      const body: PruneResponse = await post("/api/capacity/prune", { dryRun: true });
+      setFreeUp(
+        body.pruned.length > 0
+          ? { step: "confirm", titles: body.pruned.map((p) => p.title) }
+          : { step: "empty" }
+      );
+    } catch (err) {
+      setFreeUp({
+        step: "error",
+        message: err instanceof Error ? err.message : "Couldn't check what can be removed",
+      });
+    }
+  }
+
+  async function confirmFreeUp() {
+    setFreeUp({ step: "pruning" });
+    try {
+      const body: PruneResponse = await post("/api/capacity/prune", { dryRun: false });
+      setCapacity(body.capacity); // show the new level now; the refetch below confirms it
+      setFreeUp(
+        body.pruned.length > 0
+          ? { step: "done", pct: percent(body.capacity.storage) }
+          : { step: "empty" }
+      );
+      loadCapacity();
+      loadEpisodes().catch(() => {}); // best-effort: the prune itself already succeeded
+    } catch (err) {
+      setFreeUp({
+        step: "error",
+        message: err instanceof Error ? err.message : "Couldn't free up space",
+      });
     }
   }
 
@@ -434,6 +607,25 @@ export default function Dashboard({
       { value: "both", label: "Markdown + Podcast" },
     ],
     []
+  );
+
+  const bannerTone = BANNER_TONES[capacity?.level ?? "ok"];
+  const freeUpText = freeUpMessage(freeUp);
+  const freeUpBusy = freeUp.step === "checking" || freeUp.step === "pruning";
+  const canFreeUp = (capacity?.storage.ratio ?? 0) >= PRUNE_TARGET_RATIO;
+  let freeUpLabel = "Free up space";
+  if (freeUp.step === "checking") freeUpLabel = "Checking…";
+  else if (freeUp.step === "pruning") freeUpLabel = "Removing…";
+  else if (!canFreeUp) freeUpLabel = "Dismiss";
+
+  // Byte counts are in the tooltip; the line itself stays tiny.
+  const capacityLine = capacity && (
+    <p
+      className="text-xs text-zinc-500"
+      title={`Storage ${formatBytes(capacity.storage.usedBytes)} of ${formatBytes(capacity.storage.limitBytes)} · Database ${formatBytes(capacity.database.usedBytes)} of ${formatBytes(capacity.database.limitBytes)}`}
+    >
+      Storage {percent(capacity.storage)}% · Database {percent(capacity.database)}%
+    </p>
   );
 
   return (
@@ -573,6 +765,54 @@ export default function Dashboard({
                 {discarding ? "Discarding…" : "Discard"}
               </button>
             </div>
+          </section>
+        )}
+
+        {/* Capacity banner: amber when filling up, red when nearly full. It also stays up after a
+            prune so the "Freed space" confirmation is seen even once the level is back to ok. */}
+        {capacity && (capacity.level !== "ok" || freeUp.step !== "idle") && (
+          <section
+            className={`flex flex-wrap items-center justify-between gap-3 rounded-2xl border p-4 backdrop-blur-xl ${bannerTone.box}`}
+          >
+            <div
+              aria-live="polite"
+              className={`min-w-0 grow basis-56 space-y-1 text-sm ${bannerTone.text}`}
+            >
+              {capacity.recommendation && <p>{capacity.recommendation}</p>}
+              {freeUpText && (
+                <p className={freeUp.step === "error" ? "text-red-300" : undefined}>{freeUpText}</p>
+              )}
+            </div>
+            {/* A database-only warning has no button (audio pruning only frees storage). Controls
+                come back only while a Free up space message is showing, so it can be dismissed. */}
+            {(canFreeUp || freeUp.step !== "idle") && (
+              <div className="flex shrink-0 items-center gap-2">
+                {freeUp.step === "confirm" ? (
+                  <>
+                    <button onClick={confirmFreeUp} className={`${BANNER_BUTTON} ${bannerTone.primary}`}>
+                      Confirm
+                    </button>
+                    {/* The prompt replaces the button that was just pressed, so focus is placed on
+                        the safe choice instead of being dropped. */}
+                    <button
+                      onClick={() => setFreeUp({ step: "idle" })}
+                      autoFocus
+                      className={`${BANNER_BUTTON} ${bannerTone.secondary}`}
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <button
+                    onClick={canFreeUp ? startFreeUp : () => setFreeUp({ step: "idle" })}
+                    disabled={freeUpBusy}
+                    className={`${BANNER_BUTTON} ${canFreeUp ? bannerTone.primary : bannerTone.secondary}`}
+                  >
+                    {freeUpLabel}
+                  </button>
+                )}
+              </div>
+            )}
           </section>
         )}
 
@@ -744,6 +984,7 @@ export default function Dashboard({
                 className="w-full"
               />
             )}
+            <AudioRemoved episode={result.episode} />
             <div className="flex flex-wrap gap-3">
               {result.episode.markdown_url && (
                 <a
@@ -896,9 +1137,12 @@ export default function Dashboard({
         {/* Episode history */}
         {episodes.length > 0 && (
           <section className="space-y-3">
-            <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
-              Previous briefs
-            </h2>
+            <div className="space-y-1">
+              <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
+                Previous briefs
+              </h2>
+              {capacityLine}
+            </div>
             <ul className="space-y-3">
               {episodes.map((ep) => (
                 <li key={ep.id} className="space-y-3 rounded-xl border border-white/10 bg-white/[0.04] p-4 backdrop-blur-md">
@@ -922,6 +1166,7 @@ export default function Dashboard({
                       className="w-full"
                     />
                   )}
+                  <AudioRemoved episode={ep} />
                   {ep.markdown_url && (
                     <a
                       href={ep.markdown_url}
@@ -936,6 +1181,7 @@ export default function Dashboard({
             </ul>
           </section>
         )}
+        {episodes.length === 0 && capacityLine}
       </div>
     </main>
   );
