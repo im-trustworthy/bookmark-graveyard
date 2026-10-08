@@ -9,11 +9,15 @@ import {
 import { signEpisodeUrls } from "@/lib/episodes";
 import { checkUsage } from "@/lib/limits";
 import { apiError } from "@/lib/errors";
+import { isTtsReady, VoiceConfigError } from "@/lib/voice";
+import type { VoiceConfig } from "@/lib/voice";
+import { resolveVoiceConfigForUser } from "@/lib/voice/user";
 
 export const maxDuration = 300;
 
 interface PrepareRequest {
-  format: "markdown" | "audio" | "both";
+  // "audio" requests are normalized to "both" in validatePrepareBody, so only these two are ever stored.
+  format: "markdown" | "both";
   from?: string;
   to?: string;
   topics?: string[];
@@ -55,9 +59,11 @@ function validatePrepareBody(body: unknown): { value: PrepareRequest } | { error
     return { error: "targetMinutes must be a number" };
   }
 
-  const format = ["markdown", "audio", "both"].includes(b.format as string)
-    ? (b.format as PrepareRequest["format"])
-    : "both";
+  // The server still accepts "markdown", "audio" and "both". "audio" behaves as "both": the markdown is
+  // produced first either way and the podcast script is derived from it, so audio-only was never really
+  // audio-only. The picker no longer offers it, but old clients may still send it. Anything else
+  // unrecognised also falls back to "both".
+  const format: PrepareRequest["format"] = b.format === "markdown" ? "markdown" : "both";
 
   return {
     value: {
@@ -86,6 +92,26 @@ export async function POST(req: NextRequest) {
   const format = body.format;
 
   try {
+    // Before any paid work: without a voice provider an audio brief would burn
+    // a digest_prepare slot and the Grok writing pass, then fail at /render.
+    let voice: VoiceConfig | null = null;
+    if (format === "both") {
+      try {
+        voice = await resolveVoiceConfigForUser(userId);
+      } catch (err) {
+        // A broken voice setup names the setting to fix (never a secret): the same 400 as "none".
+        if (err instanceof VoiceConfigError) return apiError("Digest prepare error", err, err.message, 400);
+        throw err;
+      }
+      if (!isTtsReady(voice)) {
+        // Non-null but not ready means ElevenLabs with a key and no host voices (Grok voices have defaults).
+        const message = voice
+          ? "ElevenLabs voices aren't set — choose voices under Voices, or set ELEVENLABS_VOICE_HOST_A and ELEVENLABS_VOICE_HOST_B on the server"
+          : "Audio briefs need a voice provider — connect Grok Voice or ElevenLabs under Voices, or set VOICE_PROVIDER on the server, or choose a markdown-only brief";
+        return apiError("Digest prepare error", message, message, 400);
+      }
+    }
+
     const { included, excludedAsMisleading } = await selectBookmarksForDigest(userId, body);
     if (included.length === 0) {
       return NextResponse.json(
@@ -133,6 +159,8 @@ export async function POST(req: NextRequest) {
         topics: body.topics ?? [],
         markdown_path: markdownPath,
         bookmark_count: included.length - dropped,
+        // Pin the voices this brief starts with, so a resumed render finishes in them.
+        voice: voice ? { provider: voice.provider, voiceA: voice.voiceA, voiceB: voice.voiceB } : null,
       })
       .select()
       .single();

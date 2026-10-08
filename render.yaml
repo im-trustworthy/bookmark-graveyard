@@ -16,8 +16,6 @@ services:
         sync: false
       - key: NEXT_PUBLIC_SUPABASE_URL
         sync: false
-      - key: NEXT_PUBLIC_SUPABASE_ANON_KEY
-        sync: false
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: X_CLIENT_ID
@@ -26,6 +24,15 @@ services:
         sync: false
       - key: XAI_API_KEY
         sync: false
+      # Voice vars are instance defaults; users can override them in the app (SETUP.md step 4).
+      - key: VOICE_PROVIDER
+        sync: false # grok | elevenlabs (auto-detected if unset; see SETUP.md step 4)
+      - key: GROK_VOICE_HOST_A
+        sync: false # optional, default: ara
+      - key: GROK_VOICE_HOST_B
+        sync: false # optional, default: helios
+      # The ELEVENLABS_* trio is only needed when ElevenLabs is the provider — set explicitly, or
+      # auto-selected because ELEVENLABS_API_KEY is present.
       - key: ELEVENLABS_API_KEY
         sync: false
       - key: ELEVENLABS_VOICE_HOST_A
@@ -37,7 +44,7 @@ services:
       - key: SESSION_SECRET
         sync: false
       - key: APP_URL
-        sync: false # e.g. https://bookmarks.allensantamaria.com
+        sync: false # e.g. https://your-app.onrender.com
       - key: ALLOWED_X_USER_IDS
         sync: false
       - key: CRON_SECRET
@@ -51,7 +58,7 @@ services:
     runtime: node
     schedule: "0 12 * * 5"
     buildCommand: "true"
-    startCommand: curl -fsS --max-time 600 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/sync"
+    startCommand: 'curl -fsS --max-time 600 -H "Authorization: Bearer $CRON_SECRET" "$APP_URL/api/cron/sync"'
     envVars:
       - key: CRON_SECRET
         sync: false
