@@ -4,8 +4,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { describeSync, formatRange } from "@/lib/dashboard-text";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import VoiceSettings from "./voice-settings";
 
-type Format = "markdown" | "audio" | "both";
+// What the picker offers. There is no audio-only: the markdown is always written first and the
+// podcast script is derived from it.
+type Format = "markdown" | "both";
 
 interface Analysis {
   topics: string[];
@@ -27,7 +30,9 @@ interface Bookmark {
 interface Episode {
   id: string;
   title: string;
-  format: Format;
+  // Briefs made before the picker dropped audio-only are still stored as "audio". Nothing below reads
+  // this: the player and the download links key off audio_url / markdown_url.
+  format: Format | "audio";
   duration_seconds: number | null;
   bookmark_count: number | null;
   created_at: string;
@@ -426,7 +431,6 @@ export default function Dashboard({
   const formatOptions: { value: Format; label: string }[] = useMemo(
     () => [
       { value: "markdown", label: "Markdown" },
-      { value: "audio", label: "Podcast" },
       { value: "both", label: "Markdown + Podcast" },
     ],
     []
@@ -664,6 +668,9 @@ export default function Dashboard({
             </p>
           )}
         </section>
+
+        {/* Voices */}
+        <VoiceSettings />
 
         {/* Create button */}
         <div className="space-y-3">

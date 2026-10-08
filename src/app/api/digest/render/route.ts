@@ -4,6 +4,8 @@ import { getSessionUserId } from "@/lib/session";
 import { renderPodcast, LINES_PER_CALL } from "@/lib/tts";
 import { checkUsage } from "@/lib/limits";
 import { apiError } from "@/lib/errors";
+import { InvalidVoiceKeyError, VoiceConfigError, VoiceVendorError } from "@/lib/voice";
+import { getVoiceProviderForUser, pinnedVoiceFrom } from "@/lib/voice/user";
 import type { ScriptLine } from "@/lib/brain";
 
 export const maxDuration = 300;
@@ -20,7 +22,7 @@ export async function POST(req: NextRequest) {
   try {
     const { data: episode } = await db()
       .from("episodes")
-      .select("id, script, markdown_path, status, render_cursor")
+      .select("id, script, markdown_path, status, render_cursor, voice")
       .eq("user_id", userId)
       .eq("id", episodeId)
       .single();
@@ -52,14 +54,21 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ nextCursor: script.length, totalLines: script.length, done: true });
     }
 
-    // Gate right before the paid ElevenLabs call, after all the free checks above.
+    // The voices this episode started with (when pinned), with the user's key or
+    // the instance's. Resolved before the usage gate so a broken voice config
+    // doesn't burn a slot on every retry.
+    const provider = await getVoiceProviderForUser(userId, pinnedVoiceFrom(episode.voice));
+
+    // Gate right before the paid TTS call, after all the free checks above.
     await checkUsage(userId, "digest_render");
 
     // Pass neighbors for prosody continuity across chunk boundaries
-    const mp3 = await renderPodcast(chunk, undefined, {
-      previousLine: script[start - 1]?.line,
-      nextLine: script[start + chunk.length]?.line,
-    });
+    const mp3 = await renderPodcast(
+      chunk,
+      undefined,
+      { previousLine: script[start - 1]?.line, nextLine: script[start + chunk.length]?.line },
+      provider
+    );
 
     const base = episode.markdown_path!.replace(/\/brief\.md$/, "");
     const chunkPath = `${base}/chunks/${String(start).padStart(5, "0")}.mp3`;
@@ -88,6 +97,15 @@ export async function POST(req: NextRequest) {
       done: nextCursor >= script.length,
     });
   } catch (err) {
+    // Voice setup problems are the user's to fix; their messages name the setting, never a secret.
+    if (err instanceof VoiceConfigError) return apiError("Digest render error", err, err.message, 400);
+    if (err instanceof InvalidVoiceKeyError) {
+      return apiError("Digest render error", err, "The voice provider rejected the API key — update it under Voices", 400);
+    }
+    if (err instanceof VoiceVendorError && (err.status === 401 || err.status === 403)) {
+      const message = "The voice provider refused the request — check that account's credits and permissions";
+      return apiError("Digest render error", err, message, 502);
+    }
     return apiError("Digest render error", err, "Audio rendering failed");
   }
 }

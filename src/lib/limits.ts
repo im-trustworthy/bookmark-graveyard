@@ -6,10 +6,12 @@ export class UsageLimitError extends Error {}
 
 const DEFAULT_LIMITS: Record<string, number> = {
   sync: 24, // X API reads
-  enrich: 400, // Grok batches + article fetches + Scribe
+  enrich: 400, // Grok batches + article fetches + video transcription
   digest_prepare: 12, // full brief generations (gates prepare/markdown)
   digest_script: 40, // SMART Grok script generations (≈ prepares + resumes/retries)
-  digest_render: 500, // ElevenLabs TTS chunk calls (≈ 12 briefs × ~20 chunks + resumes)
+  digest_render: 500, // TTS chunk calls (≈ 12 briefs × ~20 chunks + resumes)
+  voice_list: 120, // voice-catalog fetches from the Voices panel (saving settings re-checks the key)
+  voice_preview: 60, // one-sentence voice previews
 };
 
 function limitFor(kind: string): number {

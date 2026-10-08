@@ -5,7 +5,7 @@ import { UsageLimitError } from "./limits";
 /**
  * Uniform route error response. Full detail always goes to the server log;
  * the client gets the generic message in production and the underlying
- * detail appended in development.
+ * detail appended in development (unless the detail is the message itself).
  */
 export function apiError(
   context: string,
@@ -17,9 +17,7 @@ export function apiError(
   if (err instanceof UsageLimitError) {
     return NextResponse.json({ error: err.message }, { status: 429 });
   }
-  const detail =
-    process.env.NODE_ENV !== "production"
-      ? ` — ${err instanceof Error ? err.message : String(err)}`
-      : "";
+  const message = err instanceof Error ? err.message : String(err);
+  const detail = process.env.NODE_ENV !== "production" && message !== publicMessage ? ` — ${message}` : "";
   return NextResponse.json({ error: `${publicMessage}${detail}` }, { status });
 }

@@ -1,22 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { mp3DurationSeconds, stripMp3Headers } from "../mp3";
-
-// MPEG-1 Layer III, 128 kbps, 44.1 kHz, mono, no padding → 417-byte frames
-const HEADER = Buffer.from([0xff, 0xfb, 0x90, 0xc0]);
-const FRAME_LEN = 417;
-const audioFrame = (fill: number) => Buffer.concat([HEADER, Buffer.alloc(FRAME_LEN - 4, fill)]);
-function infoFrame(): Buffer {
-  const body = Buffer.alloc(FRAME_LEN - 4, 0);
-  body.write("Info", 17, "latin1"); // right after the 17-byte mono side info, where encoders put it
-  return Buffer.concat([HEADER, body]);
-}
-function id3v2(payloadLen: number): Buffer {
-  const head = Buffer.from([0x49, 0x44, 0x33, 3, 0, 0, 0, 0, 0, payloadLen]); // "ID3", v2.3, syncsafe size
-  return Buffer.concat([head, Buffer.alloc(payloadLen, 0x41)]);
-}
-/** What one ElevenLabs clip looks like: tag, Info frame, then n audio frames. */
-const clip = (n: number, fill: number) =>
-  Buffer.concat([id3v2(35), infoFrame(), ...Array.from({ length: n }, () => audioFrame(fill))]);
+import { assertStitchableMp3, mp3DurationSeconds, stripMp3Headers } from "../mp3";
+import { FRAME_LEN, audioFrame, clip, mpeg1Frame48k, mpeg1Frame64kbps, mpeg2Frame24k } from "./mp3-fixtures";
 
 describe("stripMp3Headers", () => {
   it("drops every clip's ID3 tag and Info frame and keeps audio frames in order", () => {
@@ -49,5 +33,35 @@ describe("stripMp3Headers", () => {
 describe("mp3DurationSeconds", () => {
   it("counts only audio frames", () => {
     expect(mp3DurationSeconds(Buffer.concat([clip(3, 1), clip(2, 2)]))).toBeCloseTo((5 * 1152) / 44100, 6);
+  });
+});
+
+describe("assertStitchableMp3", () => {
+  const expected = "expected 128 kbps, 44.1 kHz MPEG-1 Layer III";
+
+  it("passes MPEG-1 Layer III, 128 kbps, 44.1 kHz audio", () => {
+    expect(() => assertStitchableMp3(Buffer.concat([audioFrame(1), audioFrame(2)]), "TTS")).not.toThrow();
+  });
+
+  it("rejects an empty buffer, naming the source and length", () => {
+    expect(() => assertStitchableMp3(Buffer.alloc(0), "Grok TTS (content-type audio/mpeg)")).toThrow(
+      `Grok TTS (content-type audio/mpeg): no MP3 audio frames (0 bytes); ${expected}`
+    );
+  });
+
+  it("rejects a JSON or HTML body", () => {
+    expect(() => assertStitchableMp3(Buffer.from('{"error":"busy"}'), "TTS")).toThrow("no MP3 audio frames (16 bytes)");
+    expect(() => assertStitchableMp3(Buffer.from("<html>oops</html>"), "TTS")).toThrow("no MP3 audio frames");
+  });
+
+  it("rejects a valid frame in another format (24 kHz MPEG-2)", () => {
+    expect(() => assertStitchableMp3(mpeg2Frame24k(), "TTS")).toThrow(
+      `TTS: first frame is MPEG-2 128 kbps / 24000 Hz (384 bytes); ${expected}`
+    );
+  });
+
+  it("rejects MPEG-1 at another sample rate or bitrate", () => {
+    expect(() => assertStitchableMp3(mpeg1Frame48k(), "TTS")).toThrow("first frame is MPEG-1 128 kbps / 48000 Hz");
+    expect(() => assertStitchableMp3(mpeg1Frame64kbps(), "TTS")).toThrow("first frame is MPEG-1 64 kbps / 44100 Hz");
   });
 });

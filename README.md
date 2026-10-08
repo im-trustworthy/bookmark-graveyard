@@ -2,8 +2,8 @@
 
 Turns your X bookmarks into a personal weekly briefing. It signs in with your X account, deep-reads
 everything behind each bookmark — linked articles, images, video — and uses a two-tier Grok model
-blend to synthesize what you saved into a digest: markdown, a two-host podcast, or both. Community
-Notes cross-checks and a staleness pass keep it honest and current.
+blend to synthesize what you saved into a digest: markdown, or markdown plus a two-host podcast.
+Community Notes cross-checks and a staleness pass keep it honest and current.
 
 **Core loop:** sign in with X → bookmarks sync automatically → ingestion & analysis fill in over a
 few chunked background calls → filter by date/topic or hand-pick posts → generate a brief.
@@ -30,8 +30,9 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
   tools) looks for the author's own self-reply link.
 - **Images** — described and read by Grok vision; legible text (tables, code) is transcribed
   verbatim, not just summarized.
-- **Video/GIFs** — transcribed by ElevenLabs Scribe (lowest-bitrate MP4 variant, capped at 25
-  minutes / 60MB); falls back to a thumbnail description if transcription fails or is skipped.
+- **Video/GIFs** — transcribed by the configured voice provider (Grok STT or ElevenLabs Scribe)
+  from the lowest-bitrate MP4 variant, capped at 25 minutes / 60MB; falls back to a thumbnail
+  description if transcription fails, is skipped, or the voice provider is misconfigured.
 - Runs 3-way concurrent, capped per request so it fits inside the serverless timeout budget (see
   [Pipeline](#pipeline)).
 
@@ -58,15 +59,18 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
 - Filter by date range and/or topic tags, or bypass filters entirely by hand-picking specific posts
   in the UI. Either way, individual bookmarks can be permanently hidden from all future briefs — X's
   read-only scopes mean the app can't un-bookmark on your behalf, so "hide" is a local flag.
-- Output as markdown, audio, or both.
+- Output as markdown, or markdown plus a two-host podcast.
 - **Markdown** — a two-stage SMART-model synthesis: first an editorial outline (3-7 thematic
   sections spanning topics, strongest material first), then full prose composed section by section
   from that outline, grounded in the full dossiers. Every idea is attributed inline as a markdown
   link to its creator; it closes with a "Worth a deeper look" pick of the 3 most substantive items.
 - **Audio** — a NotebookLM-style two-host script (Alex, curious; Blake, analytical) written from the
   finished markdown, word-budgeted to a target runtime (the API supports 5-30 minutes; the UI
-  currently always asks for 20), then rendered with ElevenLabs multi-voice TTS and stitched into one
-  MP3. Creators are credited by spoken name, never read out as raw handles.
+  currently always asks for 20), then rendered with the configured voice provider (Grok Voice or
+  ElevenLabs), one voice per host, and stitched into one MP3. Creators are credited by spoken name,
+  never read out as raw handles.
+- **Voices** — chosen in the app: connect Grok Voice or ElevenLabs, optionally with your own key,
+  and pick Host A/B from a live list with previews; server env vars are just the instance defaults.
 
 ### Reliability & UX
 - Every API route caps `maxDuration` at 300 seconds, and nothing that could run long — ingestion,
@@ -82,6 +86,8 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
 - The session cookie is HMAC-signed, httpOnly, `SameSite=Lax` (secure-flagged in production).
   Supabase is only ever touched server-side with the service-role key — row-level security is
   deny-all, so the browser has no direct database access.
+- Per-user voice-provider keys (pasted in the Voices panel) are AES-256-GCM–encrypted at rest like
+  the X tokens, only ever used server-side, and shown back as their last 4 characters at most.
 - The Vercel cron endpoint (`/api/cron/sync`) fails closed: with no `CRON_SECRET` configured it
   returns 503 rather than running unauthenticated, so a deployed instance can't be triggered by
   anyone who finds the URL.
@@ -94,10 +100,11 @@ Browser (dashboard.tsx — client component)
    v
 Next.js API routes  (src/app/api/**)
    |
-   |--> X API (api.x.com)             OAuth 2.0 PKCE login + bookmark reads
+   |--> X API (api.x.com)              OAuth 2.0 PKCE login + bookmark reads
    |--> Supabase (Postgres + Storage)  service-role key only, RLS deny-all
-   |--> xAI Grok (api.x.ai/v1)        FAST + SMART chat models, x_search/web_search
-   |--> ElevenLabs API                 Scribe (video STT) + multi-voice TTS
+   |--> xAI Grok (api.x.ai/v1)         FAST + SMART chat models, x_search/web_search
+   |--> Voice provider (pick one)      xAI Grok (api.x.ai/v1/tts, /v1/stt)
+                                       OR ElevenLabs (TTS + Scribe)
 
 Unattended jobs, outside the request path:
 
@@ -110,14 +117,18 @@ Unattended jobs, outside the request path:
                                                  every allowed user, unattended
 ```
 
-**Data model** (Supabase Postgres; no local migrations — schema lives in the provisioned project):
+**Data model** (Supabase Postgres; the schema is in `supabase/migrations/`, applied by
+`npm run setup` or `supabase db push`):
 - `users` — one row per X account; encrypted tokens, allowlist flag
 - `bookmarks` — raw synced posts, deduped by `tweet_id`
 - `bookmark_sources` — ingested article/image/video content, one row per source
 - `bookmark_analysis` — topics, summary, claims, content_type, credibility
 - `topics` — the user's growing tag taxonomy
 - `community_notes` — matched notes from X's public dataset
-- `episodes` — generated briefs (storage paths, script, status, stats)
+- `episodes` — generated briefs (storage paths, script, status, stats, pinned voice provider + host
+  voices)
+- `user_voice_settings` — per-user voice provider, encrypted key (nullable = use instance key), two
+  host voices
 - Storage bucket `episodes` — the markdown/MP3 files themselves, served via 24-hour signed URLs
 
 **Stack**: Next.js 16 (App Router) + React 19 + TypeScript + Tailwind 4, Supabase (Postgres +
@@ -131,8 +142,9 @@ etc.) — see `AGENTS.md` before touching framework-level code.
 git clone https://github.com/im-trustworthy/x-bookmark.git
 cd x-bookmark
 npm install
-cp .env.example .env.local
+cp .env.example .env.local   # optional: `npm run setup` creates it if it's missing
 # fill in .env.local — SETUP.md walks through where to get every value, in order
+npm run setup                # checks every value, generates the secrets, provisions the database
 npm run dev
 ```
 
@@ -164,14 +176,16 @@ inside a request designed to finish well under the 300-second ceiling.
    immediately).
 2. **`/api/digest/script`** — the SMART model turns the markdown into an Alex/Blake dialogue script,
    saved onto the episode row.
-3. **`/api/digest/render`** — renders 12 script lines per call to MP3 (ElevenLabs TTS, one voice per
-   host, neighboring-line context for prosody), uploading each chunk to Storage. The client loops,
-   advancing a cursor, driving a real `cursor / totalLines` progress bar.
-4. **`/api/digest/finalize`** — downloads every chunk, concatenates them (ElevenLabs' fixed-format
-   MP3 output makes byte concatenation valid), uploads the final `brief.mp3`, deletes the chunk
-   files, flips the episode to `status: "ready"`.
+3. **`/api/digest/render`** — renders 12 script lines per call to MP3 (one TTS call per line, one
+   voice per host; ElevenLabs also gets neighboring-line context for prosody), uploading each chunk
+   to Storage. The client loops, advancing a cursor, driving a real `cursor / totalLines` progress
+   bar.
+4. **`/api/digest/finalize`** — downloads every chunk, concatenates them (chunks share one CBR
+   encoding — MP3, 44.1 kHz, 128 kbps — whichever provider rendered them, with per-clip ID3/Xing
+   headers stripped, so byte concatenation is valid), uploads the final `brief.mp3`, deletes the
+   chunk files, flips the episode to `status: "ready"`.
 
-Audio rendering is the slowest and most timeout-prone step — one ElevenLabs call per line of
+Audio rendering is the slowest and most timeout-prone step — one TTS call per line of
 dialogue — so it's the one broken into the smallest chunks (12 lines) with the most granular
 client-visible progress. This staged design is what makes long briefs safe to generate from a
 regular HTTP request instead of needing a background job queue.
@@ -186,12 +200,26 @@ regular HTTP request instead of needing a background job queue.
   staleness checks. The SMART model (`grok-4.7`, override with `XAI_MODEL_SMART`) is reserved for
   low-volume, high-value synthesis: digest outline, digest composition, podcast script, and live
   search. A full sync plus a weekly digest is typically well under $1 in xAI usage.
-- **ElevenLabs TTS is the dominant real cost.** Unlike Grok, there's no cheap tier for speech —
-  every character spoken is billed the same regardless of how "smart" it needs to be. It defaults
-  to the turbo model (`eleven_turbo_v2_5`, override with `ELEVENLABS_MODEL`) specifically to stretch
-  further: a Creator-plan quota (~100k credits/month) renders roughly 3-4 hours of audio, comfortably
-  covering a weekly ~20-minute brief. ElevenLabs Scribe (video transcription) is the other
-  ElevenLabs cost center, but it's much smaller — it only runs on bookmarks that contain video.
+- **Voice (audio briefs + video transcription)** — unlike the Grok LLM blend, there's no cheap tier
+  for speech: every character spoken is billed the same regardless of how "smart" it needs to be, so
+  the provider you pick is the cost lever. Measured on real episodes (~15 minutes of audio,
+  ~11,500–13,800 spoken characters, 31–43 dialogue lines; pricing as of October 2026):
+
+  | Voice provider | Billing | Per ~15-minute episode |
+  | --- | --- | --- |
+  | **Grok Voice** | $15 per 1M characters, pay-as-you-go on the same xAI credits as the LLM calls (no subscription) | ~$0.20 — under $1/month for a weekly brief |
+  | **ElevenLabs, Creator plan** | $22/month for 121,000 credits; Turbo bills 0.5 credits per character | ~6,000–7,000 credits, about $1.25 — a weekly brief uses roughly a quarter of the plan |
+  | **ElevenLabs, usage-based** | $0.04 per 1,000 characters (Turbo) | ~$0.55 |
+
+  Video transcription is much smaller either way, and only runs on bookmarks that contain video:
+  Grok STT is $0.10/hour (REST), ElevenLabs Scribe v2 is $0.22/hour. ElevenLabs defaults to the
+  turbo model (`eleven_turbo_v2_5`, override with `ELEVENLABS_MODEL`) to stretch a plan further, and
+  its `previous_text`/`next_text` prosody hints aren't billed. The trade-off for Grok's price: it
+  has no equivalent of those continuity hints, so each line is rendered standalone — listen to a
+  sample before committing. The instance default is `VOICE_PROVIDER` (`grok` or `elevenlabs`; unset,
+  it's ElevenLabs when `ELEVENLABS_API_KEY` is set, otherwise Grok, since the app requires
+  `XAI_API_KEY` anyway — see [SETUP.md](SETUP.md) step 4), and users can override it in the app; a
+  user's own key is billed to their account.
 
 ## Project status
 
