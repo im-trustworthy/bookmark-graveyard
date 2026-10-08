@@ -2,7 +2,7 @@
 @plugin "@tailwindcss/typography";
 
 :root {
-  /* Bookmark Brief is dark-themed only — no light variant, so these stay
+  /* Bookmark Graveyard is dark-themed only — no light variant, so these stay
      fixed rather than following OS preference. Body text sits slightly
      below pure white (#e5e5e5) for long-reading comfort on dark. */
   --background: var(--color-zinc-950);
