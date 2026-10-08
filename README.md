@@ -47,7 +47,7 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
 ### Credibility & staleness
 - A daily GitHub Actions job (`.github/workflows/community-notes.yml`, 06:30 UTC) streams X's
   public Community Notes dataset and matches notes against your bookmarked `tweet_id`s — there's no
-  API for reading notes on an arbitrary post, so this reads the same bulk TSV dumps X publishes.
+  API for reading notes on an arbitrary post, so this reads the same bulk zipped TSV dumps X publishes.
 - Posts with a note classified `MISINFORMED_OR_POTENTIALLY_MISLEADING` **and** currently rated
   helpful are excluded from digests entirely (listed separately, as links only). Posts with any
   other note are kept, but the digest is told to caveat them.
@@ -109,7 +109,7 @@ Next.js API routes  (src/app/api/**)
 Unattended jobs, outside the request path:
 
   GitHub Actions (daily, 06:30 UTC)
-    scripts/community-notes-sync.mjs --> X's public Community Notes TSV dumps
+    scripts/community-notes-sync.mjs --> X's public Community Notes zipped TSV dumps
                                       --> Supabase `community_notes` table
 
   Vercel Cron (Fridays, vercel.json)
@@ -195,9 +195,9 @@ regular HTTP request instead of needing a background job queue.
 - **X reads** — pay-per-use, bookmark reads are billed at $0.001/post. A first sync (~800 posts)
   costs under a dollar; weekly incremental syncs are pennies.
 - **Grok** — the two-tier model blend exists specifically for token efficiency. The FAST model
-  (`grok-4.20-0309-non-reasoning`, override with `XAI_MODEL_FAST`) does all the high-volume,
+  (`grok-4.3`, override with `XAI_MODEL_FAST`) does all the high-volume,
   low-reasoning work: image descriptions, per-post categorization, article-match verification,
-  staleness checks. The SMART model (`grok-4.5`, override with `XAI_MODEL_SMART`) is reserved for
+  staleness checks. The SMART model (`grok-4.7`, override with `XAI_MODEL_SMART`) is reserved for
   low-volume, high-value synthesis: digest outline, digest composition, podcast script, and live
   search. A full sync plus a weekly digest is typically well under $1 in xAI usage.
 - **Voice (audio briefs + video transcription)** — unlike the Grok LLM blend, there's no cheap tier

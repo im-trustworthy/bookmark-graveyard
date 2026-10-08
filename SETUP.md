@@ -41,9 +41,11 @@ optional, since audio briefs can run on your xAI key instead (step 4). Fill in
 3. Your existing credits cover this; a full sync + weekly digest is typically well under $1.
 
 The app uses a two-tier model blend for token efficiency (overridable in `.env.local`):
-- `XAI_MODEL_FAST` (default `grok-4.20-0309-non-reasoning`) — per-post categorization,
+- `XAI_MODEL_FAST` (default `grok-4.3`) — per-post categorization,
   image reading (vision), staleness checks
-- `XAI_MODEL_SMART` (default `grok-4.5`) — digest outline, composition, and podcast script
+- `XAI_MODEL_SMART` (default `grok-4.7`) — digest outline, composition, and podcast script
+- `XAI_REASONING_FAST` / `XAI_REASONING_SMART` (defaults `none` / `medium`) — reasoning effort
+  per tier. Reasoning tokens bill as output, so raise these only if quality needs it.
 
 ## 4. Choose a voice provider (audio briefs and video transcription)
 
