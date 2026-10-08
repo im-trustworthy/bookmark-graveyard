@@ -222,7 +222,12 @@ export default function Dashboard({
   user,
   greeting = "Welcome back",
 }: {
-  user: { handle: string; display_name: string | null; avatar_url: string | null };
+  user: {
+    handle: string;
+    display_name: string | null;
+    avatar_url: string | null;
+    x_user_id?: string | null;
+  };
   greeting?: string;
 }) {
   const [format, setFormat] = useState<Format>("both");
@@ -761,6 +766,14 @@ export default function Dashboard({
             >
               {syncing ? "Checking X…" : "Check X for new"}
             </button>
+            {user.x_user_id && (
+              <span
+                title="Put this in ALLOWED_X_USER_IDS to restrict who can sign in"
+                className="px-2 py-2 text-sm text-zinc-500"
+              >
+                X user ID <span className="select-all tabular-nums">{user.x_user_id}</span>
+              </span>
+            )}
             <form action="/api/auth/logout" method="post">
               <button
                 aria-label="Log out"

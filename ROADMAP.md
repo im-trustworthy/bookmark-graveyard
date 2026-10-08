@@ -90,9 +90,8 @@ X's API does not expose when a post was bookmarked.
 **Why it's deferred:** accuracy equals sync frequency. Until an unattended
 nightly sync runs, "saved" dates cluster on whichever day the user happened to
 hit the sync button, which is more misleading than having no mode at all. The
-cron endpoint already exists (`/api/cron/sync`, bearer-protected) but nothing
-schedules it, and the Render deploy still fails closed (503) because its env
-vars were never set. Separately, every bookmark from before the app was first
+cron endpoint already exists (`/api/cron/sync`, bearer-protected), but
+`render.yaml` and `vercel.json` only schedule it weekly. Separately, every bookmark from before the app was first
 connected shares one `first_seen_at` and would need a "saved before you
 connected" bucket in the UI.
 

@@ -12,14 +12,18 @@ export default async function Home({
 }) {
   const { error } = await searchParams;
 
-  let user: { handle: string; display_name: string | null; avatar_url: string | null } | null =
-    null;
+  let user: {
+    handle: string;
+    display_name: string | null;
+    avatar_url: string | null;
+    x_user_id: string;
+  } | null = null;
   try {
     const userId = await getSessionUserId();
     if (userId) {
       const { data } = await db()
         .from("users")
-        .select("handle, display_name, avatar_url")
+        .select("handle, display_name, avatar_url, x_user_id")
         .eq("id", userId)
         .single();
       user = data;

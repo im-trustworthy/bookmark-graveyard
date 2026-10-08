@@ -43,8 +43,9 @@ Out of scope:
 ## If you run an instance
 
 - Never commit `.env.local`. Keep `SUPABASE_SERVICE_ROLE_KEY` on the server only.
-- On a deployed instance, set `GATE_PASSWORD` (the app refuses to serve without it), `CRON_SECRET`
-  and `ALLOWED_X_USER_IDS`.
+- On a deployed instance, set `ALLOWED_X_USER_IDS`: without it, anyone who completes X sign-in can
+  use the instance and its API keys. Set `CRON_SECRET` if you want the weekly sync. `GATE_PASSWORD`
+  is optional: it adds a shared password in front of every page for an unlisted instance.
 - Set `SUPABASE_ACCESS_TOKEN` only on your own computer for `npm run setup`. Never set it on your
   host.
 - Keep the `episodes` storage bucket private. `npm run setup -- --check` warns if it is public.
