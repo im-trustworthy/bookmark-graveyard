@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { describeSync, formatRange } from "../dashboard-text";
+import { GREETINGS, describeSync, formatRange, pickGreeting } from "../dashboard-text";
 
 describe("describeSync", () => {
   it("reports a no-op check without mentioning the date range", () => {
@@ -47,5 +47,16 @@ describe("formatRange", () => {
 
   it("falls back to neutral wording when a picker is cleared", () => {
     expect(formatRange("", "2026-10-05")).toBe("in the selected range");
+  });
+});
+
+describe("pickGreeting", () => {
+  it("returns the first greeting for 0 and the last for values just under 1", () => {
+    expect(pickGreeting(() => 0)).toBe(GREETINGS[0]);
+    expect(pickGreeting(() => 0.999999)).toBe(GREETINGS[GREETINGS.length - 1]);
+  });
+
+  it("always returns a known greeting with the real random source", () => {
+    for (let i = 0; i < 50; i++) expect(GREETINGS).toContain(pickGreeting());
   });
 });

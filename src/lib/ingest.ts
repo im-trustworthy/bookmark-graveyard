@@ -197,7 +197,7 @@ async function assertHostIsSafe(target: URL): Promise<void> {
 
 async function fetchArticle(url: string): Promise<{ title: string | null; content: string }> {
   const headers = {
-    "User-Agent": "Mozilla/5.0 (compatible; BookmarkBrief/1.0; +https://github.com/im-trustworthy/x-bookmark)",
+    "User-Agent": "Mozilla/5.0 (compatible; BookmarkGraveyard/1.0; +https://github.com/im-trustworthy/bookmark-graveyard)",
     Accept: "text/html,application/xhtml+xml",
   };
   const deadline = Date.now() + ARTICLE_FETCH_TIMEOUT_MS;

@@ -402,9 +402,9 @@ Respond with JSON: {"overview": string, "sections":[{"title", "tweet_ids": strin
 
   return grokText(
     SMART_MODEL,
-    `You write the reader's personal weekly digest, "Bookmark Brief", in markdown, from their own X bookmarks.
+    `You write the reader's personal weekly brief for Bookmark Graveyard, in markdown, from their own X bookmarks.
 Follow the provided outline exactly (sections, order, angles). Rules:
-- Start with "# Your Bookmark Brief" + the date range, then the overview paragraph.
+- Start with "# Your weekly brief" + the date range, then the overview paragraph.
 - One "## <Section title>" per outline section. SYNTHESIZE the dossiers into flowing insight along the
   section's angle — weave posts together, don't list them. Draw on the article excerpts and transcripts,
   not just post text; pull out the sharpest specific facts, numbers, and takeaways.
@@ -442,7 +442,7 @@ export async function writePodcastScript(
 Host A ("Alex") is curious and steers the show; Host B ("Blake") is the analyst who adds depth.
 Style: NotebookLM-like — conversational, enthusiastic but not cheesy, hosts build on each other,
 react briefly, ask each other real questions. Open by welcoming the listener to their weekly
-Bookmark Brief; close with a quick recap.
+Bookmark Graveyard brief; close with a quick recap.
 CREDIT CREATORS BY NAME: whenever discussing a post's content, the hosts say the creator's actual
 name naturally in speech ("Sarah Chen made a great point about...", "there's a thread from Naval on...").
 Never read out URLs or @-handles letter by letter; use the human name (fall back to the handle as a

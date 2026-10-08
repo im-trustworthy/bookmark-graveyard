@@ -1,241 +1,348 @@
-# Bookmark Brief
+# Bookmark Graveyard
 
-Turns your X bookmarks into a personal weekly briefing. It signs in with your X account, deep-reads
-everything behind each bookmark — linked articles, images, video — and uses a two-tier Grok model
-blend to synthesize what you saved into a digest: markdown, or markdown plus a two-host podcast.
-Community Notes cross-checks and a staleness pass keep it honest and current.
+*Raise your bookmarks from the dead.*
 
-**Core loop:** sign in with X → bookmarks sync automatically → ingestion & analysis fill in over a
-few chunked background calls → filter by date/topic or hand-pick posts → generate a brief.
+Bookmark Graveyard turns the X bookmarks you never go back to into a weekly markdown brief and an
+optional two-host podcast. It is self-hosted: you run it yourself and bring your own keys. It signs
+in with your X account, reads the posts you saved and the articles, images and videos behind them,
+and has [Grok](https://x.ai) write up what you saved. It is for anyone whose bookmarks are a pile
+they never open.
 
-This is a personal tool (see [Project status](#project-status)), but it's written multi-user-ready.
+![The Bookmark Graveyard dashboard: format picker, date and topic filters, voices, and the Create my brief button](docs/screenshots/app-dashboard.jpg)
 
-## Features
+[▶ Listen to 30 seconds of a real brief](docs/sample-brief.mp3)
 
-### Sync
-- OAuth 2.0 PKCE login with X, read-only scopes (`tweet.read`, `users.read`, `bookmark.read`,
-  `offline.access`). Access/refresh tokens are AES-256-GCM–encrypted at rest and refreshed
-  automatically (with rotation) when they expire.
-- Pulls your bookmarks — X's API caps a first sync at your ~800 most recent; after that, regular
-  syncs grow the library past 800 since only genuinely new `tweet_id`s get inserted.
-- Sync is decoupled from analysis: bookmarks appear in the UI the moment the fetch finishes; topics
-  and summaries fill in a few seconds later as background chunks land.
+**Private by design:** your data stays in your own Supabase project; the only services that see it
+are the ones you bring keys for.
 
-### Deep ingestion (`src/lib/ingest.ts`)
-- **Articles** — fetches linked URLs (post + quoted post, up to 3 per post) and extracts the
-  readable body with Mozilla Readability. A second Grok pass verifies the fetched article actually
-  matches what the post described before it's trusted.
-- **"Link in the replies" posts** — when a post promises a link it doesn't embed (matching patterns
-  like "link below 👇" / "full article"), Grok's live X/web search (`x_search` + `web_search` agent
-  tools) looks for the author's own self-reply link.
-- **Images** — described and read by Grok vision; legible text (tables, code) is transcribed
-  verbatim, not just summarized.
-- **Video/GIFs** — transcribed by the configured voice provider (Grok STT or ElevenLabs Scribe)
-  from the lowest-bitrate MP4 variant, capped at 25 minutes / 60MB; falls back to a thumbnail
-  description if transcription fails, is skipped, or the voice provider is misconfigured.
-- Runs 3-way concurrent, capped per request so it fits inside the serverless timeout budget (see
-  [Pipeline](#pipeline)).
+## What you need
 
-### Enrichment & taxonomy (`src/lib/brain.ts`)
-- Batches of 20 posts (3 batches concurrently) through the FAST Grok model to tag topics, write a
-  one-sentence summary, extract up to 3 key claims, and classify `content_type` (news / evergreen /
-  opinion / other) — grounded in the full dossier (post + quoted post + ingested article/media
-  content), not just the tweet text.
-- Topic tags strongly prefer reusing your existing taxonomy; a new tag is only coined when nothing
-  fits, so the topic list stays navigable instead of exploding.
+You need three accounts, one optional account, and a computer with [Node.js](https://nodejs.org) 22
+or newer (npm comes with it) and [git](https://git-scm.com).
 
-### Credibility & staleness
-- A daily GitHub Actions job (`.github/workflows/community-notes.yml`, 06:30 UTC) streams X's
-  public Community Notes dataset and matches notes against your bookmarked `tweet_id`s — there's no
-  API for reading notes on an arbitrary post, so this reads the same bulk zipped TSV dumps X publishes.
-- Posts with a note classified `MISINFORMED_OR_POTENTIALLY_MISLEADING` **and** currently rated
-  helpful are excluded from digests entirely (listed separately, as links only). Posts with any
-  other note are kept, but the digest is told to caveat them.
-- At digest time (not enrich time, so it reflects the news as of *now*), a staleness pass asks Grok
-  to judge every `news`-classified post: `keep`, `stale` (dropped), or `evolved` (kept, flagged as
-  likely having moved on since it was posted). Non-news posts skip this pass entirely.
+An API key is a long password that lets this app use a service for you. You make one on each
+service's website and paste it into a text file on your own computer, or into your host's settings.
 
-### Digest generation
-- Filter by date range and/or topic tags, or bypass filters entirely by hand-picking specific posts
-  in the UI. Either way, individual bookmarks can be permanently hidden from all future briefs — X's
-  read-only scopes mean the app can't un-bookmark on your behalf, so "hide" is a local flag.
-- Output as markdown, or markdown plus a two-host podcast.
-- **Markdown** — a two-stage SMART-model synthesis: first an editorial outline (3-7 thematic
-  sections spanning topics, strongest material first), then full prose composed section by section
-  from that outline, grounded in the full dossiers. Every idea is attributed inline as a markdown
-  link to its creator; it closes with a "Worth a deeper look" pick of the 3 most substantive items.
-- **Audio** — a NotebookLM-style two-host script (Alex, curious; Blake, analytical) written from the
-  finished markdown, word-budgeted to a target runtime (the API supports 5-30 minutes; the UI
-  currently always asks for 20), then rendered with the configured voice provider (Grok Voice or
-  ElevenLabs), one voice per host, and stitched into one MP3. Creators are credited by spoken name,
-  never read out as raw handles.
-- **Voices** — chosen in the app: connect Grok Voice or ElevenLabs, optionally with your own key,
-  and pick Host A/B from a live list with previews; server env vars are just the instance defaults.
+| Account | What you copy from it | What it costs |
+| --- | --- | --- |
+| [Supabase](https://supabase.com) | Your project URL and a secret key. This is your database and file storage. | The free tier is enough. |
+| [X Developer Console](https://console.x.com) | An OAuth 2.0 Client ID and Client Secret. This is how you sign in and how the app reads your bookmarks. | Pay-per-use. Reading bookmarks costs $0.001 per post, so $5 buys 5,000 post reads. |
+| [xAI console](https://console.x.ai) | One API key. [Grok](https://x.ai) tags your bookmarks, writes the brief and can speak the podcast. | Pay-as-you-go. Typically under $1 a month for analysis, plus about $0.20 per podcast episode with Grok Voice. |
+| [ElevenLabs](https://elevenlabs.io) (optional) | One API key, if you want other podcast voices. | Creator plan, $22 a month, about $1.25 per episode. |
 
-### Reliability & UX
-- Every API route caps `maxDuration` at 300 seconds, and nothing that could run long — ingestion,
-  enrichment, audio rendering — happens in a single request. The client drives each stage in bounded
-  chunks and loops until done, so the UI shows real progress ("recording audio — line 14 of 82", an
-  actual percentage bar) instead of an indefinite spinner.
-- Episodes stuck mid-generation (`status: "draft"`) never show up in episode history — only fully
-  rendered (`"ready"`) ones do.
-- Capacity awareness — the dashboard shows storage and database use ("Storage 4% · Database 3%")
-  and warns at 80%. By default it also removes the oldest briefs' audio once storage passes 90%, so
-  an upload never fails; the markdown of a pruned brief stays, and each person's newest four briefs
-  are never touched. The warning's "Free up space" button previews and runs that cleanup for your
-  own briefs on demand. Four optional env vars tune it: `STORAGE_LIMIT_BYTES` (default 1 GiB),
-  `DATABASE_LIMIT_BYTES` (default 500 MiB; warn-only, since bookmarks are your data),
-  `AUTO_PRUNE_AUDIO` (`false` only warns, and audio uploads are then refused when storage is full)
-  and `KEEP_RECENT_AUDIO` (default 4).
+Each "Check X for new" re-reads your whole bookmark list, so $5 lasts months for a few hundred
+bookmarks. [Costs](#costs) has the numbers.
 
-### Multi-user & security
-- `ALLOWED_X_USER_IDS` gates login: empty means personal mode (whoever completes X OAuth is
-  allowed); set it to a comma-separated list of X user IDs to lock the instance down.
-- The session cookie is HMAC-signed, httpOnly, `SameSite=Lax` (secure-flagged in production).
-  Supabase is only ever touched server-side with the service-role key — row-level security is
-  deny-all, so the browser has no direct database access.
-- Per-user voice-provider keys (pasted in the Voices panel) are AES-256-GCM–encrypted at rest like
-  the X tokens, only ever used server-side, and shown back as their last 4 characters at most.
-- The Vercel cron endpoint (`/api/cron/sync`) fails closed: with no `CRON_SECRET` configured it
-  returns 503 rather than running unauthenticated, so a deployed instance can't be triggered by
-  anyone who finds the URL.
+## Set up in about 20 minutes
 
-## Architecture
-
-```
-Browser (dashboard.tsx — client component)
-   |  fetch, same-origin, bb_session cookie (HMAC-signed)
-   v
-Next.js API routes  (src/app/api/**)
-   |
-   |--> X API (api.x.com)              OAuth 2.0 PKCE login + bookmark reads
-   |--> Supabase (Postgres + Storage)  service-role key only, RLS deny-all
-   |--> xAI Grok (api.x.ai/v1)         FAST + SMART chat models, x_search/web_search
-   |--> Voice provider (pick one)      xAI Grok (api.x.ai/v1/tts, /v1/stt)
-                                       OR ElevenLabs (TTS + Scribe)
-
-Unattended jobs, outside the request path:
-
-  GitHub Actions (daily, 06:30 UTC)
-    scripts/community-notes-sync.mjs --> X's public Community Notes zipped TSV dumps
-                                      --> Supabase `community_notes` table
-
-  Vercel Cron (Fridays, vercel.json)
-    GET /api/cron/sync (Bearer CRON_SECRET) --> sync + ingest + enrich,
-                                                 every allowed user, unattended
-```
-
-**Data model** (Supabase Postgres; the schema is in `supabase/migrations/`, applied by
-`npm run setup` or `supabase db push`):
-- `users` — one row per X account; encrypted tokens, allowlist flag
-- `bookmarks` — raw synced posts, deduped by `tweet_id`
-- `bookmark_sources` — ingested article/image/video content, one row per source
-- `bookmark_analysis` — topics, summary, claims, content_type, credibility
-- `topics` — the user's growing tag taxonomy
-- `community_notes` — matched notes from X's public dataset
-- `episodes` — generated briefs (storage paths, script, status, stats, pinned voice provider + host
-  voices)
-- `user_voice_settings` — per-user voice provider, encrypted key (nullable = use instance key), two
-  host voices
-- Storage bucket `episodes` — the markdown/MP3 files themselves, served via 24-hour signed URLs
-
-**Stack**: Next.js 16 (App Router) + React 19 + TypeScript + Tailwind 4, Supabase (Postgres +
-Storage), the `openai` SDK pointed at xAI's OpenAI-compatible endpoint, Zod. Next.js 16 has real
-breaking changes from what most tooling/training data assumes (async `cookies()` / `searchParams`,
-etc.) — see `AGENTS.md` before touching framework-level code.
-
-## Quickstart
+### 1. Get the code
 
 ```bash
-git clone https://github.com/im-trustworthy/x-bookmark.git
-cd x-bookmark
+git clone https://github.com/im-trustworthy/bookmark-graveyard.git
+cd bookmark-graveyard
 npm install
-cp .env.example .env.local   # optional: `npm run setup` creates it if it's missing
-# fill in .env.local — SETUP.md walks through where to get every value, in order
-npm run setup                # checks every value, generates the secrets, provisions the database
+cp .env.example .env.local
+```
+
+`.env.local` is a plain text file. Open it in any editor. Every key you collect below goes into it.
+Git ignores this file, so your keys stay on your computer.
+
+### 2. Supabase: your database
+
+1. Sign up at [Supabase](https://supabase.com) and create a project. The free plan is fine. Any
+   name and region will do.
+2. Open **Project Settings → API Keys**. Your project URL is `https://<project-ref>.supabase.co`,
+   and the project ref is the short code in the dashboard address. Paste the URL into
+   `.env.local` as `NEXT_PUBLIC_SUPABASE_URL`.
+3. The page opens on the **Publishable and secret API keys** tab. Skip it for now. The note below
+   explains why.
+
+   ![Supabase API Keys page on the Publishable and secret API keys tab](docs/screenshots/supabase-api-keys.jpg)
+
+4. Click the **Legacy anon, service_role API keys** tab. Click **Reveal** on the `service_role`
+   row and copy it into `.env.local` as `SUPABASE_SERVICE_ROLE_KEY`.
+
+   ![Supabase API Keys page on the Legacy anon, service_role tab, with the service_role key row](docs/screenshots/supabase-legacy-keys.jpg)
+
+The `service_role` key can read and write everything in your project. Keep it out of public places.
+
+**Which key does the code accept?** The legacy `service_role` key is a JWT. It is the format every
+part of the project sends, so use it. A newer `sb_secret_...` key from the first tab is also
+accepted by `npm run setup`, which sends it the way Supabase requires. The app passes it unchanged
+to Supabase's JavaScript client. Not every path has been tested with it, and the optional Community
+Notes job sends its key as a Bearer token. If a newer key gives you 401 errors, switch to the legacy
+one.
+
+### 3. X: sign-in and your bookmarks
+
+1. Go to the [X Developer Console](https://console.x.com) and sign in with your X account.
+2. Open **Apps → Create App**. Any name works.
+3. Open **Billing → Credits** and click **Purchase credits**. A few dollars is plenty to start.
+   Leave Auto Recharge off if you want a hard stop when the balance runs out. These credits pay for
+   X only. Grok is billed separately in step 4.
+
+   ![X Developer Console, Billing, Credits page with Purchase credits and Auto Recharge off](docs/screenshots/x-console-credits.jpg)
+
+4. Open the app and click **Settings**. Under **Authentication settings**, set:
+   - **App permissions:** Read
+   - **Type of App:** Web App, Automated App or Bot (a confidential client)
+   - **Callback URI / Redirect URL:** `http://localhost:3000/api/auth/callback/x`
+   - **Website URL:** anything valid, such as your X profile address
+
+   Save the page.
+
+   ![X app Authentication settings: Read permission, Web App confidential client, callback URL](docs/screenshots/x-console-auth-settings.jpg)
+
+5. Go back to the app page and open the **Keys & Tokens** tab. Under **OAuth 2.0 Keys**, copy the
+   **Client ID** and **Client Secret** into `.env.local` as `X_CLIENT_ID` and `X_CLIENT_SECRET`.
+   Ignore the other rows. The app does not use them.
+
+   ![X app Keys and Tokens tab, with the OAuth 2.0 Keys section holding Client ID and Client Secret](docs/screenshots/x-console-keys.jpg)
+
+### 4. xAI: Grok
+
+1. Open the [xAI console](https://console.x.ai). On the dashboard, add a few dollars of credits
+   (**Credits remaining → Add**).
+2. Click **Create API key** and copy the key into `.env.local` as `XAI_API_KEY`.
+
+   ![xAI console dashboard with Create API key and Credits remaining](docs/screenshots/xai-console.jpg)
+
+   You can find the key again later under **API Keys**.
+
+   ![xAI console API Keys list](docs/screenshots/xai-api-keys.jpg)
+
+The same key powers Grok Voice for the podcast. That is the default, so there is nothing else to set
+up. Want [ElevenLabs](https://elevenlabs.io) voices instead? Make a key there (profile → API Keys)
+and paste it into the app's Voices panel after you sign in. You do not need to edit any file.
+
+### 5. Run the setup script
+
+```bash
+npm run setup
+```
+
+The script:
+
+- checks every value in `.env.local` and tells you which ones are missing;
+- generates `APP_ENCRYPTION_KEY` and `SESSION_SECRET` for you, so you do not make those;
+- creates the database tables and the private `episodes` storage bucket;
+- checks your xAI key (and your ElevenLabs key, if you set one) with free calls.
+
+It creates the database in one of two ways. With a Supabase personal access token it does the work
+for you. Make one on the [Supabase tokens page](https://supabase.com/dashboard/account/tokens), put
+it in `.env.local` as `SUPABASE_ACCESS_TOKEN`, and run the script. It asks y/N before it changes
+anything. Without a token, it writes the whole database setup to a SQL file and prints the link to
+your project's SQL editor. Paste the file there and press Run. Only use the token on your own
+computer, never on a host.
+
+To re-check at any time without changing anything:
+
+```bash
+npm run setup -- --check
+```
+
+Look for a tick (✓) next to every required line.
+
+![Terminal output of npm run setup -- --check, with required values ticked and the callback URL to register](docs/screenshots/setup-check.png)
+
+### 6. Start it
+
+```bash
 npm run dev
 ```
 
-Open http://localhost:3000.
+Open `http://localhost:3000` and click **Sign in with X**. Approve the app. Your bookmarks start
+loading right away.
 
-## Pipeline
+![The Bookmark Graveyard landing page with the Sign in with X button](docs/screenshots/landing.jpg)
 
-Two independent pipelines: one keeps your bookmark library fresh, the other turns a slice of it
-into a brief on demand.
+## Using it
 
-**Sync → ingest → enrich** (`/api/sync`, then `/api/enrich` looped by the client):
-1. **Sync** (`syncUser`) — paginates X's bookmarks endpoint, inserts only unseen `tweet_id`s.
-   Tolerates X's rate limits (bounded backoff, up to 2 retries) and early pagination stops (keeps a
-   partial result rather than failing the whole sync). Returns immediately — no analysis yet.
-2. **Ingest** (`ingestPending`) — up to 15 not-yet-ingested bookmarks per call: fetch linked
-   articles, describe images, transcribe video. 3-way concurrent.
-3. **Enrich** (`enrichNewBookmarks`) — up to 60 ingested-but-unanalyzed bookmarks per call, batched
-   20 at a time through the FAST model for topics/summary/claims/content_type.
+**First sign-in and sync.** The first time you open the app with an empty library, it pulls your
+bookmarks from X by itself. After that, **Check X for new** pulls your whole list again. X only
+shows your newest ~800 bookmarks, and it does not tell the app when you saved each one. Posts
+appear as soon as they arrive. Topics and summaries fill in a few seconds later.
 
-The dashboard calls `/api/enrich` in a loop until `remaining` hits zero, updating the status line
-with a live count each pass. That's why sync feels instant and tags "fill in" a few seconds later
-instead of one long blocking request — every call to X's bookmarks API and every Grok batch happens
-inside a request designed to finish well under the 300-second ceiling.
+**Pick a format.** "How would you like your summary?" offers **Markdown** or **Markdown + Podcast**.
+Markdown needs no voice setup.
 
-**Prepare → script → render → finalize** (only when you click "Create my brief"):
-1. **`/api/digest/prepare`** — select bookmarks (filters or your hand-picked selection) → staleness
-   pass on news items → two-stage SMART synthesis (outline, then compose) → upload `brief.md` to
-   Storage → create the `episodes` row. Markdown-only requests stop here (`status: "ready"`
-   immediately).
-2. **`/api/digest/script`** — the SMART model turns the markdown into an Alex/Blake dialogue script,
-   saved onto the episode row.
-3. **`/api/digest/render`** — renders 12 script lines per call to MP3 (one TTS call per line, one
-   voice per host; ElevenLabs also gets neighboring-line context for prosody), uploading each chunk
-   to Storage. The client loops, advancing a cursor, driving a real `cursor / totalLines` progress
-   bar.
-4. **`/api/digest/finalize`** — downloads every chunk, concatenates them (chunks share one CBR
-   encoding — MP3, 44.1 kHz, 128 kbps — whichever provider rendered them, with per-clip ID3/Xing
-   headers stripped, so byte concatenation is valid), uploads the final `brief.mp3`, deletes the
-   chunk files, flips the episode to `status: "ready"`.
+![The dashboard with the format picker, Posted between dates, topic chips, Voices row and Create my brief](docs/screenshots/app-dashboard.jpg)
 
-Audio rendering is the slowest and most timeout-prone step — one TTS call per line of
-dialogue — so it's the one broken into the smallest chunks (12 lines) with the most granular
-client-visible progress. This staged design is what makes long briefs safe to generate from a
-regular HTTP request instead of needing a background job queue.
+**Filters and topics.** **Posted between** limits the brief to posts published in a date range. It
+starts at the last seven days. The topic chips below it are the tags Grok found, each with a count.
+Click a chip to narrow the list to that topic.
 
-## Cost notes
+**Hand-pick posts.** Click posts in **Your bookmarks** to choose exactly which ones go in. The
+button then reads "Create my brief (N selected)". The × on a post removes it for good. That is a
+local hide. The app cannot un-bookmark on X, because it only has read access.
 
-- **X reads** — pay-per-use, bookmark reads are billed at $0.001/post. A first sync (~800 posts)
-  costs under a dollar; weekly incremental syncs are pennies.
-- **Supabase storage** — a 15-minute brief's MP3 is ~13.5 MB, so the free tier's 1 GiB holds
-  roughly 70 briefs before pruning starts (see [Reliability & UX](#reliability--ux)).
-- **Grok** — the two-tier model blend exists specifically for token efficiency. The FAST model
-  (`grok-4.3`, override with `XAI_MODEL_FAST`) does all the high-volume,
-  low-reasoning work: image descriptions, per-post categorization, article-match verification,
-  staleness checks. The SMART model (`grok-4.7`, override with `XAI_MODEL_SMART`) is reserved for
-  low-volume, high-value synthesis: digest outline, digest composition, podcast script, and live
-  search. A full sync plus a weekly digest is typically well under $1 in xAI usage.
-- **Voice (audio briefs + video transcription)** — unlike the Grok LLM blend, there's no cheap tier
-  for speech: every character spoken is billed the same regardless of how "smart" it needs to be, so
-  the provider you pick is the cost lever. Measured on real episodes (~15 minutes of audio,
-  ~11,500–13,800 spoken characters, 31–43 dialogue lines; pricing as of October 2026):
+![The Your bookmarks list with topic tags on each post](docs/screenshots/app-bookmarks.jpg)
 
-  | Voice provider | Billing | Per ~15-minute episode |
-  | --- | --- | --- |
-  | **Grok Voice** | $15 per 1M characters, pay-as-you-go on the same xAI credits as the LLM calls (no subscription) | ~$0.20 — under $1/month for a weekly brief |
-  | **ElevenLabs, Creator plan** | $22/month for 121,000 credits; Turbo bills 0.5 credits per character | ~6,000–7,000 credits, about $1.25 — a weekly brief uses roughly a quarter of the plan |
-  | **ElevenLabs, usage-based** | $0.04 per 1,000 characters (Turbo) | ~$0.55 |
+**Voices.** The Voices row shows who will host the podcast. Click **Change** to open the panel. Pick
+**Grok Voice** or [ElevenLabs](https://elevenlabs.io). Paste your own key, or leave the field blank
+to use the one in `.env.local`. Click **Load voices**, then choose Host A (Alex, the curious one)
+and Host B (Blake, the analyst). **Preview** plays a one-sentence sample. **Save voices** keeps your
+choice. **Use instance defaults** puts it back.
 
-  Video transcription is much smaller either way, and only runs on bookmarks that contain video:
-  Grok STT is $0.10/hour (REST), ElevenLabs Scribe v2 is $0.22/hour. ElevenLabs defaults to the
-  turbo model (`eleven_turbo_v2_5`, override with `ELEVENLABS_MODEL`) to stretch a plan further, and
-  its `previous_text`/`next_text` prosody hints aren't billed. The trade-off for Grok's price: it
-  has no equivalent of those continuity hints, so each line is rendered standalone — listen to a
-  sample before committing. The instance default is `VOICE_PROVIDER` (`grok` or `elevenlabs`; unset,
-  it's ElevenLabs when `ELEVENLABS_API_KEY` is set, otherwise Grok, since the app requires
-  `XAI_API_KEY` anyway — see [SETUP.md](SETUP.md) step 4), and users can override it in the app; a
-  user's own key is billed to their account.
+![The Voices panel with provider choice, API key field, Load voices, and Host A and Host B pickers with Preview](docs/screenshots/app-voices.jpg)
 
-## Project status
+**Create my brief, then listen or read.** A progress bar shows each stage while the brief is
+written and, for a podcast, voiced line by line. Finished briefs collect under **Previous briefs**.
+Each has an audio player and **Download markdown**. Every idea in the markdown links back to the
+post it came from. If something is interrupted, a **Resume** button picks up where it stopped.
 
-Personal tool, built and run by [@im-trustworthy](https://github.com/im-trustworthy). The repo is
-currently private and may be open-sourced later. Unit tests cover the pure library logic
-(`npm test`); route handlers and the pipeline are exercised end-to-end rather than mocked.
-License: TBD — treat as all-rights-reserved until one is added.
+![Previous briefs, each with an audio player and a Download markdown link](docs/screenshots/app-briefs.jpg)
 
-Deferred / planned work — and why some of it is blocked upstream — lives in [ROADMAP.md](ROADMAP.md).
+**Weekly sync.** To have the app check X by itself, set `CRON_SECRET` to any long random string.
+The `/api/cron/sync` address then syncs and analyzes new bookmarks for everyone allowed to sign in.
+`render.yaml` and `vercel.json` already schedule it for Fridays at 12:00 UTC. Without
+`CRON_SECRET` it stays off.
+
+## Deploy anywhere
+
+Bookmark Graveyard is a standard Node.js app. Use any host that runs Node 22+ and takes environment
+variables. [Render](https://render.com) is what the author uses. [Vercel](https://vercel.com) works
+too. Neither is required.
+
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/im-trustworthy/bookmark-graveyard)
+
+`render.yaml` is a Render Blueprint. It creates the web service and the weekly sync job, then asks
+you for each environment variable.
+
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fim-trustworthy%2Fbookmark-graveyard&project-name=bookmark-graveyard&repository-name=bookmark-graveyard&env=NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,X_CLIENT_ID,X_CLIENT_SECRET,XAI_API_KEY,APP_ENCRYPTION_KEY,SESSION_SECRET,APP_URL&envDescription=Values%20from%20your%20.env.local%20(see%20SETUP.md))
+
+`vercel.json` adds the weekly sync cron. The button asks for eight values, all straight from your
+`.env.local`. The two optional ones for a deployed instance, `GATE_PASSWORD` and `CRON_SECRET`, are
+explained below; add them under the project's environment variables if you want them.
+
+After you deploy:
+
+1. **Add the production callback URL in your X app.** In the X Developer Console, open the app's
+   Settings and use "Add another" under Callback URI. The URL is
+   `https://your-domain/api/auth/callback/x`.
+2. **Set `APP_URL`** to your public address, with no trailing slash.
+3. **Set `ALLOWED_X_USER_IDS`** to a comma-separated list of X user IDs. This is the one that
+   matters: only those accounts can sign in. Without it, anyone who completes X sign-in can use
+   your instance and your API keys. Your own X user ID is shown next to **Log out** after you sign
+   in.
+4. **Set `CRON_SECRET`** if you want the weekly sync.
+5. **Optionally set `GATE_PASSWORD`.** It puts a single shared password in front of every page,
+   including the landing page, for people who want the instance unlisted. Leave it unset for no
+   wall.
+
+**Fully local.** You can run the database on your own computer too. Install
+[Docker](https://www.docker.com) and the
+[Supabase CLI](https://supabase.com/docs/guides/local-development). In this folder, run
+`supabase init` once and then `supabase start`. It applies the same database files and prints a
+local URL and keys. Put them in `.env.local` as `NEXT_PUBLIC_SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY`. X, xAI and the voice provider are still online services.
+
+[SETUP.md](SETUP.md) has the long version of all of this.
+
+## Costs
+
+Prices as of October 2026.
+
+| What | Price | In practice |
+| --- | --- | --- |
+| X: reading bookmarks | $0.001 per post read | Each check re-reads your whole list: a few cents for a small library, at most about $0.80 for 800 posts |
+| [Grok](https://x.ai): tagging, summaries and writing the brief | Per token, with a cheap model for bulk work and a smarter one for writing | Typically well under $1 a month for a sync and a weekly brief |
+| Podcast voice: Grok Voice | $15 per 1M characters, on the same xAI credits | About $0.20 per 15-minute episode |
+| Podcast voice: [ElevenLabs](https://elevenlabs.io) Creator plan | $22 a month for 121,000 credits | About $1.25 per episode |
+| Podcast voice: ElevenLabs usage-based | $0.04 per 1,000 characters (Turbo) | About $0.55 per episode |
+| [Supabase](https://supabase.com) storage | Free tier includes 1 GiB | A 15-minute episode is about 13.5 MB, so roughly 70 episodes per free GiB before old audio is pruned |
+| Hosting | Free on your own computer | Otherwise see [Render](https://render.com/pricing) and [Vercel](https://vercel.com/pricing) pricing |
+
+Daily limits built into the app also stop a bug or a stolen session from running up a bill.
+[ARCHITECTURE.md](ARCHITECTURE.md#cost-analysis) has the full analysis.
+
+## Data & privacy
+
+**What is stored**, in your own Supabase project:
+
+- Your bookmarks: post text, author, links, media details and the raw data X returned.
+- Text pulled from what you saved: linked article text, image descriptions and video transcripts.
+- Topics, one-sentence summaries and key claims that Grok wrote.
+- Your briefs: the markdown, the podcast script and the audio. The files sit in a private storage
+  bucket called `episodes`. The app opens them with links that expire after 24 hours.
+- Your X sign-in tokens, and any voice API key you paste into the Voices panel. Both are encrypted
+  with AES-GCM under `APP_ENCRYPTION_KEY`. The panel shows a key's last four characters at most.
+
+**What leaves your server:**
+
+- [X](https://console.x.com): sign-in, and reading your bookmarks.
+- [xAI](https://console.x.ai): post and article text, image links and video audio go to Grok to be
+  analyzed. The finished brief goes back to write the podcast script and, with Grok Voice, to speak
+  it. Grok's live search runs on xAI's side when a post says its link is in the replies.
+- [ElevenLabs](https://elevenlabs.io), only if you choose it: script lines to speak, and video audio
+  to transcribe.
+- The websites your bookmarks link to. The server fetches those articles, and it refuses private
+  addresses.
+- The optional daily [GitHub Actions](https://docs.github.com/actions) job downloads X's public
+  [Community Notes data](https://communitynotes.x.com/guide/en/under-the-hood/download-data) and
+  compares it with your bookmarked post IDs. Nothing about your bookmarks is sent to X. The job
+  runs on GitHub with your Supabase key stored as a repository secret.
+
+The app has no analytics and no telemetry. [Next.js](https://nextjs.org), the framework it is built
+on, collects anonymous usage data from its command-line tool. Turn that off with
+`npx next telemetry disable`.
+
+**To delete everything,** delete your Supabase project in its dashboard. That removes the database
+and every file. Then remove the app from your X account's connected apps, and delete the keys you
+made at each service.
+
+## Troubleshooting
+
+**X shows an error instead of asking you to approve, or you land back on the sign-in page with
+"Sign-in didn't complete."** The callback URL in your X app must match the one the app sends,
+character for character. It is your `APP_URL` plus `/api/auth/callback/x`. Check `http` against
+`https`, the port (`:3000`), a trailing slash and a `www.`. `npm run setup -- --check` prints the
+exact URL to register. Also check that the app type is "Web App, Automated App or Bot" and that you
+copied the Client ID and Secret from **OAuth 2.0 Keys**.
+
+**"This account isn't on the allowlist for this instance."** Your X user ID is not in
+`ALLOWED_X_USER_IDS`. Add it. Leaving the variable empty lets anyone who signs in through, which
+only makes sense on your own computer.
+
+**Pages fail to load or the database cannot be reached.** Free Supabase projects pause after about
+a week without activity. Open the project in the [Supabase dashboard](https://supabase.com/dashboard)
+and restore it. A deployed instance with the weekly sync running keeps itself awake.
+
+**"Invalid API key for Grok Voice" (or ElevenLabs), or "The voice provider rejected the API key."**
+Open **Voices → Change**, paste a fresh key, and click **Save voices**. The app checks the key by
+loading that provider's voices. Other messages:
+
+- "The voice provider refused the request": the key is fine, but the account may be out of credits
+  or lack permission.
+- "Your saved voice API key can't be read": `APP_ENCRYPTION_KEY` changed since you saved it. Enter
+  the key again.
+- A brief that stopped partway shows a **Resume** button. Fix the key first, then resume. Markdown
+  briefs never need a voice key. If transcribing a video fails, the app describes its thumbnail
+  instead.
+
+**Storage is filling up, or old briefs lost their audio.** The dashboard warns at 80% of your
+storage. When new audio would push storage past 90%, the app removes the oldest podcast audio until
+there is room. It never touches the markdown, the bookmarks, or each person's newest briefs (four
+by default). The warning's **Free up space** button previews that cleanup and runs it for you.
+Four optional environment variables tune it:
+
+- `STORAGE_LIMIT_BYTES`: the size to measure against. The default is 1 GiB, the free tier.
+- `DATABASE_LIMIT_BYTES`: the database size to warn at. The default is 500 MiB. It only warns.
+- `AUTO_PRUNE_AUDIO`: set to `false` to only warn. New audio is then refused when storage is full.
+- `KEEP_RECENT_AUDIO`: how many of each person's newest briefs keep their audio. The default is 4.
+
+**"Daily limit reached."** The app caps paid actions per person per day. Wait, or raise the cap with
+`LIMIT_<KIND>_PER_DAY`, such as `LIMIT_SYNC_PER_DAY`.
+
+## More
+
+- [ARCHITECTURE.md](ARCHITECTURE.md): how it works inside, the pipeline, the data model and the
+  full cost analysis.
+- [SETUP.md](SETUP.md): the long setup guide, with every option.
+- [ROADMAP.md](ROADMAP.md): what is planned, and what is blocked and why.
+- [CONTRIBUTING.md](CONTRIBUTING.md): how to run it locally and send a pull request.
+- [SECURITY.md](SECURITY.md): how to report a vulnerability.
+
+## License
+
+[MIT](LICENSE). Copyright (c) 2026 TW Labs LLC.

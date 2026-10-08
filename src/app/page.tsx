@@ -2,19 +2,8 @@ import Image from "next/image";
 import { getSessionUserId } from "@/lib/session";
 import { db } from "@/lib/supabase";
 import Dashboard from "./dashboard";
+import { pickGreeting } from "@/lib/dashboard-text";
 
-// Rotating dashboard greeting — picked server-side per page load so SSR HTML
-// and hydration agree (Math.random() in the client component would mismatch).
-const GREETINGS = [
-  "Welcome back",
-  "Hello",
-  "Welcome",
-  "Glad you're here",
-  "Time to revive",
-  "Boo",
-  "Back from the dead",
-  "The graveyard stirs",
-];
 
 export default async function Home({
   searchParams,
@@ -23,14 +12,18 @@ export default async function Home({
 }) {
   const { error } = await searchParams;
 
-  let user: { handle: string; display_name: string | null; avatar_url: string | null } | null =
-    null;
+  let user: {
+    handle: string;
+    display_name: string | null;
+    avatar_url: string | null;
+    x_user_id: string;
+  } | null = null;
   try {
     const userId = await getSessionUserId();
     if (userId) {
       const { data } = await db()
         .from("users")
-        .select("handle, display_name, avatar_url")
+        .select("handle, display_name, avatar_url, x_user_id")
         .eq("id", userId)
         .single();
       user = data;
@@ -40,7 +33,9 @@ export default async function Home({
   }
 
   if (user) {
-    const greeting = GREETINGS[Math.floor(Math.random() * GREETINGS.length)];
+    // Picked once per request in this server component, so SSR HTML and
+    // hydration agree (the client component never calls it).
+    const greeting = pickGreeting();
     return <Dashboard user={user} greeting={greeting} />;
   }
 

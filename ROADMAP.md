@@ -90,9 +90,8 @@ X's API does not expose when a post was bookmarked.
 **Why it's deferred:** accuracy equals sync frequency. Until an unattended
 nightly sync runs, "saved" dates cluster on whichever day the user happened to
 hit the sync button, which is more misleading than having no mode at all. The
-cron endpoint already exists (`/api/cron/sync`, bearer-protected) but nothing
-schedules it, and the Render deploy still fails closed (503) because its env
-vars were never set. Separately, every bookmark from before the app was first
+cron endpoint already exists (`/api/cron/sync`, bearer-protected), but
+`render.yaml` and `vercel.json` only schedule it weekly. Separately, every bookmark from before the app was first
 connected shares one `first_seen_at` and would need a "saved before you
 connected" bucket in the UI.
 
@@ -110,7 +109,7 @@ one-line hint per mode.
 
 ## Local, no-cloud storage (SQLite + disk) — BACKLOG (2026-10-07)
 
-**What we want:** a way to run Bookmark Brief with no cloud account behind it:
+**What we want:** a way to run Bookmark Graveyard with no cloud account behind it:
 the database in SQLite and the episode files on local disk, so nothing leaves
 the machine except the calls to X, xAI and the voice provider.
 

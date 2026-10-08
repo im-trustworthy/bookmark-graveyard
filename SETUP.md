@@ -1,9 +1,13 @@
-# Bookmark Brief — Setup Guide
+# Bookmark Graveyard — Setup Guide
 
 **Four accounts, one command.** Supabase, an X developer app and xAI are required; ElevenLabs is
-optional, since audio briefs can run on your xAI key instead (step 4). Fill in
-[.env.local](.env.local) from steps 1–4 (about 20–25 minutes, one-time), then run `npm run setup`
-(step 5): it checks every value, generates the two app secrets, and creates the database.
+optional, since audio briefs can run on your xAI key instead (step 4). Fill in `.env.local` from
+steps 1–4 (about 20–25 minutes, one-time), then run `npm run setup` (step 5): it checks every value,
+generates the two app secrets, and creates the database.
+
+Start with `cp .env.example .env.local`. You can host the finished app anywhere that runs Node 22+
+and takes environment variables; see the deployment sections at the end. The short, illustrated
+version of this guide is the [README](README.md).
 
 ## 1. Supabase (5 min)
 
@@ -11,10 +15,24 @@ optional, since audio briefs can run on your xAI key instead (step 4). Fill in
 2. Open **Settings → API Keys**
    (`https://supabase.com/dashboard/project/<your-project-ref>/settings/api-keys`). Copy the project
    URL (`https://<your-project-ref>.supabase.co`; the ref is in the dashboard address) into
-   `.env.local` as `NEXT_PUBLIC_SUPABASE_URL`, then reveal the **service_role / secret** key and
-   paste it as `SUPABASE_SERVICE_ROLE_KEY`. (This key stays server-side only — never commit
+   `.env.local` as `NEXT_PUBLIC_SUPABASE_URL`.
+3. Open the **Legacy anon, service_role API keys** tab, click **Reveal** on the `service_role` row,
+   and paste it as `SUPABASE_SERVICE_ROLE_KEY`. (This key stays server-side only — never commit
    `.env.local`.)
-3. Optional: create a personal access token at https://supabase.com/dashboard/account/tokens and add
+
+   ![Supabase API Keys page, Legacy anon, service_role tab: reveal the service_role key](docs/screenshots/supabase-legacy-keys.jpg)
+
+   The dashboard opens on the **Publishable and secret API keys** tab first:
+
+   ![Supabase API Keys page, Publishable and secret tab, which also lists a secret key](docs/screenshots/supabase-api-keys.jpg)
+
+   **Which key?** Use the legacy `service_role` key. It is a JWT, which is the format every part of
+   the project sends, including the optional GitHub job below. A newer `sb_secret_...` key from the
+   first tab is also accepted by `npm run setup` (it sends that key the way Supabase requires) and
+   the app hands it unchanged to Supabase's JavaScript client, but not every path has been tested
+   with it. If you see 401 errors with one, switch to the legacy key. Do not click "Disable JWT-based API keys"
+   while you rely on the legacy key. The app never uses the anon or publishable key.
+4. Optional: create a personal access token at https://supabase.com/dashboard/account/tokens and add
    it to `.env.local` as `SUPABASE_ACCESS_TOKEN` (the variable the Supabase CLI uses), so that
    `npm run setup` can create the tables for you in step 5. Only that command uses it: never set it
    on your host.
@@ -27,24 +45,43 @@ weekly sync keeps it awake.
 
 ## 2. X developer app (10–15 min)
 
-1. Go to https://developer.x.com and sign in with your X account.
-2. Sign up for **pay-per-use** access (the default for new developers) and add a small credit
-   balance — bookmark reads are $0.001/post, so **$5 covers months** of weekly syncs.
-3. Create a **Project + App** (any names, e.g. "Bookmark Brief").
-4. In the app's **User authentication settings**, click **Set up** and configure:
+1. Go to https://console.x.com (the X Developer Console) and sign in with your X account.
+2. Open **Billing → Credits** and click **Purchase credits**. The X API is **pay-per-use** (no
+   monthly plan). Bookmark reads are $0.001 per post, so **$5 buys 5,000 post reads**. Leave Auto
+   Recharge off if you want a hard stop when the balance runs out. These credits only pay for X
+   API calls; Grok is billed separately in step 3.
+
+   ![X Developer Console, Billing, Credits: Purchase credits button, balance and Auto Recharge off](docs/screenshots/x-console-credits.jpg)
+
+3. Open **Apps → Create App** (any name, e.g. "Bookmark Graveyard"). The app page should say
+   *Project Access: Default Project (Pay Per Use)*.
+4. On the app page click **Settings** (top right) to open **Authentication settings**, and set:
    - **App permissions**: Read
    - **Type of App**: *Web App, Automated App or Bot* (confidential client)
-   - **Callback URI**: `http://localhost:3000/api/auth/callback/x`
-     (add your production URL later, e.g. `https://yourapp.vercel.app/api/auth/callback/x`)
+   - **Callback URI / Redirect URL**: `http://localhost:3000/api/auth/callback/x`
+     (add your production URL later, e.g. `https://yourapp.example.com/api/auth/callback/x`. It
+     must be your `APP_URL` plus `/api/auth/callback/x`, character for character, including `http`
+     vs `https` and any port)
    - **Website URL**: anything valid (your X profile URL works)
-5. Save — you'll be shown the **OAuth 2.0 Client ID and Client Secret**. Paste them into
-   `.env.local` as `X_CLIENT_ID` and `X_CLIENT_SECRET`.
+
+   Save the page.
+
+   ![X Developer Console app Settings page: Read permission, Web App confidential client, callback URL](docs/screenshots/x-console-auth-settings.jpg)
+
+5. Go back to the app page (**Back to Keys**) and open the **Keys & Tokens** tab. Under
+   **OAuth 2.0 Keys**, copy the **Client ID** and **Client Secret** (the eye icon reveals it;
+   **Regenerate** makes a new one if you lost it). Paste them into `.env.local` as `X_CLIENT_ID` and
+   `X_CLIENT_SECRET`. Ignore the Consumer Key, Bearer Token and Access Token rows: the app does not
+   use them.
+
+   ![X Developer Console, app Keys & Tokens tab: OAuth 2.0 Keys, Client ID and Client Secret](docs/screenshots/x-console-keys.jpg)
 
 ## 3. xAI (Grok) key (2 min)
 
-1. Go to https://console.x.ai → **API keys** → create a key.
+1. Go to https://console.x.ai → **API Keys** → **Create API key**.
 2. Paste it into `.env.local` as `XAI_API_KEY`.
-3. Your existing credits cover this; a full sync + weekly digest is typically well under $1.
+3. Add a few dollars of credits (**Credits remaining → Add** on the dashboard) if the account has
+   none; a full sync + weekly digest is typically well under $1.
 
 The app uses a two-tier model blend for token efficiency (overridable in `.env.local`):
 - `XAI_MODEL_FAST` (default `grok-4.3`) — per-post categorization,
@@ -141,7 +178,7 @@ npm run dev
 Open http://localhost:3000 → **Sign in with X** (bookmarks sync automatically on first login) →
 optionally pick your podcast voices in the **Voices** section under Filters (step 4) → set filters →
 **Create my brief**. First sync pulls up to your 800 most recent bookmarks (an X API limit); after
-that, **Re-sync** keeps growing your library beyond 800.
+that, **Check X for new** keeps growing your library beyond 800.
 
 ## Optional: Community Notes fact-check job
 
@@ -151,17 +188,26 @@ reading notes on arbitrary posts). A daily GitHub Actions job does the matching:
 1. Push this repo to GitHub.
 2. In the repo → **Settings → Secrets and variables → Actions**, add:
    - `SUPABASE_URL` = `https://<your-project-ref>.supabase.co`
-   - `SUPABASE_SERVICE_ROLE_KEY` = same key as step 1
+   - `SUPABASE_SERVICE_ROLE_KEY` = the legacy `service_role` key from step 1 (the script sends it
+     as a Bearer token)
 3. The workflow (`.github/workflows/community-notes.yml`) runs daily at 06:30 UTC; you can
    also trigger it manually from the Actions tab.
 
 Until this job runs, everything works — posts just won't carry Community-Notes flags yet.
 
-## Deploy on Render (password-protected)
+## Deploying (any host)
 
-The app ships with a site-wide password wall (`src/proxy.ts`): every visitor gets a
-password prompt before anything — even the landing page — is served. The X-OAuth
-allowlist still protects the actual data behind it.
+Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environment variables:
+`npm ci && npm run build`, then `npm start`. Render is what the author uses (below); Vercel works
+too (the next section). Neither is required.
+
+The app ships with an optional site-wide password wall (`src/proxy.ts`). Set `GATE_PASSWORD` and
+every visitor gets a password prompt before anything — even the landing page — is served; leave it
+unset and there is no wall, locally or deployed. The real access control is X sign-in plus
+`ALLOWED_X_USER_IDS`: **set that on any deployed instance**, or anyone who completes X sign-in can
+use it and your API keys. Your X user ID is shown next to **Log out** once you sign in.
+
+### Deploy on Render
 
 Run `npm run setup -- --check` locally first. On Render the migrations are already applied to your
 Supabase project (step 5), so nothing runs there.
@@ -171,7 +217,8 @@ Supabase project (step 5), so nothing runs there.
    weekly Friday sync cron.
 2. Render prompts for the env vars: paste every value from `.env.local` (except
    `SUPABASE_ACCESS_TOKEN`, which only `npm run setup` uses), plus
-   - `GATE_PASSWORD` — the site password (share it with whoever should get in)
+   - `GATE_PASSWORD` — optional and not in the blueprint. If you want a site-wide password wall,
+     add it later in the service's **Environment** tab and share it with whoever should get in
    - `CRON_SECRET` — any long random string (protects `/api/cron/sync`)
    - `APP_URL` — the public URL, e.g. `https://your-app.onrender.com`
    - `VOICE_PROVIDER` — `grok` or `elevenlabs` (step 4). Set it explicitly on Render: left unset,
@@ -182,17 +229,28 @@ Supabase project (step 5), so nothing runs there.
 3. Custom domain (optional): web service → **Settings → Custom Domains** → add your domain
    (e.g. `bookmarks.example.com`), then add the CNAME Render shows you at your DNS provider.
 4. Add `https://your-app.onrender.com/api/auth/callback/x` (or the same path on your custom
-   domain) as a callback URI in your X app (step 2.4 above).
-5. Set `ALLOWED_X_USER_IDS` to your own X user ID so the password isn't the only wall.
+   domain) as a callback URI in your X app (step 2.4 above), alongside the localhost one.
+5. Set `ALLOWED_X_USER_IDS` to your own X user ID (shown next to **Log out** once you sign in), so
+   only you can sign in. Without it, anyone who completes X sign-in can use your instance.
 
-## Optional: deploy + weekly automation (Vercel)
+### Deploy on Vercel
 
 1. Push to GitHub → import the repo at https://vercel.com → add every variable from
    `.env.local` except `SUPABASE_ACCESS_TOKEN` (update `APP_URL` to your production URL) plus a
-   random `CRON_SECRET`.
+   random `CRON_SECRET` and, optionally, `GATE_PASSWORD`.
 2. Add the production callback URL to your X app (step 2.4).
 3. `vercel.json` already schedules a bookmark sync every Friday; generate briefs on demand
    from the UI, then download or listen in the browser.
+
+### Fully local, with no Supabase account
+
+Supabase runs on your own machine with Docker. Install the
+[Supabase CLI](https://supabase.com/docs/guides/local-development), then in this repo run
+`supabase init` once (the repo ships migrations but no `config.toml`) and `supabase start`. That
+applies the same `supabase/migrations/` and prints a local API URL and keys (`supabase status`
+shows them again). Put the URL in `NEXT_PUBLIC_SUPABASE_URL` and the service-role key in
+`SUPABASE_SERVICE_ROLE_KEY`, then continue from step 2. The X app, the xAI key and the voice
+provider are still cloud services.
 
 ## Multi-user later
 
