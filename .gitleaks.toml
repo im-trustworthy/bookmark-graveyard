@@ -1,0 +1,18 @@
+# gitleaks configuration (https://github.com/gitleaks/gitleaks#configuration)
+# Run locally with `gitleaks git . --redact`; CI runs the same scan.
+title = "Bookmark Graveyard"
+
+[extend]
+useDefault = true
+
+# Fake credentials that the unit tests pass through the code on purpose, and
+# one migration comment that mentions a key name. Nothing here is a real key.
+[[allowlists]]
+description = "Placeholder keys used by the test suite and docs"
+regexTarget = "line"
+regexes = [
+  '''xai-body-key-B0DY''',
+  '''xai-leak-me-SECRET1''',
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJyb2xlIjoic2VydmljZV9yb2xlIn0=\.c2ln==''',
+  '''AES-256-GCM-encrypted with APP_ENCRYPTION_KEY''',
+]
