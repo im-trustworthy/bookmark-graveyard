@@ -14,7 +14,7 @@ export async function POST() {
   if (!userId) return apiError("POST /api/enrich", "no session", "Not logged in", 401);
 
   try {
-    // Cap before touching Grok/Scribe/article fetches — checkUsage throws
+    // Cap before touching Grok/video transcription/article fetches — checkUsage throws
     // UsageLimitError (-> 429) once today's per-user enrich budget is spent. The
     // dashboard's sync loop calls this route once per chunk, so this also bounds
     // how many chunks a single sync can burn through per day.
