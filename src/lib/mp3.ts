@@ -19,7 +19,15 @@ const SAMPLE_RATES: Record<number, number[]> = {
   0: [11025, 12000, 8000], // MPEG-2.5
 };
 
-type Frame = { offset: number; length: number; samples: number; sampleRate: number; isInfo: boolean };
+type Frame = {
+  offset: number;
+  length: number;
+  samples: number;
+  sampleRate: number;
+  bitrate: number;
+  mpeg1: boolean;
+  isInfo: boolean;
+};
 
 /** Byte length of an ID3v2 tag starting at `i`, or 0 if there isn't one. */
 function id3v2Length(buf: Buffer, i: number): number {
@@ -51,7 +59,7 @@ function parseFrame(buf: Buffer, i: number): Frame | null {
   // The Xing/Info tag follows the side info (9–32 bytes); scanning the first 40 covers every layout.
   const head = buf.subarray(i + 4, i + Math.min(length, 44));
   const isInfo = head.includes("Xing") || head.includes("Info");
-  return { offset: i, length, samples, sampleRate, isInfo };
+  return { offset: i, length, samples, sampleRate, bitrate, mpeg1, isInfo };
 }
 
 function* frames(buf: Buffer): Generator<Frame> {
@@ -87,6 +95,21 @@ export function stripMp3Headers(buf: Buffer): Buffer {
     total += f.length;
   }
   return total === buf.length ? buf : Buffer.concat(parts, total);
+}
+
+/**
+ * Throws unless `buf` is MP3 audio in the one format every TTS chunk shares
+ * (MPEG-1 Layer III, 128 kbps, 44.1 kHz), judged by its first frame. Stops a
+ * 200 response that carried an empty, JSON or HTML body, or audio in another
+ * format, from being stitched into an episode. `label` names the source.
+ */
+export function assertStitchableMp3(buf: Buffer, label: string): void {
+  const first: Frame | undefined = frames(buf).next().value;
+  if (first?.mpeg1 && first.bitrate === 128_000 && first.sampleRate === 44_100) return;
+  const found = first
+    ? `first frame is ${first.mpeg1 ? "MPEG-1" : "MPEG-2"} ${first.bitrate / 1000} kbps / ${first.sampleRate} Hz`
+    : "no MP3 audio frames";
+  throw new Error(`${label}: ${found} (${buf.length} bytes); expected 128 kbps, 44.1 kHz MPEG-1 Layer III`);
 }
 
 /** Playback length from the audio frames actually present (tags and Info frames excluded). */

@@ -1,10 +1,83 @@
-import { describe, expect, it } from "vitest";
-import { estimateDurationSeconds } from "../tts";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { estimateDurationSeconds, renderPodcast } from "../tts";
 import type { ScriptLine } from "../brain";
+import type { SynthesizeContext, VoiceProvider } from "../voice";
+import { audioFrame } from "./mp3-fixtures";
+import { clearVoiceEnv } from "./voice-env";
 
 function line(speaker: ScriptLine["speaker"], text: string): ScriptLine {
   return { speaker, line: text };
 }
+
+/** Records each synthesize call (and anything else pushed to `log`); each clip is "[speaker:text]". */
+function stubProvider() {
+  const log: string[] = [];
+  const contexts: (SynthesizeContext | undefined)[] = [];
+  const provider: VoiceProvider = {
+    id: "grok",
+    async synthesize(text, speaker, context) {
+      log.push(`${speaker}:${text}`);
+      contexts.push(context);
+      return Buffer.from(`[${speaker}:${text}]`);
+    },
+    async transcribe() {
+      throw new Error("not used");
+    },
+  };
+  return { provider, log, contexts };
+}
+
+describe("renderPodcast", () => {
+  const script = [line("A", "one"), line("B", "two"), line("A", "three")];
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
+  });
+
+  it("voices each line with its speaker and concatenates the clips in order", async () => {
+    const { provider, log } = stubProvider();
+    const out = await renderPodcast(script, undefined, {}, provider);
+    expect(out.toString()).toBe("[A:one][B:two][A:three]");
+    expect(log).toEqual(["A:one", "B:two", "A:three"]);
+  });
+
+  it("passes neighboring lines as context, using the chunk-edge lines at the boundaries", async () => {
+    const { provider, contexts } = stubProvider();
+    await renderPodcast(script, undefined, { previousLine: "zero", nextLine: "four" }, provider);
+    expect(contexts).toEqual([
+      { previousText: "zero", nextText: "two" },
+      { previousText: "one", nextText: "three" },
+      { previousText: "two", nextText: "four" },
+    ]);
+  });
+
+  it("leaves the outer neighbors undefined when the chunk is the whole script", async () => {
+    const { provider, contexts } = stubProvider();
+    await renderPodcast(script, undefined, undefined, provider);
+    expect(contexts[0]).toStrictEqual({ previousText: undefined, nextText: "two" });
+    expect(contexts[2]).toStrictEqual({ previousText: "two", nextText: undefined });
+  });
+
+  it("reports progress (done, total) after each line", async () => {
+    const { provider, log } = stubProvider();
+    await renderPodcast(script, (done, total) => log.push(`${done}/${total}`), {}, provider);
+    expect(log).toEqual(["A:one", "1/3", "B:two", "2/3", "A:three", "3/3"]);
+  });
+
+  it("defaults to the configured provider", async () => {
+    clearVoiceEnv({ VOICE_PROVIDER: "grok", XAI_API_KEY: "xai-key" });
+    const fetchMock = vi.fn<typeof fetch>(async () => new Response(new Uint8Array(audioFrame(1))));
+    vi.stubGlobal("fetch", fetchMock);
+    expect((await renderPodcast([line("A", "hello")])).equals(audioFrame(1))).toBe(true);
+    expect(fetchMock.mock.calls[0][0]).toBe("https://api.x.ai/v1/tts");
+  });
+
+  it("rejects when no voice provider is configured", async () => {
+    clearVoiceEnv();
+    await expect(renderPodcast([line("A", "hello")])).rejects.toThrow("No voice provider configured");
+  });
+});
 
 describe("estimateDurationSeconds", () => {
   it("returns 0 for no lines", () => {

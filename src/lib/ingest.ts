@@ -4,8 +4,9 @@ import { isIP } from "net";
 import { JSDOM, VirtualConsole } from "jsdom";
 import { Readability } from "@mozilla/readability";
 import { db } from "./supabase";
-import { env } from "./env";
 import { grokJson, grokText, grokSearchText, FAST_MODEL } from "./grok";
+import { getVoiceProviderForUser } from "./voice/user";
+import type { VoiceProvider } from "./voice";
 import type { ReferencedTweet } from "./x";
 
 const ARTICLE_CHAR_CAP = 8000;
@@ -294,7 +295,7 @@ async function verifyArticleMatches(
 }
 
 // ---------------------------------------------------------------------------
-// Media: images via Grok vision, video via ElevenLabs Scribe
+// Media: images via Grok vision, video via the configured voice provider's STT
 // ---------------------------------------------------------------------------
 
 interface XMedia {
@@ -317,32 +318,23 @@ async function describeImage(imageUrl: string, altText?: string): Promise<string
   );
 }
 
-async function transcribeVideo(media: XMedia): Promise<{ url: string; content: string }> {
+async function transcribeVideo(media: XMedia, stt: VoiceProvider | null): Promise<{ url: string; content: string }> {
   const variants = (media.variants ?? [])
     .filter((v) => v.content_type === "video/mp4" && v.url && v.bit_rate != null)
     .sort((a, b) => (a.bit_rate ?? 0) - (b.bit_rate ?? 0));
   const variant = variants[0];
   if (!variant?.url) throw new Error("No mp4 variant");
   if ((media.duration_ms ?? 0) > MAX_VIDEO_MINUTES * 60_000) throw new Error("Video too long");
+  // Checked before the download: with no usable provider the caller falls back
+  // to the thumbnail without fetching the video for nothing.
+  if (!stt) throw new Error("No voice provider for transcription");
 
   const videoRes = await fetch(variant.url, { signal: AbortSignal.timeout(60_000) });
   if (!videoRes.ok) throw new Error(`Video fetch ${videoRes.status}`);
   const bytes = await videoRes.arrayBuffer();
   if (bytes.byteLength > MAX_VIDEO_BYTES) throw new Error("Video too large");
 
-  const form = new FormData();
-  form.append("model_id", "scribe_v1");
-  form.append("file", new Blob([bytes], { type: "video/mp4" }), "video.mp4");
-  const res = await fetch("https://api.elevenlabs.io/v1/speech-to-text", {
-    method: "POST",
-    headers: { "xi-api-key": env("ELEVENLABS_API_KEY") },
-    body: form,
-    signal: AbortSignal.timeout(240_000),
-  });
-  if (!res.ok) throw new Error(`Scribe failed (${res.status}): ${await res.text()}`);
-  const body = (await res.json()) as { text?: string };
-  const text = (body.text ?? "").trim();
-  if (!text) throw new Error("Empty transcript");
+  const text = await stt.transcribe(bytes, "video/mp4", "video.mp4");
   return { url: variant.url, content: text.slice(0, TRANSCRIPT_CHAR_CAP) };
 }
 
@@ -350,15 +342,18 @@ async function transcribeVideo(media: XMedia): Promise<{ url: string; content: s
 // Orchestration
 // ---------------------------------------------------------------------------
 
-async function ingestOne(bookmark: {
-  user_id: string;
-  tweet_id: string;
-  author_handle: string | null;
-  text: string;
-  entities: unknown;
-  media: XMedia[] | null;
-  referenced: ReferencedTweet[] | null;
-}): Promise<SourceRow[]> {
+async function ingestOne(
+  bookmark: {
+    user_id: string;
+    tweet_id: string;
+    author_handle: string | null;
+    text: string;
+    entities: unknown;
+    media: XMedia[] | null;
+    referenced: ReferencedTweet[] | null;
+  },
+  stt: VoiceProvider | null
+): Promise<SourceRow[]> {
   const rows: SourceRow[] = [];
   const base = { user_id: bookmark.user_id, tweet_id: bookmark.tweet_id };
 
@@ -408,7 +403,7 @@ async function ingestOne(bookmark: {
     } else if (media.type === "video" || media.type === "animated_gif") {
       const fallbackUrl = media.preview_image_url ?? `video:${bookmark.tweet_id}`;
       try {
-        const { url, content } = await transcribeVideo(media);
+        const { url, content } = await transcribeVideo(media, stt);
         rows.push({ ...base, kind: "video", url, title: "transcript", content, status: "ok" });
       } catch (err) {
         console.error("Video transcription skipped:", err);
@@ -450,13 +445,20 @@ export async function ingestPending(
   const todo = all.slice(0, limit);
   if (todo.length === 0) return { ingested: 0, remaining: 0 };
 
+  // One provider for the whole batch (one settings read and key decrypt). A
+  // missing or broken voice config isn't fatal: videos fall back to thumbnails.
+  const stt = await getVoiceProviderForUser(userId).catch((err: unknown) => {
+    console.error("Video transcription unavailable:", err);
+    return null;
+  });
+
   let done = 0;
   const queue = [...todo];
   await Promise.all(
     Array.from({ length: Math.min(3, queue.length) }, async () => {
       for (let b = queue.shift(); b; b = queue.shift()) {
         try {
-          const rows = await ingestOne(b);
+          const rows = await ingestOne(b, stt);
           if (rows.length > 0) {
             const { error } = await db().from("bookmark_sources").upsert(rows);
             if (error) throw new Error(error.message);
