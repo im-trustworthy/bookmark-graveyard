@@ -79,6 +79,14 @@ This is a personal tool (see [Project status](#project-status)), but it's writte
   actual percentage bar) instead of an indefinite spinner.
 - Episodes stuck mid-generation (`status: "draft"`) never show up in episode history — only fully
   rendered (`"ready"`) ones do.
+- Capacity awareness — the dashboard shows storage and database use ("Storage 4% · Database 3%")
+  and warns at 80%. By default it also removes the oldest briefs' audio once storage passes 90%, so
+  an upload never fails; the markdown of a pruned brief stays, and each person's newest four briefs
+  are never touched. The warning's "Free up space" button previews and runs that cleanup for your
+  own briefs on demand. Four optional env vars tune it: `STORAGE_LIMIT_BYTES` (default 1 GiB),
+  `DATABASE_LIMIT_BYTES` (default 500 MiB; warn-only, since bookmarks are your data),
+  `AUTO_PRUNE_AUDIO` (`false` only warns, and audio uploads are then refused when storage is full)
+  and `KEEP_RECENT_AUDIO` (default 4).
 
 ### Multi-user & security
 - `ALLOWED_X_USER_IDS` gates login: empty means personal mode (whoever completes X OAuth is
@@ -194,6 +202,8 @@ regular HTTP request instead of needing a background job queue.
 
 - **X reads** — pay-per-use, bookmark reads are billed at $0.001/post. A first sync (~800 posts)
   costs under a dollar; weekly incremental syncs are pennies.
+- **Supabase storage** — a 15-minute brief's MP3 is ~13.5 MB, so the free tier's 1 GiB holds
+  roughly 70 briefs before pruning starts (see [Reliability & UX](#reliability--ux)).
 - **Grok** — the two-tier model blend exists specifically for token efficiency. The FAST model
   (`grok-4.3`, override with `XAI_MODEL_FAST`) does all the high-volume,
   low-reasoning work: image descriptions, per-post categorization, article-match verification,
