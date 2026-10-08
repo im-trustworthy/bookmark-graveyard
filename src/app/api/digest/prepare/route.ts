@@ -141,7 +141,7 @@ export async function POST(req: NextRequest) {
 
     const dropped = included.filter((b) => verdicts.get(b.tweet_id) === "stale").length;
     const markdownOnly = format === "markdown";
-    const title = `Bookmark Brief — ${new Date().toLocaleDateString("en-US", {
+    const title = `Bookmark Graveyard — ${new Date().toLocaleDateString("en-US", {
       month: "long",
       day: "numeric",
       year: "numeric",

@@ -43,3 +43,25 @@ export function formatRange(from: string, to: string): string {
     });
   return `${day(from)} to ${day(to)}`;
 }
+
+/** Rotating dashboard greetings; the server picks one per page load. */
+export const GREETINGS = [
+  "Welcome back",
+  "Hello",
+  "Welcome",
+  "Glad you're here",
+  "Time to revive",
+  "Boo",
+  "Back from the dead",
+  "The graveyard stirs",
+] as const;
+
+/**
+ * One greeting at random. Lives here (not in the page component) so the React
+ * purity rule doesn't see Math.random() during render: the server component
+ * calls it once per request, and the client never re-runs it.
+ */
+export function pickGreeting(random: () => number = Math.random): string {
+  const index = Math.min(GREETINGS.length - 1, Math.max(0, Math.floor(random() * GREETINGS.length)));
+  return GREETINGS[index];
+}

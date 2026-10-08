@@ -110,7 +110,7 @@ one-line hint per mode.
 
 ## Local, no-cloud storage (SQLite + disk) — BACKLOG (2026-10-07)
 
-**What we want:** a way to run Bookmark Brief with no cloud account behind it:
+**What we want:** a way to run Bookmark Graveyard with no cloud account behind it:
 the database in SQLite and the episode files on local disk, so nothing leaves
 the machine except the calls to X, xAI and the voice provider.
 

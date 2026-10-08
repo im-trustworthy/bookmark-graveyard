@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * One-command setup for a self-hosted Bookmark Brief: `npm run setup`.
+ * One-command setup for a self-hosted Bookmark Graveyard: `npm run setup`.
  *
  *   1. Loads .env.local, creating it from .env.example on the first run.
  *   2. Checks the variables the app needs, and generates APP_ENCRYPTION_KEY and
@@ -370,7 +370,7 @@ export function applySqlFor(migration) {
  */
 export function freshSetupSql(all) {
   return [
-    "-- Bookmark Brief: the complete database for a brand-new Supabase project",
+    "-- Bookmark Graveyard: the complete database for a brand-new Supabase project",
     `-- (${plural(all.length, "migration")} from supabase/migrations, written by \`npm run setup\`).`,
     "-- Run it once in the SQL editor. It is one transaction: all of it applies, or none of it does.",
     "-- For a project that already has some of it, set SUPABASE_ACCESS_TOKEN and run `npm run setup` instead.",
@@ -654,7 +654,7 @@ async function stepDatabase(env, placeholders, { checkOnly, assumeYes }) {
     }
 
     // A private directory, not a fixed name in a shared /tmp that someone else could pre-create.
-    const file = join(mkdtempSync(join(tmpdir(), "bookmark-brief-")), "setup.sql");
+    const file = join(mkdtempSync(join(tmpdir(), "bookmark-graveyard-")), "setup.sql");
     writeFileSync(file, freshSetupSql(migrations));
     say("  – SUPABASE_ACCESS_TOKEN not set, so setup can't see which migrations this project already has.");
     say(`  ✓ wrote the whole schema (${plural(migrations.length, "migration")}, one transaction) to`);
@@ -770,7 +770,7 @@ function stepNext(env, ok) {
   heading("Next steps");
   const steps = [
     ...(ok ? [] : ["Fix the ✗ items above, then run `npm run setup` again."]),
-    "Add the callback URL above to your X app\n     (developer.x.com > your app > User authentication settings > Callback URI).",
+    "Add the callback URL above to your X app\n     (console.x.com > Apps > your app > Settings > Callback URI / Redirect URL).",
     "npm run dev",
     `Open ${env.APP_URL || DEFAULT_APP_URL} and click "Sign in with X".`,
     "Choose the podcast voices in the app (Voices panel). VOICE_PROVIDER, GROK_VOICE_HOST_*\n     and ELEVENLABS_* in .env.local are optional server defaults.",
@@ -794,7 +794,7 @@ async function main() {
   const checkOnly = args.includes("--check");
   const assumeYes = args.includes("--yes");
 
-  say(checkOnly ? "Bookmark Brief setup: check only (writes nothing, leaves the database alone)" : "Bookmark Brief setup");
+  say(checkOnly ? "Bookmark Graveyard setup: check only (writes nothing, leaves the database alone)" : "Bookmark Graveyard setup");
   const { env, placeholders, ok: envOk } = stepEnvironment(checkOnly);
   const db = await stepDatabase(env, placeholders, { checkOnly, assumeYes });
   const verified = await stepVerify(env, placeholders, db.applied > 0);

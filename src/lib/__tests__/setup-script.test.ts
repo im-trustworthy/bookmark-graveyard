@@ -143,7 +143,7 @@ describe("parseEnvFile", () => {
 
 describe("placeholder detection", () => {
   const example = [
-    "# Bookmark Brief — environment variables",
+    "# Bookmark Graveyard — environment variables",
     "NEXT_PUBLIC_SUPABASE_URL=https://your-project-ref.supabase.co",
     "XAI_API_KEY=your-xai-api-key",
     "# ELEVENLABS_API_KEY=your-elevenlabs-api-key",
