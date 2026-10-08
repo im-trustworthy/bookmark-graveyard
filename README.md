@@ -209,11 +209,11 @@ too. Neither is required.
 `render.yaml` is a Render Blueprint. It creates the web service and the weekly sync job, then asks
 you for each environment variable.
 
-[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fim-trustworthy%2Fbookmark-graveyard&project-name=bookmark-graveyard&repository-name=bookmark-graveyard&env=NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,X_CLIENT_ID,X_CLIENT_SECRET,XAI_API_KEY,APP_ENCRYPTION_KEY,SESSION_SECRET,APP_URL,GATE_PASSWORD,CRON_SECRET&envDescription=Values%20from%20your%20.env.local%20(see%20SETUP.md))
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2Fim-trustworthy%2Fbookmark-graveyard&project-name=bookmark-graveyard&repository-name=bookmark-graveyard&env=NEXT_PUBLIC_SUPABASE_URL,SUPABASE_SERVICE_ROLE_KEY,X_CLIENT_ID,X_CLIENT_SECRET,XAI_API_KEY,APP_ENCRYPTION_KEY,SESSION_SECRET,APP_URL&envDescription=Values%20from%20your%20.env.local%20(see%20SETUP.md))
 
-`vercel.json` adds the weekly sync cron. The button asks for ten values. Eight come straight from
-your `.env.local`; the last two, `GATE_PASSWORD` and `CRON_SECRET`, are new for a deployed instance
-and are explained below.
+`vercel.json` adds the weekly sync cron. The button asks for eight values, all straight from your
+`.env.local`. The two optional ones for a deployed instance, `GATE_PASSWORD` and `CRON_SECRET`, are
+explained below; add them under the project's environment variables if you want them.
 
 After you deploy:
 
@@ -221,11 +221,14 @@ After you deploy:
    Settings and use "Add another" under Callback URI. The URL is
    `https://your-domain/api/auth/callback/x`.
 2. **Set `APP_URL`** to your public address, with no trailing slash.
-3. **Set `GATE_PASSWORD`.** The app puts one site-wide password wall in front of every page,
-   including the landing page. A deployed instance refuses to serve without it and answers 503.
-4. **Set `ALLOWED_X_USER_IDS`** to a comma-separated list of X user IDs. Only those accounts can
-   sign in. Left empty, anyone who completes X sign-in is allowed.
-5. **Set `CRON_SECRET`** if you want the weekly sync.
+3. **Set `ALLOWED_X_USER_IDS`** to a comma-separated list of X user IDs. This is the one that
+   matters: only those accounts can sign in. Without it, anyone who completes X sign-in can use
+   your instance and your API keys. Your own X user ID is shown next to **Log out** after you sign
+   in.
+4. **Set `CRON_SECRET`** if you want the weekly sync.
+5. **Optionally set `GATE_PASSWORD`.** It puts a single shared password in front of every page,
+   including the landing page, for people who want the instance unlisted. Leave it unset for no
+   wall.
 
 **Fully local.** You can run the database on your own computer too. Install
 [Docker](https://www.docker.com) and the
@@ -301,9 +304,6 @@ copied the Client ID and Secret from **OAuth 2.0 Keys**.
 `ALLOWED_X_USER_IDS`. Add it. Leaving the variable empty lets anyone who signs in through, which
 only makes sense on your own computer.
 
-**Every page says "GATE_PASSWORD not configured."** A deployed instance needs `GATE_PASSWORD`. Set
-it in your host's environment variables and redeploy.
-
 **Pages fail to load or the database cannot be reached.** Free Supabase projects pause after about
 a week without activity. Open the project in the [Supabase dashboard](https://supabase.com/dashboard)
 and restore it. A deployed instance with the weekly sync running keeps itself awake.
@@ -345,4 +345,4 @@ Four optional environment variables tune it:
 
 ## License
 
-[MIT](LICENSE). Copyright (c) 2026 im-trustworthy.
+[MIT](LICENSE). Copyright (c) 2026 TW Labs LLC.

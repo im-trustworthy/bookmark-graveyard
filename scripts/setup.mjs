@@ -65,6 +65,7 @@ const OPTIONAL = [
   "ELEVENLABS_VOICE_HOST_B",
   "APP_URL",
   "ALLOWED_X_USER_IDS",
+  "GATE_PASSWORD",
   "CRON_SECRET",
 ];
 
@@ -73,6 +74,7 @@ const SECRET_NAMES = [
   ...REQUIRED.filter((name) => name !== "NEXT_PUBLIC_SUPABASE_URL"),
   ...GENERATED_SECRETS,
   "ELEVENLABS_API_KEY",
+  "GATE_PASSWORD",
   "CRON_SECRET",
   "SUPABASE_ACCESS_TOKEN",
 ];
@@ -213,11 +215,11 @@ export function checkRequired(env, placeholders) {
 export function optionalStatus(env, placeholders) {
   const isPlaceholder = (name) => Boolean(env[name]) && env[name] === placeholders[name];
   /** @returns {[string, string, string]} */
-  const hidden = (name, unsetNote = "not set") =>
+  const hidden = (name, unsetNote = "not set", setNote = "set") =>
     isPlaceholder(name)
       ? ["✗", name, "still the .env.example placeholder (warning)"]
       : env[name]
-        ? ["✓", name, "set"]
+        ? ["✓", name, setNote]
         : ["–", name, unsetNote];
   /** @returns {[string, string, string]} */
   const shown = (name, unsetNote) => (env[name] ? ["✓", name, String(env[name])] : ["–", name, unsetNote]);
@@ -242,7 +244,12 @@ export function optionalStatus(env, placeholders) {
     appUrlStatus(env.APP_URL),
     allowed.length
       ? ["✓", "ALLOWED_X_USER_IDS", plural(allowed.length, "X user ID")]
-      : ["–", "ALLOWED_X_USER_IDS", "empty: personal mode (whoever signs in with X is allowed)"],
+      : [
+          "–",
+          "ALLOWED_X_USER_IDS",
+          "empty: anyone who signs in with X can use this instance and its API keys; fine on your own computer, set it before deploying",
+        ],
+    hidden("GATE_PASSWORD", "not set: no site password wall (optional)", "set: site password wall on"),
     hidden("CRON_SECRET", "not set: /api/cron/sync stays disabled"),
   ];
 }

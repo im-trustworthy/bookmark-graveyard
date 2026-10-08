@@ -201,10 +201,11 @@ Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environm
 `npm ci && npm run build`, then `npm start`. Render is what the author uses (below); Vercel works
 too (the next section). Neither is required.
 
-The app ships with a site-wide password wall (`src/proxy.ts`): every visitor gets a password prompt
-before anything — even the landing page — is served. The X-OAuth allowlist still protects the actual
-data behind it. **On any deployed instance (`NODE_ENV=production`), `GATE_PASSWORD` is required:**
-without it every page answers 503 "GATE_PASSWORD not configured". Local `npm run dev` skips the wall.
+The app ships with an optional site-wide password wall (`src/proxy.ts`). Set `GATE_PASSWORD` and
+every visitor gets a password prompt before anything — even the landing page — is served; leave it
+unset and there is no wall, locally or deployed. The real access control is X sign-in plus
+`ALLOWED_X_USER_IDS`: **set that on any deployed instance**, or anyone who completes X sign-in can
+use it and your API keys. Your X user ID is shown next to **Log out** once you sign in.
 
 ### Deploy on Render
 
@@ -216,7 +217,8 @@ Supabase project (step 5), so nothing runs there.
    weekly Friday sync cron.
 2. Render prompts for the env vars: paste every value from `.env.local` (except
    `SUPABASE_ACCESS_TOKEN`, which only `npm run setup` uses), plus
-   - `GATE_PASSWORD` — the site password (required; share it with whoever should get in)
+   - `GATE_PASSWORD` — optional and not in the blueprint. If you want a site-wide password wall,
+     add it later in the service's **Environment** tab and share it with whoever should get in
    - `CRON_SECRET` — any long random string (protects `/api/cron/sync`)
    - `APP_URL` — the public URL, e.g. `https://your-app.onrender.com`
    - `VOICE_PROVIDER` — `grok` or `elevenlabs` (step 4). Set it explicitly on Render: left unset,
@@ -228,13 +230,14 @@ Supabase project (step 5), so nothing runs there.
    (e.g. `bookmarks.example.com`), then add the CNAME Render shows you at your DNS provider.
 4. Add `https://your-app.onrender.com/api/auth/callback/x` (or the same path on your custom
    domain) as a callback URI in your X app (step 2.4 above), alongside the localhost one.
-5. Set `ALLOWED_X_USER_IDS` to your own X user ID so the password isn't the only wall.
+5. Set `ALLOWED_X_USER_IDS` to your own X user ID (shown next to **Log out** once you sign in), so
+   only you can sign in. Without it, anyone who completes X sign-in can use your instance.
 
 ### Deploy on Vercel
 
 1. Push to GitHub → import the repo at https://vercel.com → add every variable from
-   `.env.local` except `SUPABASE_ACCESS_TOKEN` (update `APP_URL` to your production URL) plus
-   `GATE_PASSWORD` and a random `CRON_SECRET`.
+   `.env.local` except `SUPABASE_ACCESS_TOKEN` (update `APP_URL` to your production URL) plus a
+   random `CRON_SECRET` and, optionally, `GATE_PASSWORD`.
 2. Add the production callback URL to your X app (step 2.4).
 3. `vercel.json` already schedules a bookmark sync every Friday; generate briefs on demand
    from the UI, then download or listen in the browser.

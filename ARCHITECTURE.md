@@ -67,7 +67,7 @@ Repository map:
 | --- | --- |
 | `src/app/` | Pages, the dashboard (`dashboard.tsx`), the Voices panel (`voice-settings.tsx`), API routes under `api/` |
 | `src/lib/` | All the logic: `x.ts` (X API), `sync.ts`, `ingest.ts`, `brain.ts` (Grok prompts), `grok.ts`, `tts.ts`, `voice/` (providers), `capacity.ts`, `limits.ts`, `crypto.ts`, `session.ts` |
-| `src/proxy.ts` | The site-wide password gate |
+| `src/proxy.ts` | The optional site-wide password gate |
 | `supabase/migrations/` | The database schema, the source of truth |
 | `scripts/` | `setup.mjs` (`npm run setup`), `community-notes-sync.mjs`, plus two maintenance scripts |
 | `.github/workflows/` | The daily Community Notes job |
@@ -314,10 +314,11 @@ a larger instance's audio.
   completes X OAuth is allowed). Set it to a comma-separated list of X user IDs to lock the instance
   down. A user who signs in but is not on the list is stored with `is_allowed = false` and turned
   away.
-- **Site password gate.** `src/proxy.ts` puts every route, including the landing page, behind a
-  password when `GATE_PASSWORD` is set. In production it fails closed: with no `GATE_PASSWORD` the
-  app answers 503 instead of serving. Local `npm run dev` skips the gate. The cron path, the gate
-  page itself and the favicon stay reachable.
+- **Site password gate (optional).** `src/proxy.ts` puts every route, including the landing page,
+  behind a shared password when `GATE_PASSWORD` is set. Unset, there is no gate, in development and
+  production alike: the login allowlist above is the access control that matters, and the gate is an
+  extra layer for keeping an instance unlisted. The cron path, the gate page itself and the favicon
+  stay reachable.
 - **Session.** The cookie is HMAC-signed (`SESSION_SECRET`), httpOnly, `SameSite=Lax` and
   secure-flagged in production, with a 30-day lifetime. Signatures are checked in constant time.
 - **Database access.** Supabase is only ever touched server-side with the service-role key. Row-level
