@@ -1,10 +1,12 @@
 // In-memory stand-in for the supabase-js client, covering only the calls this
-// app makes: from(table) with select/insert/upsert/update/delete, eq/is/lt
-// filters, order/limit (ignored), then maybeSingle()/single() or a plain
-// await; plus storage uploads. Like PostgREST, select("a, b") returns only
-// those columns (select() or "*" returns all), so a column missing from a
-// query's select list reads as undefined in tests too. Tests read and seed
-// `tables` directly.
+// app makes: from(table) with select/insert/upsert/update/delete, eq/is/lt and
+// not(column, "is", value) filters, order/limit (ignored), then
+// maybeSingle()/single() or a plain await; rpc() into Postgres functions the
+// test registers in `functions` (an unregistered one errors, as a missing
+// function does); plus storage uploads and removals. Like PostgREST,
+// select("a, b") returns only those columns (select() or "*" returns all), so
+// a column missing from a query's select list reads as undefined in tests too.
+// Tests read and seed `tables` directly.
 
 type Row = Record<string, unknown>;
 type Result = { data: unknown; error: { message: string } | null };
@@ -12,20 +14,41 @@ type Result = { data: unknown; error: { message: string } | null };
 export interface FakeDb {
   tables: Record<string, Row[]>;
   uploads: { bucket: string; path: string }[];
+  /** One entry per storage remove() call. */
+  removals: { bucket: string; paths: string[] }[];
+  /** What rpc(name, args) returns as data, by function name. */
+  functions: Record<string, (args: Record<string, unknown>) => unknown>;
   from(table: string): FakeQuery;
-  storage: { from(bucket: string): { upload(path: string): Promise<{ error: null }> } };
+  rpc(fn: string, args?: Record<string, unknown>): Promise<Result>;
+  storage: {
+    from(bucket: string): {
+      upload(path: string): Promise<{ error: null }>;
+      remove(paths: string[]): Promise<Result>;
+    };
+  };
 }
 
 export function createFakeDb(tables: Record<string, Row[]> = {}): FakeDb {
   const db: FakeDb = {
     tables,
     uploads: [],
+    removals: [],
+    functions: {},
     from: (table) => new FakeQuery(db, table),
+    rpc: async (fn, args = {}) => {
+      const body = db.functions[fn];
+      if (!body) return { data: null, error: { message: `Could not find the function public.${fn}` } };
+      return { data: body(args), error: null };
+    },
     storage: {
       from: (bucket) => ({
         upload: async (path) => {
           db.uploads.push({ bucket, path });
           return { error: null };
+        },
+        remove: async (paths) => {
+          db.removals.push({ bucket, paths });
+          return { data: paths.map((name) => ({ name })), error: null };
         },
       }),
     },
@@ -83,6 +106,10 @@ class FakeQuery implements PromiseLike<Result> {
   }
   lt(column: string, value: number) {
     this.filters.push((row) => (row[column] as number) < value);
+    return this;
+  }
+  not(column: string, operator: "is", value: unknown) {
+    this.filters.push((row) => (row[column] ?? null) !== value);
     return this;
   }
   order() {

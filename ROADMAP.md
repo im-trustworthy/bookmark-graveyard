@@ -105,3 +105,37 @@ so stop at the first page with nothing new; a daily check then costs one page).
 (switch the filtered column; topic counts follow the same window), a toggle
 beside the pickers in `src/app/dashboard.tsx`, default to "saved", and a
 one-line hint per mode.
+
+---
+
+## Local, no-cloud storage (SQLite + disk) — BACKLOG (2026-10-07)
+
+**What we want:** a way to run Bookmark Brief with no cloud account behind it:
+the database in SQLite and the episode files on local disk, so nothing leaves
+the machine except the calls to X, xAI and the voice provider.
+
+**Why not now:** V1 is Supabase-only on purpose. The app talks to Supabase's
+query builder from about 20 files, keeps episode files in Supabase Storage and
+serves them through signed URLs, and enforces its spend caps in a Postgres
+function (`record_usage`). Supporting SQLite would take:
+
+- a store interface with two implementations (Supabase and SQLite) behind every
+  one of those call sites;
+- a local file store with authenticated serving, since a disk has no signed
+  URLs;
+- a port of the schema in `supabase/migrations/`, including the spend-cap
+  function;
+- a different deployment model: an always-on server with a persistent disk.
+  That rules out Vercel and free Render, and the GitHub Actions Community Notes
+  job could not reach a database on a laptop.
+
+**Unblock / how to do it:** revisit when self-hosters repeatedly ask for a
+no-cloud option. **Interim, with no new code:** Supabase runs locally with
+Docker, so a fully local install already exists. Run `supabase init` once (the
+repo ships migrations but no `config.toml`), then `supabase start`, which
+applies the same `supabase/migrations/`, and point `NEXT_PUBLIC_SUPABASE_URL`
+and `SUPABASE_SERVICE_ROLE_KEY` at the local stack (`supabase status` prints
+the URL and keys).
+
+**Note:** database-size pruning is warn-only by design (bookmarks are user
+data); audio pruning is automatic.
