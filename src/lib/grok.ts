@@ -5,8 +5,23 @@ import { env } from "./env";
 // Two-tier model strategy for token efficiency:
 //  FAST  — high-volume per-post work (categorize, describe images, staleness)
 //  SMART — synthesis where reasoning quality shows (outline, digest, script)
-export const FAST_MODEL = process.env.XAI_MODEL_FAST ?? "grok-4.20-0309-non-reasoning";
-export const SMART_MODEL = process.env.XAI_MODEL_SMART ?? "grok-4.5";
+//
+// Picked 2026-10-05 from the account's catalog (GET /v1/language-models):
+//  grok-4.3  $1.25/M in, $2.50/M out — same price as the old 4.20 non-reasoning
+//            model, newer, 1M context. Reasoning "none" keeps per-post calls cheap.
+//  grok-4.7  $2.00/M in, $6.00/M out — same price as grok-4.5, current flagship.
+//            Reasoning tokens bill as output, so effort defaults to "medium".
+export const FAST_MODEL = process.env.XAI_MODEL_FAST ?? "grok-4.3";
+export const SMART_MODEL = process.env.XAI_MODEL_SMART ?? "grok-4.7";
+// Reasoning effort per tier (none | low | medium | high | xhigh). Set the env var
+// to an empty string to omit the parameter, e.g. for a model that rejects it.
+export const FAST_REASONING = process.env.XAI_REASONING_FAST ?? "none";
+export const SMART_REASONING = process.env.XAI_REASONING_SMART ?? "medium";
+
+function reasoningFor(model: string): Record<string, string> {
+  const effort = model === SMART_MODEL ? SMART_REASONING : model === FAST_MODEL ? FAST_REASONING : "";
+  return effort ? { reasoning_effort: effort } : {};
+}
 
 let client: OpenAI | null = null;
 function grok(): OpenAI {
@@ -32,6 +47,7 @@ export async function grokText(
       { role: "user", content: user as any },
     ],
     temperature: options.temperature ?? 0.4,
+    ...reasoningFor(model),
     ...(options.extraBody ?? {}),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any);
@@ -51,6 +67,7 @@ export async function grokSearchText(system: string, user: string): Promise<stri
       { role: "user", content: user },
     ],
     tools: [{ type: "x_search" }, { type: "web_search" }],
+    ...(SMART_REASONING ? { reasoning: { effort: SMART_REASONING } } : {}),
   });
   if (typeof res.output_text === "string" && res.output_text) return res.output_text;
   const texts: string[] = [];
@@ -77,6 +94,7 @@ export async function grokJson<T>(
     ],
     response_format: { type: "json_object" },
     temperature: 0.2,
+    ...reasoningFor(model),
     ...(extraBody ?? {}),
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any);

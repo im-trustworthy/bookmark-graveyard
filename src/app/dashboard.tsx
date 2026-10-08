@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { describeSync, formatRange } from "@/lib/dashboard-text";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import VoiceSettings from "./voice-settings";
@@ -65,6 +66,8 @@ function analysisOf(b: Bookmark): Analysis | null {
   return Array.isArray(b.bookmark_analysis) ? (b.bookmark_analysis[0] ?? null) : b.bookmark_analysis;
 }
 
+type TopicCount = { name: string; count: number };
+
 function isoDaysAgo(days: number): string {
   const d = new Date();
   d.setDate(d.getDate() - days);
@@ -83,12 +86,14 @@ export default function Dashboard({
   const [to, setTo] = useState(isoDaysAgo(0));
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [allTopics, setAllTopics] = useState<string[]>([]);
+  const [topicCounts, setTopicCounts] = useState<TopicCount[]>([]);
   const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
   const [totalBookmarks, setTotalBookmarks] = useState<number | null>(null);
+  const [libraryCount, setLibraryCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [syncing, setSyncing] = useState(false);
   const [syncStage, setSyncStage] = useState<string | null>(null);
+  const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null);
   const [syncMessage, setSyncMessage] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [createStage, setCreateStage] = useState<string | null>(null);
@@ -139,9 +144,10 @@ export default function Dashboard({
     if (res.ok) {
       const body = await res.json();
       setBookmarks(body.bookmarks ?? []);
-      setAllTopics(body.allTopics ?? []);
+      setTopicCounts(body.topics ?? []);
       total = body.total ?? 0;
       setTotalBookmarks(total);
+      setLibraryCount(body.library ?? total);
     }
     setLoading(false);
     return total;
@@ -195,6 +201,7 @@ export default function Dashboard({
     try {
       // Fast: fetch from X + store. Bookmarks appear immediately.
       setSyncStage("Pulling bookmarks from X…");
+      setSyncProgress(null);
       const res = await fetch("/api/sync", { method: "POST" });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Sync failed");
@@ -204,9 +211,8 @@ export default function Dashboard({
       let pending: number = body.pendingAnalysis ?? 0;
       const toAnalyze = pending;
       while (pending > 0) {
-        setSyncStage(
-          `Reading linked articles & media, analyzing topics… ${toAnalyze - pending} of ${toAnalyze} done`
-        );
+        setSyncStage("Reading linked articles & media, tagging topics…");
+        setSyncProgress({ done: toAnalyze - pending, total: toAnalyze });
         const enrichRes = await fetch("/api/enrich", { method: "POST" });
         const enrichBody = await enrichRes.json();
         if (!enrichRes.ok) throw new Error(enrichBody.error ?? "Analysis failed");
@@ -216,16 +222,15 @@ export default function Dashboard({
         pending = enrichBody.remaining;
         await loadBookmarks();
       }
-      setSyncMessage(
-        `Synced ${body.fetched} bookmarks (${body.new} new${toAnalyze ? `, ${toAnalyze} analyzed with sources` : ""}).`
-      );
+      setSyncMessage(describeSync(body, from, to, toAnalyze));
     } catch (err) {
       setErrorMessage(err instanceof Error ? err.message : "Sync failed");
     } finally {
       setSyncing(false);
       setSyncStage(null);
+      setSyncProgress(null);
     }
-  }, [loadBookmarks]);
+  }, [loadBookmarks, from, to]);
 
   // First visit: pull bookmarks automatically instead of waiting for a click.
   useEffect(() => {
@@ -387,6 +392,15 @@ export default function Dashboard({
       prev.includes(topic) ? prev.filter((t) => t !== topic) : [...prev, topic]
     );
 
+  // Chips come strictly from the posts loaded for the current date range. A
+  // selected topic that drops to zero (e.g. after narrowing the dates) stays
+  // visible at 0 so it can still be unselected.
+  const chips = useMemo<TopicCount[]>(() => {
+    const present = new Set(topicCounts.map((t) => t.name));
+    const stale = selectedTopics.filter((t) => !present.has(t)).map((name) => ({ name, count: 0 }));
+    return [...topicCounts, ...stale];
+  }, [topicCounts, selectedTopics]);
+
   const toggleSelected = (tweetId: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -479,10 +493,10 @@ export default function Dashboard({
             <button
               onClick={sync}
               disabled={syncing}
-              aria-label={syncing ? "Syncing bookmarks" : "Sync bookmarks"}
+              aria-label={syncing ? "Checking X for new bookmarks" : "Check X for new bookmarks"}
               className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
             >
-              {syncing ? "Syncing…" : "Re-sync"}
+              {syncing ? "Checking X…" : "Check X for new"}
             </button>
             <form action="/api/auth/logout" method="post">
               <button
@@ -496,11 +510,39 @@ export default function Dashboard({
         </header>
 
         <div className="space-y-2">
-          {syncStage && (
-            <p className="flex items-center gap-2 text-sm text-sky-400">
-              <span className="inline-block h-3 w-3 rounded-full border-2 border-sky-400 border-t-transparent animate-spin" />
-              {syncStage}
-            </p>
+          {syncing && (
+            <section
+              role="status"
+              aria-live="polite"
+              className="space-y-3 rounded-2xl border border-sky-400/30 bg-sky-500/10 p-4 shadow-lg shadow-black/20 backdrop-blur-xl"
+            >
+              <div className="flex items-center justify-between gap-3 text-sm">
+                <span className="flex items-center gap-2 font-medium text-sky-200">
+                  <span className="inline-block h-3 w-3 shrink-0 rounded-full border-2 border-sky-300 border-t-transparent animate-spin" />
+                  {syncStage ?? "Syncing your bookmarks…"}
+                </span>
+                {syncProgress && (
+                  <span className="shrink-0 tabular-nums text-sky-300/80">
+                    {syncProgress.done} of {syncProgress.total} analyzed
+                  </span>
+                )}
+              </div>
+              <div className="h-2 overflow-hidden rounded-full bg-zinc-800/80">
+                {syncProgress && syncProgress.total > 0 ? (
+                  <div
+                    className="h-full rounded-full bg-sky-400 transition-[width] duration-500"
+                    style={{ width: `${Math.round((syncProgress.done / syncProgress.total) * 100)}%` }}
+                  />
+                ) : (
+                  <div className="h-full w-1/3 rounded-full bg-sky-400/80 animate-[slide_1.4s_ease-in-out_infinite]" />
+                )}
+              </div>
+              <p className="text-xs text-sky-200/70">
+                {syncProgress
+                  ? "Your bookmarks are already listed below. Topic tags and filters fill in as each batch finishes."
+                  : "Pulling your latest bookmarks from X."}
+              </p>
+            </section>
           )}
           {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
           {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
@@ -560,47 +602,69 @@ export default function Dashboard({
         {/* Filters */}
         <section className="space-y-4 rounded-2xl border border-white/10 bg-white/[0.06] p-5 shadow-lg shadow-black/20 backdrop-blur-xl">
           <h2 className="font-heading text-2xl tracking-wide text-zinc-100">Filters</h2>
-          <div className="flex flex-wrap items-center gap-3">
-            <label className="text-sm text-zinc-400">
-              From{" "}
-              <input
-                type="date"
-                value={from}
-                onChange={(e) => setFrom(e.target.value)}
-                className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
-              />
-            </label>
-            <label className="text-sm text-zinc-400">
-              To{" "}
-              <input
-                type="date"
-                value={to}
-                onChange={(e) => setTo(e.target.value)}
-                className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
-              />
-            </label>
-            <span className="text-xs text-zinc-600">Filters by the post&apos;s date.</span>
+          <div className="space-y-1.5">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm text-zinc-400">
+                Posted between{" "}
+                <input
+                  type="date"
+                  aria-label="Posted on or after"
+                  value={from}
+                  onChange={(e) => setFrom(e.target.value)}
+                  className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+                />
+              </label>
+              <label className="text-sm text-zinc-400">
+                and{" "}
+                <input
+                  type="date"
+                  aria-label="Posted on or before"
+                  value={to}
+                  onChange={(e) => setTo(e.target.value)}
+                  className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+                />
+              </label>
+            </div>
+            <p className="text-xs text-zinc-500">
+              Filters by when a post was published. X doesn&apos;t share when you saved a bookmark, and
+              checking X always pulls your whole list, so these dates only change what&apos;s shown.
+            </p>
           </div>
-          {allTopics.length > 0 ? (
-            <div className="flex flex-wrap gap-2">
-              {allTopics.map((topic) => (
-                <button
-                  key={topic}
-                  onClick={() => toggleTopic(topic)}
-                  aria-pressed={selectedTopics.includes(topic)}
-                  className={`rounded-full border px-3 py-1 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
-                    selectedTopics.includes(topic)
-                      ? "border-sky-500 bg-sky-500/20 text-sky-300"
-                      : "border-white/15 bg-white/5 text-zinc-300 backdrop-blur-md hover:border-white/30"
-                  }`}
-                >
-                  {topic}
-                </button>
-              ))}
+          {chips.length > 0 ? (
+            <div className="space-y-2">
+              <p className="text-xs text-zinc-500">Topics found in these posts</p>
+              <div className="flex flex-wrap gap-2">
+                {chips.map(({ name, count }) => {
+                  const active = selectedTopics.includes(name);
+                  return (
+                    <button
+                      key={name}
+                      onClick={() => toggleTopic(name)}
+                      aria-pressed={active}
+                      className={`rounded-full border px-3 py-1 text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950 ${
+                        active
+                          ? "border-sky-500 bg-sky-500/20 text-sky-300"
+                          : "border-white/15 bg-white/5 text-zinc-300 backdrop-blur-md hover:border-white/30"
+                      }`}
+                    >
+                      {name}
+                      <span className={`ml-1.5 tabular-nums ${active ? "text-sky-400/80" : "text-zinc-500"}`}>
+                        {count}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           ) : (
             <p className="text-xs text-zinc-600">
-              Topic tags appear here after your first sync &amp; analysis.
+              {syncing
+                ? "Topics fill in here as each batch is analyzed…"
+                : loading
+                  ? "Loading topics…"
+                  : bookmarks.length === 0
+                    ? "No posts in this date range, so no topics to show. Widen the dates to see more."
+                    : "No topics yet for these posts — use Check X for new to analyze them."}
             </p>
           )}
         </section>
@@ -717,19 +781,39 @@ export default function Dashboard({
 
         {/* Bookmark list */}
         <section className="space-y-3">
-          <div className="flex items-baseline justify-between">
-            <h2 className="font-heading text-2xl tracking-wide text-zinc-100">
-              Your bookmarks {loading ? "…" : `(${bookmarks.length})`}
-            </h2>
+          <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+            <h2 className="font-heading text-2xl tracking-wide text-zinc-100">Your bookmarks</h2>
             <span className="text-xs text-zinc-600">
               Click to hand-pick posts · × removes for good
             </span>
           </div>
+          <p className="text-sm text-zinc-400" aria-live="polite">
+            {libraryCount === null
+              ? "Loading…"
+              : `Showing ${bookmarks.length} of ${libraryCount} posted ${formatRange(from, to)}`}
+            {libraryCount !== null && selectedTopics.length > 0 && (
+              <span className="text-zinc-500">
+                {" · filtered to "}
+                {selectedTopics.length === 1 ? selectedTopics[0] : `${selectedTopics.length} topics`}
+              </span>
+            )}
+          </p>
+          {loading && bookmarks.length === 0 && (
+            <ul className="space-y-3" aria-hidden="true">
+              {[0, 1, 2].map((i) => (
+                <li key={i} className="animate-pulse space-y-2 rounded-xl border border-white/10 bg-white/[0.04] p-4">
+                  <div className="h-3 w-1/3 rounded bg-white/10" />
+                  <div className="h-3 w-full rounded bg-white/10" />
+                  <div className="h-3 w-2/3 rounded bg-white/10" />
+                </li>
+              ))}
+            </ul>
+          )}
           {!loading && bookmarks.length === 0 && (
             <p className="text-sm text-zinc-500">
               {syncing
                 ? "Pulling your bookmarks from X — they'll appear here in a few seconds…"
-                : "Nothing in this range — widen the dates or hit Re-sync."}
+                : "Nothing posted in this range — widen the dates, or check X for new bookmarks."}
             </p>
           )}
           <ul className="space-y-3">
@@ -776,6 +860,14 @@ export default function Dashboard({
                   </div>
                   <p className="text-sm text-zinc-300 line-clamp-3">{b.text}</p>
                   <div className="flex flex-wrap gap-1.5">
+                    {!a && (
+                      <span className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-sky-400/40 px-2 py-0.5 text-[11px] text-sky-300/80">
+                        {syncing && (
+                          <span className="inline-block h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
+                        )}
+                        {syncing ? "Analyzing…" : "Not analyzed yet"}
+                      </span>
+                    )}
                     {(a?.topics ?? []).map((t) => (
                       <span
                         key={t}

@@ -2,22 +2,32 @@
 /**
  * Nightly Community Notes sync.
  *
- * X publishes the full Community Notes dataset as public TSV downloads
+ * X publishes the full Community Notes dataset as public downloads
  * (https://communitynotes.x.com/guide/en/under-the-hood/download-data).
- * There is no API to read the note on an arbitrary post, so we stream the
- * daily files and keep only rows whose tweetId matches one of our bookmarks.
+ * Each daily chunk is a zip archive holding a single TSV. There is no API to
+ * read the note on an arbitrary post, so we stream the daily files and keep
+ * only rows whose tweetId matches one of our bookmarks.
  *
  * Runs in GitHub Actions (see .github/workflows/community-notes.yml) because
- * the files are multi-GB — too large for serverless functions.
+ * the files are multi-GB — too large for serverless functions. Needs the
+ * `unzip` CLI, which ships on ubuntu-latest runners and macOS.
  *
  * Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY
+ *      DRY_RUN=1 — download and match, but skip every write to Supabase.
  */
 
 import { createInterface } from "node:readline";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { spawn } from "node:child_process";
+import { createWriteStream } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const DRY_RUN = process.env.DRY_RUN === "1";
 if (!SUPABASE_URL || !SERVICE_KEY) {
   console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
   process.exit(1);
@@ -46,20 +56,51 @@ async function fetchBookmarkedTweetIds() {
   return ids;
 }
 
+/** kind is "notes" or "noteStatusHistory"; chunks are zipped TSVs. */
 function dataUrl(date, kind, index) {
   const y = date.getUTCFullYear();
   const m = String(date.getUTCMonth() + 1).padStart(2, "0");
   const d = String(date.getUTCDate()).padStart(2, "0");
-  return `https://ton.twimg.com/birdwatch-public-data/${y}/${m}/${d}/${kind}/${kind === "notes" ? "notes" : "noteStatusHistory"}-${String(index).padStart(5, "0")}.tsv`;
+  return `https://ton.twimg.com/birdwatch-public-data/${y}/${m}/${d}/${kind}/${kind}-${String(index).padStart(5, "0")}.zip`;
 }
 
-/** Streams a TSV URL line-by-line, calling onRow(columnsObject). Returns false on 404. */
+/**
+ * Downloads one zipped TSV chunk and calls onRow(columnsObject) per data row.
+ * Returns false when the chunk does not exist (404/403).
+ */
 async function streamTsv(url, onRow) {
   const res = await fetch(url);
   if (res.status === 404 || res.status === 403) return false;
   if (!res.ok) throw new Error(`Fetch failed ${res.status} for ${url}`);
 
-  const rl = createInterface({ input: Readable.fromWeb(res.body), crlfDelay: Infinity });
+  // Node has no built-in zip reader, so spool the archive to disk and stream
+  // the inner TSV out of `unzip -p` rather than inflating gigabytes in memory.
+  const dir = await mkdtemp(join(tmpdir(), "community-notes-"));
+  try {
+    const zipPath = join(dir, "chunk.zip");
+    await pipeline(Readable.fromWeb(res.body), createWriteStream(zipPath));
+    await streamZippedTsv(zipPath, onRow);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+  return true;
+}
+
+async function streamZippedTsv(zipPath, onRow) {
+  const child = spawn("unzip", ["-p", zipPath], { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  const exited = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (code) =>
+      code === 0
+        ? resolve()
+        : reject(new Error(`unzip exited with code ${code}: ${stderr.trim()}`))
+    );
+  });
+  exited.catch(() => {}); // surfaced by `await exited` below, not as an unhandled rejection
+
+  const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
   let header = null;
   for await (const line of rl) {
     const cols = line.split("\t");
@@ -71,7 +112,7 @@ async function streamTsv(url, onRow) {
     header.forEach((h, i) => (row[h] = cols[i]));
     onRow(row);
   }
-  return true;
+  await exited;
 }
 
 /** Tries today's dataset, walking back up to 5 days (publication lags). */
@@ -122,6 +163,14 @@ async function main() {
       : null,
     fetched_at: new Date().toISOString(),
   }));
+
+  if (DRY_RUN) {
+    console.log(`[dry run] would upsert ${payload.length} community notes; skipping writes.`);
+    for (const n of payload.slice(0, 10)) {
+      console.log(`  tweet ${n.tweet_id}  note ${n.note_id}  ${n.classification}  ${n.status}`);
+    }
+    return;
+  }
 
   const res = await fetch(
     `${SUPABASE_URL}/rest/v1/community_notes?on_conflict=note_id`,
