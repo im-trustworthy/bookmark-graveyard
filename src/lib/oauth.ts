@@ -44,8 +44,6 @@ export const MAX_CLIENTS = 1000;
 export const CLIENT_UNUSED_MINUTES = 60;
 /** Registrations older than this whose tokens are all revoked, with no pending code, are pruned. */
 export const CLIENT_STALE_DAYS = 30;
-/** Registrations older than this with no token and no pending code are pruned. */
-export const CLIENT_MAX_AGE_DAYS = 30;
 /** How many evictions one registration may make before it registers anyway. */
 export const MAX_EVICTIONS_PER_REGISTRATION = 5;
 /** The largest body /oauth/register and /oauth/token read. */

@@ -49,24 +49,56 @@ export function oauthTables(): Record<string, Record<string, unknown>[]> {
   };
 }
 
+const isPast = (iso: unknown) => typeof iso === "string" && Date.parse(iso) <= Date.now();
+
 /**
- * What public.prune_oauth_clients does, against the fake tables: drop clients
- * older than p_max_age_days with no api_tokens row and no oauth_codes row, then
- * return how many remain.
+ * What the registration functions of the connector hardening migration do,
+ * against the fake tables:
+ *
+ * public.prune_oauth_clients drops (a) clients older than p_unused_minutes with
+ * no oauth_codes row and no api_tokens row, and (b) clients older than
+ * p_stale_days with no unrevoked token and no unexpired code, then returns how
+ * many remain.
+ *
+ * public.evict_oauth_client drops the oldest client with no live token
+ * (unrevoked and unexpired) and no unused, unexpired code, and returns whether
+ * it found one. Codes cascade with their client, as the foreign key does.
  */
 export function installPruneFunction(fake: FakeDb): void {
+  const tokensOf = (clientId: unknown) => (fake.tables.api_tokens ?? []).filter((t) => t.client_id === clientId);
+  const codesOf = (clientId: unknown) => (fake.tables.oauth_codes ?? []).filter((o) => o.client_id === clientId);
+  const drop = (gone: (c: Record<string, unknown>) => boolean) => {
+    const goneIds = new Set((fake.tables.oauth_clients ?? []).filter(gone).map((c) => c.client_id));
+    fake.tables.oauth_clients = (fake.tables.oauth_clients ?? []).filter((c) => !goneIds.has(c.client_id));
+    fake.tables.oauth_codes = (fake.tables.oauth_codes ?? []).filter((o) => !goneIds.has(o.client_id));
+  };
+
   fake.functions.prune_oauth_clients = (args) => {
-    const days = Number(args.p_max_age_days);
-    const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-    const tokens = fake.tables.api_tokens ?? [];
-    const codes = fake.tables.oauth_codes ?? [];
-    fake.tables.oauth_clients = (fake.tables.oauth_clients ?? []).filter(
+    const unusedBefore = Date.now() - Number(args.p_unused_minutes) * 60 * 1000;
+    const staleBefore = Date.now() - Number(args.p_stale_days) * 24 * 60 * 60 * 1000;
+    const createdBefore = (c: Record<string, unknown>, cutoff: number) => Date.parse(String(c.created_at)) < cutoff;
+    drop((c) => createdBefore(c, unusedBefore) && codesOf(c.client_id).length === 0 && tokensOf(c.client_id).length === 0);
+    drop(
       (c) =>
-        !(Date.parse(String(c.created_at)) < cutoff) ||
-        tokens.some((t) => t.client_id === c.client_id) ||
-        codes.some((o) => o.client_id === c.client_id)
+        createdBefore(c, staleBefore) &&
+        tokensOf(c.client_id).every((t) => t.revoked_at) &&
+        codesOf(c.client_id).every((o) => isPast(o.expires_at))
     );
     return fake.tables.oauth_clients.length;
+  };
+
+  fake.functions.evict_oauth_client = () => {
+    const evictable = (fake.tables.oauth_clients ?? [])
+      .filter(
+        (c) =>
+          tokensOf(c.client_id).every((t) => t.revoked_at || isPast(t.expires_at)) &&
+          codesOf(c.client_id).every((o) => o.used_at || isPast(o.expires_at))
+      )
+      .sort((a, b) => Date.parse(String(a.created_at)) - Date.parse(String(b.created_at)));
+    if (evictable.length === 0) return false;
+    const victim = evictable[0].client_id;
+    drop((c) => c.client_id === victim);
+    return true;
   };
 }
 
