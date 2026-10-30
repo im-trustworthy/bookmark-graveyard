@@ -2,6 +2,7 @@ import { createMcpHandler, withMcpAuth } from "mcp-handler";
 import type { AuthInfo } from "@modelcontextprotocol/server";
 import { verifyApiToken } from "@/lib/api-tokens";
 import { bearerToken } from "@/lib/auth";
+import { appUrl } from "@/lib/env";
 import { MCP_INSTRUCTIONS, registerTools } from "@/lib/mcp/tools";
 import pkg from "../../../../package.json";
 
@@ -39,9 +40,13 @@ async function verify(req: Request): Promise<AuthInfo | undefined> {
   };
 }
 
+// The challenge's resource_metadata comes from APP_URL, the same source the OAuth server uses for its RFC 9728
+// document (resource `${appUrl()}/api/mcp`), never from X-Forwarded-* or the request URL: clients compare
+// the two against the server URL they connected to. Read once at module load, like the rest of APP_URL's uses.
 const authed = withMcpAuth(handler, verify, {
   required: true,
   resourceMetadataPath: "/.well-known/oauth-protected-resource",
+  resourceUrl: appUrl().replace(/\/+$/, ""),
 });
 
 export { authed as GET, authed as POST, authed as DELETE };
