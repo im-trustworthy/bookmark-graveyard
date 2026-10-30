@@ -1,7 +1,8 @@
 import { createHmac } from "node:crypto";
 import { NextRequest } from "next/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { proxy } from "../../proxy";
+import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
+import { config, proxy } from "../../proxy";
 import { sign } from "../crypto";
 
 // The site password wall is optional: GATE_PASSWORD unset means no wall in
@@ -69,6 +70,34 @@ describe("GATE_PASSWORD set: the wall is on", () => {
     }
   );
 
+  // Routes that carry their own lock (a bearer token, or the session cookie) stay open,
+  // so an assistant outside the browser can reach them on a gated instance.
+  it.each([
+    "/api/mcp",
+    "/api/episodes/0b6f2c1e-3d4a-4f5b-8c6d-7e8f9a0b1c2d/audio",
+    "/api/episodes/0b6f2c1e-3d4a-4f5b-8c6d-7e8f9a0b1c2d/markdown",
+  ])("passes the self-locked route %s through without a cookie", (path) => {
+    expect(passesThrough(proxy(request(path)))).toBe(true);
+  });
+
+  // ...and nothing that merely looks like them.
+  it.each([
+    "/api/mcp/extra",
+    "/api/mcpx",
+    "/api/episodes",
+    "/api/episodes/ep-1",
+    "/api/episodes/ep-1/audio/extra",
+    "/api/episodes/ep-1/script",
+    "/api/episodes//audio",
+    "/api/episodes/a/b/audio",
+    "/api/tokens",
+    "/api/tokens/ep-1",
+  ])("still redirects %s to /gate without a cookie", (path) => {
+    const res = proxy(request(path));
+    expect([307, 308]).toContain(res.status);
+    expect(res.headers.get("location")).toBe("http://localhost:3000/gate");
+  });
+
   it("passes / through with the cookie /api/gate mints", () => {
     // The proxy's own derivation must match src/lib/crypto.ts sign().
     expect(gateCookie()).toBe(sign("gate-ok"));
@@ -83,5 +112,20 @@ describe("GATE_PASSWORD set: the wall is on", () => {
     const res = proxy(request("/", cookie));
     expect([307, 308]).toContain(res.status);
     expect(res.headers.get("location")).toBe("http://localhost:3000/gate");
+  });
+});
+
+describe("matcher", () => {
+  // The proxy never runs for paths with a dot, so the OAuth metadata routes under
+  // /.well-known/ need no OPEN_PATHS entry to stay reachable on a gated instance.
+  it.each(["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server", "/_next/static/x"])(
+    "skips %s",
+    (url) => {
+      expect(unstable_doesMiddlewareMatch({ config, url })).toBe(false);
+    }
+  );
+
+  it.each(["/", "/api/mcp", "/api/episodes/ep-1/audio", "/api/tokens"])("runs for %s", (url) => {
+    expect(unstable_doesMiddlewareMatch({ config, url })).toBe(true);
   });
 });
