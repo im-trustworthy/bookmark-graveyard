@@ -1,10 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
-  CLIENT_MAX_AGE_DAYS,
+  CLIENT_STALE_DAYS,
+  CLIENT_UNUSED_MINUTES,
   corsHeaders,
+  declaresOversizedBody,
   MAX_CLIENTS,
+  MAX_EVICTIONS_PER_REGISTRATION,
   MAX_REDIRECT_URIS,
   newClientId,
+  OAUTH_BODY_MAX,
   oauthError,
   preflight,
   redirectUriProblem,
@@ -17,12 +21,16 @@ import { db } from "@/lib/supabase";
 // claude.ai or ChatGPT registers itself the first time a user adds the
 // connector). Public clients only: no secret is issued, and the only token
 // endpoint auth method is "none"; PKCE is what binds a code to its client.
-// Abuse guard: every registration first prunes stale registrations, and past
-// MAX_CLIENTS the endpoint answers 503 instead of growing the table.
+//
+// Abuse guard, built so a flood of registrations can't lock real sign-ups
+// out: every registration first prunes registrations that never got a code
+// after an hour (and fully revoked ones after 30 days). At MAX_CLIENTS it
+// evicts the oldest registration with no live token, a few at most, and
+// answers 503 only when there is nothing left that may be evicted, which
+// takes a thousand connected clients rather than a script.
 
 const METHODS = "POST, OPTIONS";
 const HEADERS = { ...corsHeaders(METHODS), "Cache-Control": "no-store", Pragma: "no-cache" };
-const BODY_MAX = 64 * 1024;
 const GRANT_TYPES = ["authorization_code", "refresh_token"];
 
 interface Registration {
@@ -97,9 +105,37 @@ function parseRegistration(raw: unknown): Registration | { error: OAuthErrorCode
   };
 }
 
+/**
+ * Makes room for one more registration: prunes, then evicts while the table is
+ * at the ceiling. False when it is full of clients that may not be evicted.
+ */
+async function makeRoom(): Promise<boolean> {
+  const { data: remaining, error: pruneError } = await db().rpc("prune_oauth_clients", {
+    p_unused_minutes: CLIENT_UNUSED_MINUTES,
+    p_stale_days: CLIENT_STALE_DAYS,
+  });
+  if (pruneError) throw new Error(`prune_oauth_clients failed: ${pruneError.message}`);
+
+  let count = Number(remaining);
+  for (let evictions = 0; count >= MAX_CLIENTS && evictions < MAX_EVICTIONS_PER_REGISTRATION; evictions++) {
+    const { data: evicted, error: evictError } = await db().rpc("evict_oauth_client");
+    if (evictError) throw new Error(`evict_oauth_client failed: ${evictError.message}`);
+    if (evicted !== true) return false;
+    count--;
+  }
+  // Still at the ceiling after a few evictions (registrations racing this one):
+  // register anyway. Each later registration evicts again, so the overshoot is bounded.
+  return true;
+}
+
+const tooLarge = () => fail("invalid_client_metadata", "The registration request is too large", 413);
+
 export async function POST(req: NextRequest) {
+  // Refused before reading a byte when the client says how big it is; the
+  // length check after reading covers a body sent without Content-Length.
+  if (declaresOversizedBody(req)) return tooLarge();
   const text = await req.text().catch(() => "");
-  if (text.length > BODY_MAX) return fail("invalid_client_metadata", "The registration request is too large");
+  if (text.length > OAUTH_BODY_MAX) return tooLarge();
   let raw: unknown;
   try {
     raw = JSON.parse(text);
@@ -110,12 +146,8 @@ export async function POST(req: NextRequest) {
   if ("error" in registration) return fail(registration.error, registration.description);
 
   try {
-    const { data: remaining, error: pruneError } = await db().rpc("prune_oauth_clients", {
-      p_max_age_days: CLIENT_MAX_AGE_DAYS,
-    });
-    if (pruneError) throw new Error(`prune_oauth_clients failed: ${pruneError.message}`);
-    if (Number(remaining) >= MAX_CLIENTS) {
-      console.error(`POST /oauth/register: refused, ${MAX_CLIENTS} clients are already registered`);
+    if (!(await makeRoom())) {
+      console.error(`POST /oauth/register: refused, ${MAX_CLIENTS} clients are registered and none may be evicted`);
       return fail("temporarily_unavailable", "This server isn't accepting new clients right now. Try again later.", 503);
     }
 

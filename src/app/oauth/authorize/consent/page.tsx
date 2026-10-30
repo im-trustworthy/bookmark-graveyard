@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
-import { checkAuthorizeRequest, loginUrl, sealConsent } from "@/lib/oauth";
-import type { AuthorizeRequest } from "@/lib/oauth";
+import { checkAuthorizeRequest, loginUrl, redirectDestination, sealConsent } from "@/lib/oauth";
+import type { AuthorizeRequest, ReturnLink } from "@/lib/oauth";
 import { getSessionUserId } from "@/lib/session";
 import { db } from "@/lib/supabase";
 
@@ -11,7 +11,8 @@ import { db } from "@/lib/supabase";
 // and asks them. The form posts one hidden field, an HMAC-signed blob of the
 // validated request and the user that expires in ten minutes, to
 // /api/oauth/decision, which checks everything once more. The page never
-// redirects to the client itself.
+// redirects to the client itself: a request it refuses at most gets a link
+// back that the user can choose to click.
 
 export const metadata: Metadata = {
   title: "Connect an app · Bookmark Graveyard",
@@ -28,12 +29,6 @@ function toSearchParams(raw: SearchParams): URLSearchParams {
   return params;
 }
 
-/** Where the user lands after deciding: the redirect URI's host, or its scheme for an app link. */
-function destination(redirectUri: string): string {
-  const url = new URL(redirectUri);
-  return url.protocol === "https:" || url.protocol === "http:" ? url.host : url.protocol.replace(/:$/, "");
-}
-
 const FOCUS =
   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-400 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950";
 
@@ -48,13 +43,25 @@ function Shell({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Problem({ message }: { message: string }) {
+/** A refusal. With `returnTo`, a plain link carries the error back to the client; nothing happens until it's clicked. */
+function Problem({ message, returnTo = null }: { message: string; returnTo?: ReturnLink | null }) {
   return (
     <Shell>
       <div className="space-y-3 rounded-2xl border border-red-900/60 bg-red-950/20 p-6">
         <h1 className="font-heading text-2xl tracking-wide text-white">This request can&apos;t be completed</h1>
-        <p className="text-sm text-red-200">{message}</p>
+        <p className="break-words text-sm text-red-200">{message}</p>
         <p className="text-sm text-zinc-400">Go back to the app you came from and add the connector again.</p>
+        {returnTo && (
+          <p className="text-sm">
+            <a
+              href={returnTo.href}
+              rel="noreferrer"
+              className={`break-all rounded text-sky-300 underline underline-offset-4 hover:text-sky-200 ${FOCUS}`}
+            >
+              Return to {returnTo.destination}
+            </a>
+          </p>
+        )}
       </div>
     </Shell>
   );
@@ -77,7 +84,7 @@ function Consent({ request, handle, consent }: { request: AuthorizeRequest; hand
         </div>
         <p className="text-sm text-zinc-400">
           Signed in as <span className="font-medium text-zinc-100">@{handle}</span>. After you choose, you&apos;ll go
-          back to <span className="break-all font-medium text-zinc-100">{destination(request.redirectUri)}</span>.
+          back to <span className="break-all font-medium text-zinc-100">{redirectDestination(request.redirectUri)}</span>.
         </p>
         <p className="text-xs text-zinc-500">
           Only approve apps you added yourself. You can disconnect it at any time in the Assistants panel.
@@ -116,8 +123,9 @@ export default async function ConsentPage({ searchParams }: { searchParams: Prom
     console.error("/oauth/authorize/consent:", err);
     return <Problem message="Something went wrong on our side. Try again in a minute." />;
   }
-  // Only reachable by opening this URL by hand: /oauth/authorize answers these itself.
-  if (!check.ok) return <Problem message="The connection request isn't valid." />;
+  // Only reachable by opening this URL by hand: /oauth/authorize answers these
+  // itself, with the same message and the same link back.
+  if (!check.ok) return <Problem message={check.message} returnTo={check.returnTo} />;
 
   const userId = await getSessionUserId();
   // Outside any try: redirect() works by throwing.

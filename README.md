@@ -335,14 +335,15 @@ what the app has already stored, so it is free.
   link again.
 - On [Vercel](https://vercel.com) and similar hosts, background work is
   [cut off after five minutes](https://vercel.com/docs/functions/configuring-functions/duration). A
-  long podcast then needs the assistant to keep checking in, and each check carries it forward. On
+  long podcast then needs the assistant to keep checking in, and each check carries it forward, as
+  long as the assistant has read-and-write access (a read-only one can only watch). On
   [Render](https://render.com) and other always-on hosts it finishes on its own.
 - Bookmark text is written by other people. The assistant is told to treat it as information, not
   as instructions, but no assistant is perfectly safe from a post that tries to steer it. Give
   read-and-write access only to assistants you trust.
 - To cut an assistant off, click **Revoke** next to its token in the Assistants panel. Assistants
   that connected by signing in are listed there too, tagged "Connected by sign-in". The assistant
-  loses access on its next request.
+  loses access on its next request, and a brief it started stops before its next paid step.
 
 ## Deploy anywhere
 

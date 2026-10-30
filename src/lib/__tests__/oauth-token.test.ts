@@ -286,6 +286,60 @@ describe("grant_type=authorization_code", () => {
     expect(tokens()).toEqual([]);
   });
 
+  it("keeps one connection per client per user: a fresh exchange revokes the client's earlier tokens", async () => {
+    const first = await connect(["read", "write"]);
+    // Another client's connection and a dashboard token for the same user, and this client for another user.
+    fake.tables.api_tokens.push(
+      { id: "other-client", user_id: USER_ID, client_id: OTHER_CLIENT_ID, revoked_at: null, expires_at: null },
+      { id: "dashboard", user_id: USER_ID, client_id: null, revoked_at: null, expires_at: null },
+      { id: "other-user", user_id: "someone-else", client_id: CLIENT_ID, revoked_at: null, expires_at: null }
+    );
+    vi.setSystemTime(T0.getTime() + MINUTE);
+    const second = await connect(["read"]);
+
+    expect(await verifyApiToken(first.access_token)).toBeNull();
+    expect(await verifyApiToken(second.access_token)).toMatchObject({ userId: USER_ID, scopes: ["read"] });
+    const byId = (id: string) => tokens().find((t) => t.id === id)!;
+    expect(tokens()[0].revoked_at).toBe(new Date(T0.getTime() + MINUTE).toISOString());
+    for (const id of ["other-client", "dashboard", "other-user"]) expect(byId(id).revoked_at).toBeNull();
+    // The first connection's refresh token died with it.
+    const refreshed = await read(
+      await token({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: CLIENT_ID })
+    );
+    expect(refreshed.json.error).toBe("invalid_grant");
+  });
+
+  it("refuses to mint past the account's 25 active tokens, counting after its own old tokens are revoked", async () => {
+    const live = (i: number, extra: Record<string, unknown> = {}) => ({
+      id: `live-${i}`,
+      user_id: USER_ID,
+      client_id: null,
+      revoked_at: null,
+      expires_at: null,
+      ...extra,
+    });
+    // 25 live tokens elsewhere (an expired and a revoked one don't count): the cap is reached.
+    fake.tables.api_tokens.push(
+      ...Array.from({ length: 25 }, (_, i) => live(i)),
+      live(98, { expires_at: new Date(T0.getTime() - MINUTE).toISOString() }),
+      live(99, { revoked_at: T0.toISOString() })
+    );
+    const { code, verifier } = await newCode();
+    const { status, json } = await read(await token(exchangeFields(code, verifier)));
+    expect(status).toBe(400);
+    expect(json).toEqual({
+      error: "invalid_grant",
+      error_description: "This account already has the maximum number of active tokens; revoke one in the Assistants panel",
+    });
+    expect(tokens().filter((t) => t.client_id === CLIENT_ID)).toEqual([]);
+
+    // 24 elsewhere plus this client's own earlier token: that one is revoked first, so there is room.
+    tokens().find((t) => t.id === "live-0")!.client_id = CLIENT_ID;
+    const again = await newCode();
+    expect((await token(exchangeFields(again.code, again.verifier))).status).toBe(200);
+    expect(tokens().find((t) => t.id === "live-0")!.revoked_at).toBe(T0.toISOString());
+  });
+
   it("prunes codes that expired more than a day ago", async () => {
     fake.tables.oauth_codes.push(
       { code_hash: "old", client_id: CLIENT_ID, expires_at: new Date(T0.getTime() - DAY - 1).toISOString() },
@@ -357,6 +411,68 @@ describe("grant_type=refresh_token", () => {
     const replay = await read(await token(refreshFields(first.refresh_token)));
     expect(replay.status).toBe(400);
     expect(replay.json.error).toBe("invalid_grant");
+  });
+
+  it("treats a rotated-away refresh token presented again as stolen: the row is revoked", async () => {
+    const first = await connect(["read", "write"]);
+    vi.setSystemTime(T0.getTime() + DAY);
+    const second = (await read(await token(refreshFields(first.refresh_token)))).json as typeof first;
+    expect(tokens()[0].previous_refresh_token_hash).toBe(sha256Hex(first.refresh_token));
+    expect(await verifyApiToken(second.access_token)).not.toBeNull();
+
+    const errorSpy = vi.mocked(console.error);
+    errorSpy.mockClear();
+    vi.setSystemTime(T0.getTime() + DAY + MINUTE);
+    const reuse = await read(await token(refreshFields(first.refresh_token)));
+    expect(reuse.status).toBe(400);
+    expect(reuse.json.error).toBe("invalid_grant");
+    expect(tokens()[0].revoked_at).toBe(new Date(T0.getTime() + DAY + MINUTE).toISOString());
+
+    // Everything issued after the stolen token dies with it.
+    expect(await verifyApiToken(second.access_token)).toBeNull();
+    expect((await read(await token(refreshFields(second.refresh_token)))).json.error).toBe("invalid_grant");
+
+    // One log line, naming the token id, never a token.
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const logged = errorSpy.mock.calls[0].map(String).join(" ");
+    expect(logged).toContain(String(tokens()[0].id));
+    for (const secret of [first.refresh_token, second.refresh_token, second.access_token]) {
+      expect(logged).not.toContain(secret);
+    }
+  });
+
+  it("revokes on reuse even when the replay names another client, and keeps the first revocation time", async () => {
+    const first = await connect();
+    await token(refreshFields(first.refresh_token));
+    await token(refreshFields(first.refresh_token, { client_id: OTHER_CLIENT_ID }));
+    expect(tokens()[0].revoked_at).toBe(T0.toISOString());
+    vi.setSystemTime(T0.getTime() + MINUTE);
+    expect((await read(await token(refreshFields(first.refresh_token)))).json.error).toBe("invalid_grant");
+    expect(tokens()[0].revoked_at).toBe(T0.toISOString());
+  });
+
+  it("refuses a refresh after 90 days without use: accepted at 89 days, refused at 91", async () => {
+    const idle89 = await connect();
+    vi.setSystemTime(T0.getTime() + 89 * DAY);
+    expect((await token(refreshFields(idle89.refresh_token))).status).toBe(200);
+
+    vi.setSystemTime(T0);
+    fake = createFakeDb(oauthTables());
+    state.db = fake;
+    const idle91 = await connect();
+    vi.setSystemTime(T0.getTime() + 91 * DAY);
+    const { status, json } = await read(await token(refreshFields(idle91.refresh_token)));
+    expect(status).toBe(400);
+    expect(json).toEqual({ error: "invalid_grant", error_description: expect.stringMatching(/unused for 90 days/) });
+    expect(tokens()[0].revoked_at ?? null).toBeNull();
+  });
+
+  it("counts API use as use: idle is measured from the last call, not from the last refresh", async () => {
+    const first = await connect();
+    vi.setSystemTime(T0.getTime() + 20 * DAY);
+    expect(await verifyApiToken(first.access_token)).not.toBeNull(); // bumps last_used_at
+    vi.setSystemTime(T0.getTime() + 105 * DAY);
+    expect((await token(refreshFields(first.refresh_token))).status).toBe(200);
   });
 
   it("refreshes an access token that has already expired", async () => {
@@ -476,6 +592,22 @@ describe("the request itself", () => {
     const { status, json } = await read(await POST(jsonPost(URL_, body)));
     expect(status).toBe(400);
     expect(json.error).toBe("invalid_request");
+  });
+
+  it("refuses a body over 64 KB from its Content-Length, before reading it", async () => {
+    const req = formPost(URL_, { grant_type: "refresh_token" }, { "Content-Length": String(64 * 1024 + 1) });
+    const text = vi.spyOn(req, "text");
+    const res = await POST(req);
+    expect(res.status).toBe(413);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(await res.json()).toEqual({ error: "invalid_request", error_description: "The request body is too large" });
+    expect(text).not.toHaveBeenCalled();
+  });
+
+  it("still measures a body sent without Content-Length", async () => {
+    const res = await POST(formPost(URL_, { grant_type: "refresh_token", padding: "x".repeat(64 * 1024) }));
+    expect(res.status).toBe(413);
+    expect((await res.json()).error).toBe("invalid_request");
   });
 
   it("answers a CORS preflight", () => {
