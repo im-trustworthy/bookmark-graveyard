@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { appUrl } from "@/lib/env";
+import { RETURN_PATH_COOKIE, safeReturnPath } from "@/lib/return-path";
 import { db } from "@/lib/supabase";
 import { setSession } from "@/lib/session";
 import { exchangeCode, fetchMe, storeTokens } from "@/lib/x";
@@ -9,13 +10,18 @@ import { exchangeCode, fetchMe, storeTokens } from "@/lib/x";
 // that ends up in browser history / referrer headers / server access logs.
 type AuthErrorCode = "auth_failed" | "not_allowed";
 
-function authErrorRedirect(code: AuthErrorCode): NextResponse {
-  const res = NextResponse.redirect(`${appUrl()}/?error=${code}`);
-  // Clear the one-shot PKCE cookies on every exit path, not just success — see the
-  // state-comparison note below for why that matters beyond plain cleanliness.
+/** Clears the one-shot sign-in cookies: the PKCE pair and the return path. */
+function clearSignInCookies(res: NextResponse): NextResponse {
   res.cookies.delete("bb_pkce");
   res.cookies.delete("bb_state");
+  res.cookies.delete(RETURN_PATH_COOKIE);
   return res;
+}
+
+function authErrorRedirect(code: AuthErrorCode): NextResponse {
+  // Clear the one-shot cookies on every exit path, not just success — see the
+  // state-comparison note below for why that matters beyond plain cleanliness.
+  return clearSignInCookies(NextResponse.redirect(`${appUrl()}/?error=${code}`));
 }
 
 export async function GET(req: NextRequest) {
@@ -68,10 +74,11 @@ export async function GET(req: NextRequest) {
     await storeTokens(user.id, tokens);
     await setSession(user.id);
 
-    const res = NextResponse.redirect(appUrl());
-    res.cookies.delete("bb_pkce");
-    res.cookies.delete("bb_state");
-    return res;
+    // No open redirect: bb_next is only ever a path on this app (checked again
+    // here, not just when /api/auth/login set it), appended to APP_URL.
+    const next = safeReturnPath(req.cookies.get(RETURN_PATH_COOKIE)?.value);
+    const target = next ? `${appUrl().replace(/\/+$/, "")}${next}` : appUrl();
+    return clearSignInCookies(NextResponse.redirect(target));
   } catch (err) {
     // Detail stays server-side; the redirect only ever carries the fixed code.
     console.error("OAuth callback error:", err);

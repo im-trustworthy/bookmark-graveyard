@@ -1,12 +1,16 @@
+import { safeReturnPath } from "@/lib/return-path";
+
 // Password wall shown by src/proxy.ts to anyone without the gate cookie.
 // Deliberately spare — no wordmark, no product copy — so the URL gives away
-// nothing about what lives behind it.
+// nothing about what lives behind it. `next` (the blocked path the proxy
+// remembered) rides along in the form so /api/gate can return there.
 export default async function Gate({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string }>;
+  searchParams: Promise<{ error?: string; next?: string | string[] }>;
 }) {
-  const { error } = await searchParams;
+  const { error, next: rawNext } = await searchParams;
+  const next = safeReturnPath(rawNext);
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-zinc-950 px-6 text-zinc-100">
@@ -20,6 +24,7 @@ export default async function Gate({
           </p>
         )}
         <form method="POST" action="/api/gate" className="space-y-3">
+          {next && <input type="hidden" name="next" value={next} />}
           <input
             type="password"
             name="password"

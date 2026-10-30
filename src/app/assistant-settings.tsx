@@ -483,7 +483,10 @@ export default function AssistantSettings() {
 
       {open && (
         <div className="mt-4 space-y-6 border-t border-white/10 pt-4">
-          <p className="text-sm text-zinc-300">Connect an AI assistant to search your bookmarks and make briefs.</p>
+          <p className="text-sm text-zinc-300">
+            Connect an AI assistant to search your bookmarks and make briefs. Assistants that support sign-in (Claude,
+            ChatGPT) connect without a token: add the connector URL and approve the access request.
+          </p>
 
           {/* Connector URL */}
           <div className="space-y-2">
@@ -527,6 +530,11 @@ export default function AssistantSettings() {
                           <p className="break-words text-sm font-medium text-zinc-100">
                             {t.name}{" "}
                             <span className="font-mono text-xs font-normal text-zinc-500">{t.prefix}…</span>
+                            {t.client_id && (
+                              <span className="ml-2 rounded-full bg-sky-900/40 px-2 py-0.5 text-[11px] font-normal text-sky-300">
+                                Connected by sign-in
+                              </span>
+                            )}
                             {expired && (
                               <span className="ml-2 rounded-full bg-amber-900/40 px-2 py-0.5 text-[11px] font-normal text-amber-300">
                                 Expired
