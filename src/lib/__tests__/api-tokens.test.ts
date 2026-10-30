@@ -8,11 +8,14 @@ vi.mock("@/lib/supabase", () => ({ db: () => state.db }));
 
 import {
   countActiveApiTokens,
+  findRefreshGrant,
   hasScope,
   LAST_USED_THROTTLE_MS,
   listApiTokens,
   mintApiToken,
+  mintOAuthToken,
   revokeApiToken,
+  rotateOAuthToken,
   verifyApiToken,
 } from "@/lib/api-tokens";
 
@@ -227,5 +230,76 @@ describe("listApiTokens / countActiveApiTokens / revokeApiToken", () => {
     expect(await revokeApiToken("u2", theirs.record.id)).toBe(true);
     expect(await revokeApiToken("u2", theirs.record.id)).toBe(false); // already revoked
     expect(await revokeApiToken("u2", "00000000-0000-4000-8000-000000000000")).toBe(false);
+  });
+});
+
+describe("OAuth tokens: mintOAuthToken / findRefreshGrant / rotateOAuthToken", () => {
+  const CLIENT = "c".repeat(43);
+  const oauthToken = (scopes: ("read" | "write")[]) =>
+    mintOAuthToken("u1", { clientId: CLIENT, name: "Claude", scopes, expiresInDays: 30 });
+
+  it("stores the client and only the refresh token's hash; the access token is an ordinary bearer token", async () => {
+    const { token, refreshToken, record } = await oauthToken(["write"]);
+    expect(token).toMatch(/^bg_[A-Za-z0-9_-]{43}$/);
+    expect(refreshToken).toMatch(/^bgr_[A-Za-z0-9_-]{43}$/);
+    expect(record).toMatchObject({ name: "Claude", client_id: CLIENT, scopes: ["read", "write"] });
+    expect(record).not.toHaveProperty("refresh_token_hash");
+    expect(rowFor(record.id)).toMatchObject({
+      client_id: CLIENT,
+      token_hash: sha256(token),
+      refresh_token_hash: sha256(refreshToken),
+      expires_at: new Date(T0.getTime() + 30 * DAY).toISOString(),
+    });
+    expect(JSON.stringify(fake.tables)).not.toContain(refreshToken);
+    expect(await verifyApiToken(token)).toMatchObject({ userId: "u1", tokenId: record.id });
+    expect(await verifyApiToken(refreshToken)).toBeNull();
+  });
+
+  it("leaves dashboard tokens without a client or refresh token", async () => {
+    const { record } = await mintApiToken("u1", { name: "Grok", scopes: ["read"] });
+    expect(rowFor(record.id)).toMatchObject({ client_id: null, refresh_token_hash: null });
+  });
+
+  it("finds the grant behind a refresh token, and nothing for revoked, disallowed or unknown ones", async () => {
+    const { refreshToken, record } = await oauthToken(["read"]);
+    expect(await findRefreshGrant(refreshToken)).toEqual({
+      tokenId: record.id,
+      userId: "u1",
+      clientId: CLIENT,
+      scopes: ["read"],
+    });
+    expect(await findRefreshGrant(`bgr_${"A".repeat(43)}`)).toBeNull();
+    expect(await findRefreshGrant("bg_nope")).toBeNull();
+
+    (fake.tables.users[0] as Record<string, unknown>).is_allowed = false;
+    expect(await findRefreshGrant(refreshToken)).toBeNull();
+    (fake.tables.users[0] as Record<string, unknown>).is_allowed = true;
+
+    await revokeApiToken("u1", record.id);
+    expect(await findRefreshGrant(refreshToken)).toBeNull();
+  });
+
+  it("rotates in place; a second rotation with the old refresh token loses", async () => {
+    const first = await oauthToken(["write"]);
+    const grant = (await findRefreshGrant(first.refreshToken))!;
+    vi.setSystemTime(T0.getTime() + DAY);
+    const rotated = (await rotateOAuthToken(grant, first.refreshToken, { scopes: ["read"], expiresInDays: 30 }))!;
+    expect(rotated.record.id).toBe(first.record.id);
+    expect(rotated.record.scopes).toEqual(["read"]);
+    expect(rows()).toHaveLength(1);
+    expect(await verifyApiToken(first.token)).toBeNull();
+    expect(await verifyApiToken(rotated.token)).toMatchObject({ scopes: ["read"] });
+    expect(await findRefreshGrant(first.refreshToken)).toBeNull();
+
+    expect(await rotateOAuthToken(grant, first.refreshToken, { scopes: ["read"], expiresInDays: 30 })).toBeNull();
+  });
+
+  it("refuses to widen", async () => {
+    const first = await oauthToken(["read"]);
+    const grant = (await findRefreshGrant(first.refreshToken))!;
+    await expect(
+      rotateOAuthToken(grant, first.refreshToken, { scopes: ["write"], expiresInDays: 30 })
+    ).rejects.toThrow(/widen/);
+    expect(await verifyApiToken(first.token)).not.toBeNull();
   });
 });
