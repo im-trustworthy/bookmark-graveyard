@@ -247,16 +247,25 @@ For assistants that cannot take a pasted token, the instance is also a small
 
 1. The assistant reads `/.well-known/oauth-protected-resource` and
    `/.well-known/oauth-authorization-server`, then registers itself at `/oauth/register`. It gets no
-   secret, and PKCE with `S256` is required.
+   secret, and PKCE with `S256` is required. An assistant can skip registering by using a client ID
+   metadata document instead ("Claude's published identity" in claude.ai): its client ID is an https
+   address, and your instance fetches the JSON there to learn the assistant's name and return
+   addresses, refusing private or local addresses, redirects and anything that asks for a secret.
+   Either way works.
 2. It opens `/oauth/authorize` in your browser. If you are not signed in, you go through the X
    sign-in first and come back.
 3. You see the consent page, `/oauth/authorize/consent`. It shows:
    - "Connect *name*?" The name is whatever the assistant called itself when it registered, and
-     anyone can register under any name. Approve only requests you just started yourself.
+     anyone can register under any name. For an assistant with a metadata document it reads
+     "Connect *name* (*site*)?": the name comes from that document and the site is where the document
+     is published. Anyone can publish a document under any name too, so check the site. Approve only
+     requests you just started yourself.
    - What it wants to do: search and read your bookmarks and briefs. If it asked for write access, it
      adds starting briefs (which spends your daily allowance and credits) and hiding bookmarks. An
      assistant that names no scope gets read only.
-   - The account you are signed in as (`@handle`), and the site you will be sent back to.
+   - The account you are signed in as (`@handle`), and the site you will be sent back to. When that
+     is a program on your own computer (`localhost`), a warning says that any program could be
+     asking.
    - **Approve** and **Deny** buttons, with a reminder that you can disconnect any time in the
      Assistants panel.
 4. **Approve** sends the assistant a single-use code that works for five minutes. It trades the code
@@ -272,11 +281,11 @@ itself, so the assistant asks you to sign in again. If anyone presents a refresh
 already traded in, the server takes it as stolen and revokes that connection.
 
 If the page says "This connection request can't be completed", your instance rejected what the
-assistant sent: an unknown client, a return address it never registered, or a request that is
-invalid in some other way, which the page names. The page never sends you anywhere by itself. When
-the assistant and its return address check out, it offers a **Return to** link that takes the error
-back to the assistant if you click it. Otherwise go back to the assistant and add the connector
-again. The consent form is good for ten minutes, so if it times out, start again. An assistant may
+assistant sent: an unknown client, a metadata document that couldn't be fetched or isn't valid, a
+return address it never registered, or a request that is invalid in some other way, which the page
+names. The page never sends you anywhere by itself. When the assistant and its return address check
+out, it offers a **Return to** link that takes the error back to the assistant if you click it.
+Otherwise go back to the assistant and add the connector again. The consent form is good for ten minutes, so if it times out, start again. An assistant may
 register return addresses that use `https`, `http` on localhost only, or an app scheme such as
 `cursor://`. A registration that never gets as far as a sign-in is deleted after an hour.
 
@@ -304,7 +313,7 @@ its own lock.
 | --- | --- |
 | `/api/mcp` | An assistant outside your browser cannot pass the gate. The endpoint needs a valid bearer token. |
 | `/oauth/token`, `/oauth/register` | Machine endpoints that assistants call directly. A token request needs a valid code or refresh token. Registration is open by design; unused registrations are deleted after an hour, so a flood of them can't lock real assistants out (see the security review in [docs/mcp-connector.md](docs/mcp-connector.md#security-review-2026-10-30)). |
-| `/oauth/authorize`, `/oauth/authorize/consent` | The browser steps of sign-in. They require the X sign-in themselves. |
+| `/oauth/authorize`, `/oauth/authorize/consent` | The browser steps of sign-in. They require the X sign-in themselves. Checking the request first may fetch an assistant's metadata document, which never goes to a private or local address. |
 | `/api/oauth/decision` | The consent form's post. It needs your session cookie and a signed consent that belongs to you. |
 | `/.well-known/…` | Public discovery documents. The gate's matcher skips any path that contains a dot, so these are never gated. |
 | `/api/episodes/<id>/audio`, `/api/episodes/<id>/markdown` | The stable links an assistant shares. They need your session cookie or a read token, and send a browser without one to the sign-in page. |

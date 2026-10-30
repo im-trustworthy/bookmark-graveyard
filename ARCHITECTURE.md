@@ -391,6 +391,14 @@ app is also a small OAuth 2.1 authorization server for its own tokens
   live connection. A body declared over 64 KB is refused with 413 before it is read, here and at
   `/oauth/token`. Redirect URIs must be `https`, `http` on a loopback host, or an app scheme such as
   `cursor://`. They match exactly, except that a loopback URI may use any port.
+- **Client ID Metadata Documents.** A client may skip registration and send the https URL of a JSON
+  document about itself as its `client_id` (draft-ietf-oauth-client-id-metadata-document, advertised
+  as `client_id_metadata_document_supported`); this is "Claude's published identity" in claude.ai.
+  The authorization request fetches that document under the SSRF guard in `src/lib/ssrf.ts` (every
+  resolved address must be public, no redirects, 5 seconds, 5 KB), checks it like a registration
+  plus an exact `client_id` match and no client secret, and caches a valid one in memory for five
+  minutes. Approving writes an `oauth_clients` row keyed by the URL, so codes, tokens, revocation and
+  pruning work as for a registered client, and the token endpoint never fetches anything.
 - **Authorization.** `GET /oauth/authorize` is a route handler, so it can answer with real status
   codes. It never redirects to the client before the user has acted, because anyone can register a
   client with any redirect URI and an automatic error redirect would make the app an open redirector
@@ -399,8 +407,9 @@ app is also a small OAuth 2.1 authorization server for its own tokens
   `error`, `error_description`, `state` and `iss` for the user to click. A missing X session goes to
   sign-in and returns. Otherwise it redirects to the consent page, `/oauth/authorize/consent`, which
   checks everything again. PKCE with `S256` is required.
-- **Consent.** The page shows which client is asking, the scopes, the account and where you will
-  land. Its form posts one hidden field to `/api/oauth/decision`: the validated request plus the
+- **Consent.** The page shows which client is asking (with the host that published its metadata
+  document, for a URL `client_id`), the scopes, the account and where you will land, and warns when
+  that is a program on this computer. Its form posts one hidden field to `/api/oauth/decision`: the validated request plus the
   user's id, sealed with an HMAC under `SESSION_SECRET` (with a purpose prefix, so it cannot pass for
   a session or gate signature) and valid for ten minutes. Editing the form cannot change what was
   approved, and the decision route checks the same-origin header, the signed-in user, the client and

@@ -1,6 +1,13 @@
 import type { Metadata } from "next";
 import { redirect } from "next/navigation";
-import { checkAuthorizeRequest, loginUrl, redirectDestination, sealConsent } from "@/lib/oauth";
+import {
+  checkAuthorizeRequest,
+  clientLabel,
+  isLoopbackRedirect,
+  loginUrl,
+  redirectDestination,
+  sealConsent,
+} from "@/lib/oauth";
 import type { AuthorizeRequest, ReturnLink } from "@/lib/oauth";
 import { getSessionUserId } from "@/lib/session";
 import { db } from "@/lib/supabase";
@@ -67,14 +74,20 @@ function Problem({ message, returnTo = null }: { message: string; returnTo?: Ret
   );
 }
 
+// The name is the client's own claim either way: whatever it registered under,
+// or what its metadata document says. So the page puts what can be checked
+// next to it: the host that published the document, and where the browser goes
+// afterwards, with a warning when that is a program on this computer, which
+// any program can claim to be (MCP authorization spec, localhost redirect risks).
 function Consent({ request, handle, consent }: { request: AuthorizeRequest; handle: string; consent: string }) {
   const canWrite = request.scopes.includes("write");
+  const name = clientLabel({ client_name: request.clientName, host: request.clientHost });
   return (
     <Shell>
       <div className="space-y-5 rounded-2xl border border-white/10 bg-white/[0.06] p-6 shadow-lg shadow-black/20">
-        <h1 className="break-words font-heading text-3xl tracking-wide text-white">Connect {request.clientName}?</h1>
+        <h1 className="break-words font-heading text-3xl tracking-wide text-white">Connect {name}?</h1>
         <div className="space-y-2">
-          <p className="break-words text-zinc-200">{request.clientName} wants to:</p>
+          <p className="break-words text-zinc-200">{name} wants to:</p>
           <ul className="list-disc space-y-1 pl-5 text-zinc-300">
             <li>search and read your bookmarks and briefs</li>
             {canWrite && (
@@ -86,7 +99,16 @@ function Consent({ request, handle, consent }: { request: AuthorizeRequest; hand
           Signed in as <span className="font-medium text-zinc-100">@{handle}</span>. After you choose, you&apos;ll go
           back to <span className="break-all font-medium text-zinc-100">{redirectDestination(request.redirectUri)}</span>.
         </p>
-        <p className="text-xs text-zinc-500">
+        {isLoopbackRedirect(request.redirectUri) && (
+          <p className="break-words text-sm text-amber-200">
+            That is a program on this computer, and any program can say it is {request.clientName}. Approve only if
+            you started this sign-in yourself just now.
+          </p>
+        )}
+        <p className="break-words text-xs text-zinc-500">
+          {request.clientHost
+            ? `The name comes from a description published at ${request.clientHost}, and anyone can publish one under any name. `
+            : "The name is whatever the app registered under, and anyone can register under any name. "}
           Only approve apps you added yourself. You can disconnect it at any time in the Assistants panel.
         </p>
         <form method="POST" action="/api/oauth/decision" className="flex flex-wrap gap-3">

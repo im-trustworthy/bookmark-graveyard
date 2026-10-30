@@ -34,7 +34,7 @@ Then do [Check the instance](#1-check-the-instance), the client's section under
 | --- | --- |
 | Connector URL | `<APP_URL>/api/mcp` |
 | Transport | MCP over Streamable HTTP (protocol revision 2025-03-26 or later). No stdio, no legacy SSE endpoint. |
-| Authentication | `Authorization: Bearer <token>`, or OAuth 2.1 with discovery, dynamic client registration (RFC 7591) and PKCE `S256`. Cookies are never read. |
+| Authentication | `Authorization: Bearer <token>`, or OAuth 2.1 with discovery, PKCE `S256`, and either dynamic client registration (RFC 7591) or a client ID metadata document (an https URL as `client_id`). Cookies are never read. |
 | Discovery | `<APP_URL>/.well-known/oauth-protected-resource` and `<APP_URL>/.well-known/oauth-authorization-server` |
 | Scopes | `read`, `write` (write includes read) |
 | Server name | `bookmark-graveyard` |
@@ -77,13 +77,15 @@ next request.
 ### Sign in
 
 Give the client the connector URL and choose its sign-in option. The client reads the discovery
-documents, registers itself, and opens `<APP_URL>/oauth/authorize` in the browser. The user signs
+documents, registers itself or names its client ID metadata document, and opens
+`<APP_URL>/oauth/authorize` in the browser. The user signs
 in with X if they are not already, then sees a consent page naming the client, what it may do, and
 which account it connects, and clicks **Approve**. The connection appears in the Assistants panel
 tagged "Connected by sign-in" and can be revoked there.
 
-- If the client asks which OAuth client to use, choose **automatic** or **dynamic registration**.
-  The server registers clients itself; it does not accept pre-registered or published client IDs.
+- If the client asks which OAuth client to use, either works: **automatic** (dynamic) registration,
+  or the client's **published identity** (a client ID metadata document, which the server fetches
+  from the client's own https address). Pre-registered client IDs are not accepted.
 - An access token lasts 30 days and renews itself. A connection unused for 90 days has to sign in
   again. Connecting the same client again replaces its earlier connection.
 - A person can hold 25 active tokens, sign-in connections included.
@@ -111,8 +113,8 @@ Add `--scope user` to make it available in every project rather than the current
 ### [claude.ai and Claude Desktop](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
 
 **Customize → Connectors → + Add → Add custom connector.** Name it, enter `<APP_URL>/api/mcp`,
-**Continue**. Under **Authentication** choose **Sign in now**; under **OAuth client** choose
-automatic registration, not Claude's published identity. For a token instead, choose **No sign
+**Continue**. Under **Authentication** choose **Sign in now**; under **OAuth client** either
+Claude's published identity or automatic registration works. For a token instead, choose **No sign
 in** and add a request header `Authorization` with the value `Bearer <token>`. Click **Add**, then
 turn it on in a chat with **+ → Connectors**. Free accounts get one custom connector. Claude
 Desktop uses the same connector through the account; its `claude_desktop_config.json` is for local
@@ -215,7 +217,8 @@ To sign in instead: `codex mcp add bookmark-graveyard --url <APP_URL>/api/mcp`, 
 ### Any other client
 
 Three facts configure any MCP client: the URL `<APP_URL>/api/mcp`, the transport Streamable HTTP,
-and either the header `Authorization: Bearer <token>` or OAuth with dynamic registration and PKCE.
+and either the header `Authorization: Bearer <token>` or OAuth with PKCE and either dynamic
+registration or a client ID metadata document.
 A client that only runs local (stdio) servers, such as `claude_desktop_config.json`, can bridge with
 [mcp-remote](https://github.com/geelen/mcp-remote):
 
@@ -296,8 +299,8 @@ nothing matched. A spent daily brief allowance does not refuse the call: the job
 | Symptom | Cause and fix |
 | --- | --- |
 | `401` with `invalid_token` on every call | The token is mistyped, revoked or expired, or the user is no longer allowed on the instance. Make a new token in the Assistants panel. |
-| Sign-in client reports a resource or metadata mismatch, or "unknown client" | The instance's `APP_URL` differs from the address used (see [Check the instance](#1-check-the-instance)), or the client used a pre-registered client ID. Fix `APP_URL` and redeploy, or choose automatic registration. |
-| A page says "This connection request can't be completed" | The sign-in request was invalid: an unknown client, a return address it never registered, missing or non-`S256` PKCE, or a bad scope. The page names the problem. Remove the connector in the client and add it again. |
+| Sign-in client reports a resource or metadata mismatch, or "unknown client" | The instance's `APP_URL` differs from the address used (see [Check the instance](#1-check-the-instance)), or the client used a pre-registered client ID. Fix `APP_URL` and redeploy, or choose automatic registration or the client's published identity. |
+| A page says "This connection request can't be completed" | The sign-in request was invalid: an unknown client, a client metadata document that couldn't be fetched or isn't valid, a return address the client never registered, missing or non-`S256` PKCE, or a bad scope. The page names the problem. Remove the connector in the client and add it again. |
 | Tool error "token is read-only, so it can't …" | Expected for `generate_brief` and `hide_bookmark` with a read-only token. Use a read-and-write token. |
 | Tool error "Daily limit reached for mcp call" | More than 1,000 tool calls in 24 hours. Wait, or the owner raises `LIMIT_MCP_CALL_PER_DAY`. |
 | `generate_brief` answers an error and no `job_id` | No posts match the filters (checked at once when `sync_first` is false). Nothing was charged. |

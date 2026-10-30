@@ -5,6 +5,7 @@ import { hashToken, normalizeScopes } from "./api-tokens";
 import type { ApiScope } from "./api-tokens";
 import { sign, verifySignature } from "./crypto";
 import { appUrl } from "./env";
+import { checkPublicHost, isReservedHostname } from "./ssrf";
 import { db } from "./supabase";
 
 // The app as a small OAuth 2.1 authorization server for its own tokens, so web
@@ -14,6 +15,10 @@ import { db } from "./supabase";
 //   1. The client reads /.well-known/oauth-protected-resource (RFC 9728) and
 //      /.well-known/oauth-authorization-server (RFC 8414).
 //   2. It registers at POST /oauth/register (RFC 7591): public clients only.
+//      Or it skips registering and uses the https URL of its client metadata
+//      document as its client_id (CIMD, draft-ietf-oauth-client-id-metadata-
+//      document): the server fetches that document, under an SSRF guard, to
+//      learn the client's name and redirect URIs.
 //   3. It sends the user to GET /oauth/authorize with a PKCE S256 challenge
 //      (RFC 7636). The user signs in with X if needed and approves on the
 //      consent page; POST /api/oauth/decision issues a five-minute, single-use
@@ -97,6 +102,9 @@ export function authorizationServerMetadata() {
     // RFC 9207: every authorization response carries iss, so a client talking to
     // several servers can tell which one answered (mix-up attacks).
     authorization_response_iss_parameter_supported: true,
+    // A client may use the https URL of its metadata document as client_id
+    // instead of registering. With "none" above, this is what claude.ai checks.
+    client_id_metadata_document_supported: true,
   };
 }
 
@@ -276,6 +284,17 @@ export interface OAuthClient {
   client_id: string;
   client_name: string;
   redirect_uris: string[];
+  /**
+   * For a client whose client_id is the URL of its metadata document, that
+   * URL's host: the site that published the name. Null for a client
+   * registered here.
+   */
+  host: string | null;
+}
+
+/** How to name a client to the user: its name, plus the publishing host for a metadata-document client. */
+export function clientLabel(client: Pick<OAuthClient, "client_name" | "host">): string {
+  return client.host ? `${client.client_name} (${client.host})` : client.client_name;
 }
 
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
@@ -332,6 +351,9 @@ export function redirectUriMatches(registered: readonly string[], requested: str
   return wanted !== null && registered.some((uri) => loopbackWithoutPort(uri) === wanted);
 }
 
+/** Whether a redirect URI leads to a program on the user's own machine (http on a loopback host). */
+export const isLoopbackRedirect = (uri: string) => loopbackWithoutPort(uri) !== null;
+
 /**
  * A client-supplied name made safe to show on the consent page: control
  * characters become spaces, invisible formatting characters (bidi overrides,
@@ -350,9 +372,18 @@ export function sanitizeClientName(raw: unknown): string {
 /** A fresh client_id: 32 random bytes in base64url. */
 export const newClientId = () => randomBytes(32).toString("base64url");
 
-/** The registered client, or null when there is no such client. Throws only when the database can't be asked. */
+/**
+ * The client's oauth_clients row, or null when there is none: a client that
+ * registered here, or one known by its metadata document URL that a user has
+ * approved (see findClient, which the authorization request uses instead).
+ * The token endpoint asks this, so it never fetches anything. Throws only when
+ * the database can't be asked.
+ */
 export async function getClient(clientId: string | null | undefined): Promise<OAuthClient | null> {
-  if (!clientId || !CLIENT_ID_SHAPE.test(clientId)) return null; // not one of ours: no lookup
+  if (!clientId) return null;
+  const byUrl = isUrlClientId(clientId);
+  // Not one of ours: no lookup.
+  if (byUrl ? clientIdUrlProblem(clientId) !== null : !CLIENT_ID_SHAPE.test(clientId)) return null;
   const { data, error } = await db()
     .from("oauth_clients")
     .select("client_id, client_name, redirect_uris")
@@ -364,6 +395,7 @@ export async function getClient(clientId: string | null | undefined): Promise<OA
     client_id: String(data.client_id),
     client_name: sanitizeClientName(data.client_name),
     redirect_uris: Array.isArray(data.redirect_uris) ? data.redirect_uris.filter((u: unknown) => typeof u === "string") : [],
+    host: byUrl ? new URL(clientId).host : null,
   };
 }
 
@@ -376,12 +408,329 @@ export async function touchClient(clientId: string): Promise<void> {
   if (error) console.error("oauth: last_used_at update failed for a client:", error.message);
 }
 
+/** Client metadata (RFC 7591 §2) that passed the checks both registration and metadata documents apply. */
+export interface ClientMetadata {
+  client_name: string;
+  redirect_uris: string[];
+  grant_types: string[];
+  response_types: string[];
+}
+
+const GRANT_TYPES = ["authorization_code", "refresh_token"];
+
+const isStringArray = (value: unknown): value is string[] =>
+  Array.isArray(value) && value.every((item) => typeof item === "string");
+
+/**
+ * Client metadata from a registration request or a client metadata document,
+ * checked the same way for both: 1 to MAX_REDIRECT_URIS redirect URIs under
+ * the redirect rules, a public client (token_endpoint_auth_method "none" or
+ * absent), only the code flow and refresh. Otherwise the RFC 7591 error to
+ * answer with; `description` is always our own wording.
+ */
+export function parseClientMetadata(raw: unknown): ClientMetadata | { error: OAuthErrorCode; description: string } {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return { error: "invalid_client_metadata", description: "Expected a JSON object with redirect_uris" };
+  }
+  const body = raw as Record<string, unknown>;
+
+  const uris = body.redirect_uris;
+  if (!Array.isArray(uris) || uris.length < 1 || uris.length > MAX_REDIRECT_URIS) {
+    return {
+      error: "invalid_redirect_uri",
+      description: `redirect_uris must be a list of 1 to ${MAX_REDIRECT_URIS} absolute URLs`,
+    };
+  }
+  for (const uri of uris) {
+    const problem = redirectUriProblem(uri);
+    if (problem) return { error: "invalid_redirect_uri", description: problem };
+  }
+
+  const method = body.token_endpoint_auth_method;
+  if (method !== undefined && method !== null && method !== "none") {
+    return {
+      error: "invalid_client_metadata",
+      description: 'token_endpoint_auth_method must be "none": this server only accepts public clients (use PKCE)',
+    };
+  }
+
+  let grantTypes = GRANT_TYPES;
+  if (body.grant_types !== undefined && body.grant_types !== null) {
+    if (!isStringArray(body.grant_types) || body.grant_types.some((g) => !GRANT_TYPES.includes(g))) {
+      return {
+        error: "invalid_client_metadata",
+        description: 'grant_types may only contain "authorization_code" and "refresh_token"',
+      };
+    }
+    grantTypes = [...new Set(body.grant_types)];
+  }
+
+  if (body.response_types !== undefined && body.response_types !== null) {
+    if (!isStringArray(body.response_types) || body.response_types.some((r) => r !== "code")) {
+      return { error: "invalid_client_metadata", description: 'response_types may only contain "code"' };
+    }
+  }
+
+  if (body.scope !== undefined && body.scope !== null && typeof body.scope !== "string") {
+    return { error: "invalid_client_metadata", description: "scope must be a space-separated string" };
+  }
+  if (body.client_name !== undefined && body.client_name !== null && typeof body.client_name !== "string") {
+    return { error: "invalid_client_metadata", description: "client_name must be a string" };
+  }
+
+  return {
+    client_name: sanitizeClientName(body.client_name),
+    redirect_uris: [...new Set(uris as string[])],
+    grant_types: grantTypes,
+    response_types: ["code"],
+  };
+}
+
+// --- Client ID Metadata Documents ---------------------------------------------
+//
+// draft-ietf-oauth-client-id-metadata-document, which the MCP authorization
+// spec adopts: a client may skip registration and send the https URL of a
+// JSON document about itself as its client_id. The authorization request
+// (authorize, the consent page, the decision) reads the client from that
+// document, fetched under the SSRF guard in ssrf.ts and cached in memory for
+// five minutes, so a changed document takes effect at the next sign-in. When
+// the user approves, the client gets an ordinary oauth_clients row keyed by
+// the URL (rememberMetadataClient): oauth_codes references that table, and the
+// token endpoint, revocation and pruning then treat it like any registered
+// client without fetching anything.
+
+/** How long a validated client metadata document is used before it is fetched again. */
+export const CLIENT_METADATA_TTL_MS = 5 * 60 * 1000;
+/** The most of a client metadata document that is read: the draft's recommended limit (§5). */
+export const CLIENT_METADATA_MAX_BYTES = 5 * 1024;
+/** How long fetching one may take, DNS included. */
+export const CLIENT_METADATA_TIMEOUT_MS = 5000;
+/** At most this many documents are cached; a new one pushes out the oldest. */
+const CLIENT_METADATA_CACHE_MAX = 500;
+
+/** Why a client metadata document can't be used, in our own words for the error page. Never request input. */
+export const METADATA_PROBLEMS = {
+  url: "The app's client ID is a web address this server can't use: it must be an https address with a path, and no fragment, user name or dot segments.",
+  privateHost: "The app's client ID points to a private or local network address, which this server won't fetch.",
+  unresolvable: "The app's client ID points to a host that doesn't exist.",
+  unreachable: "The app's client metadata document couldn't be fetched from its client ID address.",
+  timeout: `The app's client metadata document didn't arrive within ${CLIENT_METADATA_TIMEOUT_MS / 1000} seconds.`,
+  status: "The app's client ID address answered with an error instead of its client metadata document.",
+  redirect: "The app's client ID address redirected elsewhere; its client metadata document must be served there directly.",
+  tooLarge: `The app's client metadata document is larger than ${CLIENT_METADATA_MAX_BYTES / 1024} KB.`,
+  notJson: "The app's client metadata document isn't a JSON object.",
+  clientIdMismatch: "The app's client metadata document names a different client_id than the address it came from.",
+  secret: "The app's client metadata document includes a client secret; this server only accepts public clients.",
+  noName: "The app's client metadata document has no client_name.",
+  invalid: (description: string) => `The app's client metadata document is invalid: ${description}.`,
+} as const;
+
+/** Whether a client_id is a URL (scheme and colon) rather than an id this server issued, which never has a colon. */
+export const isUrlClientId = (clientId: string) => /^[A-Za-z][A-Za-z0-9+.-]*:/.test(clientId);
+
+/**
+ * Why a URL client_id can't name a metadata document, or null when it can:
+ * https; already in the form the URL parser gives it, which rules out dot
+ * segments, a default port, an upper-case host and a missing path (the
+ * document's client_id must match it character for character); no fragment
+ * or user name; and a host that isn't private or local by its text alone. The
+ * addresses it resolves to are checked when the document is fetched.
+ */
+export function clientIdUrlProblem(raw: string): string | null {
+  if (raw.length > REDIRECT_URI_MAX || /[\u0000- \u007f]/.test(raw)) return METADATA_PROBLEMS.url;
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return METADATA_PROBLEMS.url;
+  }
+  if (url.protocol !== "https:" || url.href !== raw || url.hash || raw.includes("#") || url.username || url.password) {
+    return METADATA_PROBLEMS.url;
+  }
+  if (isReservedHostname(url.hostname)) return METADATA_PROBLEMS.privateHost;
+  return null;
+}
+
+type MetadataResult = { client: OAuthClient } | { problem: string };
+
+/**
+ * The client a fetched metadata document describes, or why it can't be used.
+ * The document is untrusted: its client_id must equal the URL it came from
+ * exactly; it may carry no client secret; it must name the client; and the
+ * rest goes through parseClientMetadata like a registration, so the name is
+ * sanitized and capped and every redirect URI follows the usual rules.
+ */
+export function clientFromMetadataDocument(clientId: string, raw: unknown): MetadataResult {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return { problem: METADATA_PROBLEMS.notJson };
+  const doc = raw as Record<string, unknown>;
+  if (doc.client_id !== clientId) return { problem: METADATA_PROBLEMS.clientIdMismatch };
+  if (doc.client_secret !== undefined || doc.client_secret_expires_at !== undefined) {
+    return { problem: METADATA_PROBLEMS.secret };
+  }
+  if (typeof doc.client_name !== "string") return { problem: METADATA_PROBLEMS.noName };
+  const metadata = parseClientMetadata(doc);
+  if ("error" in metadata) return { problem: METADATA_PROBLEMS.invalid(metadata.description) };
+  return {
+    client: {
+      client_id: clientId,
+      client_name: metadata.client_name,
+      redirect_uris: metadata.redirect_uris,
+      host: new URL(clientId).host,
+    },
+  };
+}
+
+/** `promise`, or a rejection as soon as `signal` aborts (dns.lookup itself can't be cancelled). */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    if (signal.aborted) return reject(signal.reason);
+    signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    promise.then(resolve, reject);
+  });
+}
+
+/** The body as text, or null once it passes `max` bytes (declared or actually read); stops reading there. */
+async function readCapped(res: Response, max: number): Promise<string | null> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {});
+    return null;
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      return null;
+    }
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+/**
+ * Fetches and checks the metadata document at `clientId`, a URL that passed
+ * clientIdUrlProblem: every address the host resolves to must be public; one
+ * GET with Accept: application/json, never cached by Next and never following
+ * a redirect; only a 200 counts; at most CLIENT_METADATA_MAX_BYTES read; all
+ * within CLIENT_METADATA_TIMEOUT_MS.
+ */
+async function fetchMetadataDocument(clientId: string): Promise<MetadataResult> {
+  const url = new URL(clientId);
+  const signal = AbortSignal.timeout(CLIENT_METADATA_TIMEOUT_MS);
+  try {
+    const host = await untilAborted(checkPublicHost(url.hostname), signal);
+    if (host === "special-use") return { problem: METADATA_PROBLEMS.privateHost };
+    if (host === "unresolvable") return { problem: METADATA_PROBLEMS.unresolvable };
+
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      redirect: "manual",
+      cache: "no-store",
+      signal,
+    });
+    if (res.status !== 200) {
+      await res.body?.cancel().catch(() => {});
+      return { problem: res.status >= 300 && res.status < 400 ? METADATA_PROBLEMS.redirect : METADATA_PROBLEMS.status };
+    }
+    const text = await readCapped(res, CLIENT_METADATA_MAX_BYTES);
+    if (text === null) return { problem: METADATA_PROBLEMS.tooLarge };
+    let raw: unknown;
+    try {
+      raw = JSON.parse(text);
+    } catch {
+      return { problem: METADATA_PROBLEMS.notJson };
+    }
+    return clientFromMetadataDocument(clientId, raw);
+  } catch (err) {
+    const timedOut = signal.aborted || (err as { name?: unknown } | null)?.name === "TimeoutError";
+    return { problem: timedOut ? METADATA_PROBLEMS.timeout : METADATA_PROBLEMS.unreachable };
+  }
+}
+
+interface CachedClient {
+  client: OAuthClient;
+  expiresAt: number;
+}
+
+// On globalThis, so that the authorize route, the consent page and the
+// decision route share one cache even if they were bundled separately.
+const CACHE_KEY = Symbol.for("bookmark-graveyard.oauth.client-metadata");
+
+function metadataCache(): Map<string, CachedClient> {
+  const store = globalThis as typeof globalThis & { [CACHE_KEY]?: Map<string, CachedClient> };
+  return (store[CACHE_KEY] ??= new Map());
+}
+
+/** Empties the client metadata cache. For tests. */
+export function forgetClientMetadata(): void {
+  metadataCache().clear();
+}
+
+/**
+ * The client an authorization request names, as `client`, or null when there
+ * is none. A registered client comes from oauth_clients. A URL client_id comes
+ * from its metadata document, never from the row an earlier approval wrote,
+ * so the redirect URIs it lists now are the ones that count: from the cache
+ * when it was validated in the last five minutes, otherwise fetched. Only a
+ * valid document is cached. `problem` says, in our own words, why a URL
+ * client_id or its document can't be used. Throws only when the database
+ * can't be asked.
+ */
+export async function findClient(clientId: string): Promise<{ client: OAuthClient | null; problem: string | null }> {
+  if (!isUrlClientId(clientId)) return { client: await getClient(clientId), problem: null };
+  const urlProblem = clientIdUrlProblem(clientId);
+  if (urlProblem) return { client: null, problem: urlProblem };
+
+  const cache = metadataCache();
+  const cached = cache.get(clientId);
+  if (cached && cached.expiresAt > Date.now()) return { client: cached.client, problem: null };
+  cache.delete(clientId);
+
+  const result = await fetchMetadataDocument(clientId);
+  if ("problem" in result) return { client: null, problem: result.problem };
+  cache.set(clientId, { client: result.client, expiresAt: Date.now() + CLIENT_METADATA_TTL_MS });
+  // Maps iterate in insertion order: the first key is the oldest entry.
+  while (cache.size > CLIENT_METADATA_CACHE_MAX) cache.delete(cache.keys().next().value!);
+  return { client: result.client, problem: null };
+}
+
+/**
+ * Writes, or refreshes, the oauth_clients row of a client known by its
+ * metadata document, just before its code is stored: oauth_codes references
+ * oauth_clients, and the token endpoint, revokeClientTokens and pruning then
+ * work from the row as for any registered client. Only an approval by a
+ * signed-in, allowed user gets here, so these rows can't be flooded. Throws
+ * when the row can't be saved.
+ */
+export async function rememberMetadataClient(client: OAuthClient): Promise<void> {
+  const { error } = await db()
+    .from("oauth_clients")
+    .upsert(
+      {
+        client_id: client.client_id,
+        client_name: client.client_name,
+        redirect_uris: [...client.redirect_uris],
+        token_endpoint_auth_method: "none",
+      },
+      { onConflict: "client_id" }
+    );
+  if (error) throw new Error(`Couldn't save the client: ${error.message}`);
+}
+
 // --- The authorization request ------------------------------------------------
 
 /** A validated /oauth/authorize request. */
 export interface AuthorizeRequest {
   clientId: string;
   clientName: string;
+  /** The host that published the client's metadata document, or null for a registered client. */
+  clientHost: string | null;
   redirectUri: string;
   scopes: ApiScope[];
   state: string | null;
@@ -422,7 +771,8 @@ export function authorizationResponseUrl(redirectUri: string, params: Record<str
 
 /**
  * Checks an authorization request in the order RFC 6749 §4.1.2.1 asks for:
- * client and redirect URI first, then everything else. Nothing fails with a
+ * client and redirect URI first (a URL client_id is read from its metadata
+ * document, see findClient), then everything else. Nothing fails with a
  * redirect: once the client and redirect URI check out, a failure carries a
  * link back with `error`, `error_description` and `state` for the user to
  * click (RFC 9700 §4.11.2), since anyone can register a client with any
@@ -434,9 +784,9 @@ export async function checkAuthorizeRequest(params: URLSearchParams): Promise<Au
   if (clientIds.length !== 1 || redirectUris.length !== 1) {
     return { ok: false, message: "The request needs exactly one client_id and one redirect_uri.", returnTo: null };
   }
-  const client = await getClient(clientIds[0]);
+  const { client, problem } = await findClient(clientIds[0]);
   if (!client) {
-    return { ok: false, message: "The app asking for access isn't registered here.", returnTo: null };
+    return { ok: false, message: problem ?? "The app asking for access isn't registered here.", returnTo: null };
   }
   const redirectUri = redirectUris[0];
   if (!redirectUriMatches(client.redirect_uris, redirectUri)) {
@@ -485,6 +835,7 @@ export async function checkAuthorizeRequest(params: URLSearchParams): Promise<Au
     request: {
       clientId: client.client_id,
       clientName: client.client_name,
+      clientHost: client.host,
       redirectUri,
       scopes,
       state,
