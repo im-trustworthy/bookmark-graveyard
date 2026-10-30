@@ -26,7 +26,8 @@ import { db } from "@/lib/supabase";
 //  authorization_code: trades a code from /api/oauth/decision plus its PKCE
 //    verifier for an api_tokens row (30 days, tagged with the client) and a
 //    refresh token. A code works once: the request that flips used_at wins,
-//    a replay loses.
+//    a replay loses, and a replay of a code that already produced a token
+//    revokes that token (RFC 6749 §4.1.2: the code may have leaked).
 //  refresh_token: rotates. The same row gets a new access token and a new
 //    refresh token, so the presented pair dies and the Assistants panel keeps
 //    one entry per connected client. Scopes may narrow, never widen.
@@ -91,6 +92,24 @@ async function readParams(req: NextRequest): Promise<URLSearchParams | null> {
   return params;
 }
 
+/**
+ * A code that already produced a token was presented again: treat it as
+ * leaked and revoke that token (RFC 6749 §4.1.2). Logs the token id, never
+ * the code. A failed revoke is logged; the replay is refused either way.
+ */
+async function revokeTokenOfReplayedCode(tokenId: string): Promise<void> {
+  const { error } = await db()
+    .from("api_tokens")
+    .update({ revoked_at: new Date().toISOString() })
+    .eq("id", tokenId)
+    .is("revoked_at", null);
+  if (error) {
+    console.error(`POST /oauth/token: an authorization code was replayed; revoking token ${tokenId} failed:`, error.message);
+  } else {
+    console.error(`POST /oauth/token: an authorization code was replayed; revoked token ${tokenId}`);
+  }
+}
+
 async function exchangeCode(params: URLSearchParams): Promise<Response> {
   const code = params.get("code");
   const redirectUri = params.get("redirect_uri");
@@ -111,13 +130,18 @@ async function exchangeCode(params: URLSearchParams): Promise<Response> {
   const codeHash = hashToken(code);
   const { data: row, error } = await db()
     .from("oauth_codes")
-    .select("code_hash, client_id, user_id, redirect_uri, scopes, code_challenge, expires_at, used_at")
+    .select("code_hash, client_id, user_id, redirect_uri, scopes, code_challenge, expires_at, used_at, token_id")
     .eq("code_hash", codeHash)
     .maybeSingle();
   if (error) throw new Error(`Code lookup failed: ${error.message}`);
   // Unknown, used, expired and another client's codes all read the same.
   const badCode = () => fail("invalid_grant", "The authorization code is invalid, expired or already used");
-  if (!row || row.used_at || isExpired(row.expires_at)) return badCode();
+  if (!row) return badCode();
+  if (row.used_at) {
+    if (row.token_id) await revokeTokenOfReplayedCode(String(row.token_id));
+    return badCode();
+  }
+  if (isExpired(row.expires_at)) return badCode();
   if (row.client_id !== clientId) return badCode();
   if (row.redirect_uri !== redirectUri) return fail("invalid_grant", "redirect_uri doesn't match the authorization request");
   if (pkceChallenge(verifier) !== row.code_challenge) return fail("invalid_grant", "code_verifier doesn't match the code_challenge");
@@ -139,12 +163,19 @@ async function exchangeCode(params: URLSearchParams): Promise<Response> {
   const scopes = normalizeScopes(
     (Array.isArray(row.scopes) ? row.scopes : []).filter((s: unknown): s is ApiScope => s === "read" || s === "write")
   );
-  const { token, refreshToken } = await mintOAuthToken(userId, {
+  const { token, refreshToken, record } = await mintOAuthToken(userId, {
     clientId,
     name: client.client_name,
     scopes,
     expiresInDays: ACCESS_TOKEN_DAYS,
   });
+
+  // Remember which token this code produced, so a replay can revoke it.
+  const { error: linkError } = await db()
+    .from("oauth_codes")
+    .update({ token_id: record.id })
+    .eq("code_hash", codeHash);
+  if (linkError) console.error(`POST /oauth/token: couldn't link token ${record.id} to its code:`, linkError.message);
 
   await touchClient(clientId);
   // Housekeeping: codes are worthless a day after they expire.
