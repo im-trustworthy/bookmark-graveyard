@@ -12,6 +12,7 @@ import {
 import { describeSync, formatRange } from "@/lib/dashboard-text";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import AssistantSettings from "./assistant-settings";
 import VoiceSettings from "./voice-settings";
 
 // What the picker offers. There is no audio-only: the markdown is always written first and the
@@ -995,6 +996,9 @@ export default function Dashboard({
 
         {/* Voices */}
         <VoiceSettings />
+
+        {/* Assistants (MCP connector tokens) */}
+        <AssistantSettings />
 
         {/* Create button */}
         <div className="space-y-3">

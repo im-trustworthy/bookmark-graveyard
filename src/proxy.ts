@@ -18,7 +18,19 @@ const GATE_VALUE = "gate-ok";
 //  /gate + /api/gate — the wall itself
 //  /api/cron/…       — server-to-server, protected by its own CRON_SECRET bearer
 //  /icon             — generated favicon (fetched by the browser on /gate too)
-const OPEN_PATHS = [/^\/gate$/, /^\/api\/gate$/, /^\/api\/cron\//, /^\/icon$/];
+//  /api/mcp          — the assistant connector; carries its own lock (a personal
+//                      access token, bearer only)
+//  /api/episodes/<id>/audio|markdown — stable links an assistant shares; each
+//                      carries its own lock (the session cookie or a bearer token)
+// /.well-known/… never gets here: the matcher below skips any path with a dot.
+const OPEN_PATHS = [
+  /^\/gate$/,
+  /^\/api\/gate$/,
+  /^\/api\/cron\//,
+  /^\/icon$/,
+  /^\/api\/mcp$/,
+  /^\/api\/episodes\/[^/]+\/(audio|markdown)$/,
+];
 
 function hasValidGateCookie(req: NextRequest): boolean {
   const secret = process.env.SESSION_SECRET;

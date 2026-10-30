@@ -12,6 +12,7 @@ const DEFAULT_LIMITS: Record<string, number> = {
   digest_render: 500, // TTS chunk calls (≈ 12 briefs × ~20 chunks + resumes)
   voice_list: 120, // voice-catalog fetches from the Voices panel (saving settings re-checks the key)
   voice_preview: 60, // one-sentence voice previews
+  mcp_call: 1000, // assistant (MCP) tool calls: a brake on a runaway client, not a spend cap
 };
 
 function limitFor(kind: string): number {
