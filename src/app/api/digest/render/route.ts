@@ -1,14 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
-import { renderPodcast, LINES_PER_CALL } from "@/lib/tts";
-import { checkUsage } from "@/lib/limits";
+import { DigestStageError, renderChunk } from "@/lib/digest";
 import { apiError } from "@/lib/errors";
 import { InvalidVoiceKeyError, VoiceConfigError, VoiceVendorError } from "@/lib/voice";
-import { getVoiceProviderForUser, pinnedVoiceFrom } from "@/lib/voice/user";
-import type { ScriptLine } from "@/lib/brain";
+import { stageErrorResponse } from "../shared";
 
 export const maxDuration = 300;
+
+const CONTEXT = "Digest render error";
 
 // Stage 3 (audio): render the next chunk of script lines to an MP3 segment.
 // The client loops, advancing `cursor`, so each request stays ~30-60s.
@@ -20,92 +19,18 @@ export async function POST(req: NextRequest) {
   if (!episodeId) return NextResponse.json({ error: "episodeId required" }, { status: 400 });
 
   try {
-    const { data: episode } = await db()
-      .from("episodes")
-      .select("id, script, markdown_path, status, render_cursor, voice")
-      .eq("user_id", userId)
-      .eq("id", episodeId)
-      .single();
-    const script = (episode?.script ?? []) as ScriptLine[];
-    if (!episode || script.length === 0) {
-      return NextResponse.json({ error: "Episode has no script" }, { status: 404 });
-    }
-    // Only an unfinished draft is resumable — a 'ready' episode's script is
-    // never cleared, so without this a replayed/late call would silently
-    // re-render (and re-bill) audio against a finished brief.
-    if (episode.status !== "draft") {
-      return apiError("Digest render error", "episode not draft", "Episode is not resumable", 409);
-    }
-
-    const start = Math.max(0, cursor);
-
-    // Forward-only: render_cursor is a persisted high-water mark, so only the
-    // current frontier chunk (one chunk-width behind it) may be re-rendered —
-    // that's exactly the "redo the last, possibly-partial chunk" resume move
-    // the client makes (see deriveDigestStage). Anything further back is a
-    // replay (stale tab, leaked session, retried request) against a chunk
-    // that's already landed and already been paid for.
-    if (start < episode.render_cursor - LINES_PER_CALL) {
-      return apiError("Digest render error", "stale render cursor", "Stale render cursor", 409);
-    }
-
-    const chunk = script.slice(start, start + LINES_PER_CALL);
-    if (chunk.length === 0) {
-      return NextResponse.json({ nextCursor: script.length, totalLines: script.length, done: true });
-    }
-
-    // The voices this episode started with (when pinned), with the user's key or
-    // the instance's. Resolved before the usage gate so a broken voice config
-    // doesn't burn a slot on every retry.
-    const provider = await getVoiceProviderForUser(userId, pinnedVoiceFrom(episode.voice));
-
-    // Gate right before the paid TTS call, after all the free checks above.
-    await checkUsage(userId, "digest_render");
-
-    // Pass neighbors for prosody continuity across chunk boundaries
-    const mp3 = await renderPodcast(
-      chunk,
-      undefined,
-      { previousLine: script[start - 1]?.line, nextLine: script[start + chunk.length]?.line },
-      provider
-    );
-
-    const base = episode.markdown_path!.replace(/\/brief\.md$/, "");
-    const chunkPath = `${base}/chunks/${String(start).padStart(5, "0")}.mp3`;
-    const { error } = await db()
-      .storage.from("episodes")
-      .upload(chunkPath, mp3, { contentType: "audio/mpeg", upsert: true });
-    if (error) throw new Error(`Chunk upload failed: ${error.message}`);
-
-    const nextCursor = start + chunk.length;
-
-    // Guarded update: only ever advances render_cursor, never regresses it.
-    // The `lt` filter is evaluated against the live row at execution time, so
-    // this stays a correct monotonic high-water mark even if two chunk
-    // uploads for the same episode race (e.g. two tabs both resuming).
-    const { error: cursorErr } = await db()
-      .from("episodes")
-      .update({ render_cursor: nextCursor })
-      .eq("user_id", userId)
-      .eq("id", episodeId)
-      .lt("render_cursor", nextCursor);
-    if (cursorErr) throw new Error(`Cursor update failed: ${cursorErr.message}`);
-
-    return NextResponse.json({
-      nextCursor,
-      totalLines: script.length,
-      done: nextCursor >= script.length,
-    });
+    return NextResponse.json(await renderChunk(userId, episodeId, cursor));
   } catch (err) {
+    if (err instanceof DigestStageError) return stageErrorResponse(CONTEXT, err);
     // Voice setup problems are the user's to fix; their messages name the setting, never a secret.
-    if (err instanceof VoiceConfigError) return apiError("Digest render error", err, err.message, 400);
+    if (err instanceof VoiceConfigError) return apiError(CONTEXT, err, err.message, 400);
     if (err instanceof InvalidVoiceKeyError) {
-      return apiError("Digest render error", err, "The voice provider rejected the API key — update it under Voices", 400);
+      return apiError(CONTEXT, err, "The voice provider rejected the API key — update it under Voices", 400);
     }
     if (err instanceof VoiceVendorError && (err.status === 401 || err.status === 403)) {
       const message = "The voice provider refused the request — check that account's credits and permissions";
-      return apiError("Digest render error", err, message, 502);
+      return apiError(CONTEXT, err, message, 502);
     }
-    return apiError("Digest render error", err, "Audio rendering failed");
+    return apiError(CONTEXT, err, "Audio rendering failed");
   }
 }
