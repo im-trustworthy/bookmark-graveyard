@@ -1,6 +1,7 @@
 // In-memory stand-in for the supabase-js client, covering only the calls this
 // app makes: from(table) with select/insert/upsert/update/delete, eq/is/lt and
-// not(column, "is", value) filters, order/limit (ignored), then
+// not(column, "is", value) filters, order/limit (applied to selects, nulls
+// placed as Postgres does), then
 // maybeSingle()/single() or a plain await; rpc() into Postgres functions the
 // test registers in `functions` (an unregistered one errors, as a missing
 // function does); plus storage uploads and removals. Like PostgREST,
@@ -65,6 +66,8 @@ class FakeQuery implements PromiseLike<Result> {
   private columns: string[] | null = null; // null = every column
   private mode: "many" | "single" | "maybeSingle" = "many";
   private filters: ((row: Row) => boolean)[] = [];
+  private sorts: { column: string; ascending: boolean; nullsFirst: boolean }[] = [];
+  private max: number | null = null;
 
   constructor(
     private db: FakeDb,
@@ -112,10 +115,14 @@ class FakeQuery implements PromiseLike<Result> {
     this.filters.push((row) => (row[column] ?? null) !== value);
     return this;
   }
-  order() {
+  order(column: string, options: { ascending?: boolean; nullsFirst?: boolean } = {}) {
+    const ascending = options.ascending ?? true;
+    // Postgres puts nulls last ascending and first descending unless told otherwise.
+    this.sorts.push({ column, ascending, nullsFirst: options.nullsFirst ?? !ascending });
     return this;
   }
-  limit() {
+  limit(count: number) {
+    this.max = count;
     return this;
   }
   maybeSingle() {
@@ -139,7 +146,8 @@ class FakeQuery implements PromiseLike<Result> {
     const matches = (row: Row) => this.filters.every((f) => f(row));
     let result: Row[];
     if (this.op === "select") {
-      result = table.filter(matches);
+      result = this.sorted(table.filter(matches));
+      if (this.max !== null) result = result.slice(0, this.max);
     } else if (this.op === "insert") {
       result = this.rows.map((row) => ({ id: `${this.table}-${table.length + 1}`, ...row }));
       table.push(...result);
@@ -166,5 +174,20 @@ class FakeQuery implements PromiseLike<Result> {
       return { data: null, error: { message: `expected 1 row, got ${result.length}` } };
     }
     return { data: result[0] ? project(result[0]) : null, error: null };
+  }
+
+  private sorted(rows: Row[]): Row[] {
+    if (this.sorts.length === 0) return rows;
+    return [...rows].sort((a, b) => {
+      for (const { column, ascending, nullsFirst } of this.sorts) {
+        const x = a[column] ?? null;
+        const y = b[column] ?? null;
+        if (x === y) continue;
+        if (x === null) return nullsFirst ? -1 : 1;
+        if (y === null) return nullsFirst ? 1 : -1;
+        return (x < y ? -1 : 1) * (ascending ? 1 : -1);
+      }
+      return 0;
+    });
   }
 }
