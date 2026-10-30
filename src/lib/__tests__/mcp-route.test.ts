@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CLIENT_CAPABILITIES_META_KEY,
   CLIENT_INFO_META_KEY,
@@ -12,7 +12,17 @@ import type { FakeDb } from "./fake-db";
 // answered over SSE) and 2026-07-28 (a per-request _meta envelope plus Mcp-Method/Mcp-Name headers,
 // answered as JSON). Auth is a token minted into the fake db. The session cookie is mocked to a signed-in
 // user throughout, to show the route never looks at it.
-const state = vi.hoisted(() => ({ db: null as unknown }));
+// The route reads APP_URL once at module load, so it is set (with a trailing slash, which must be dropped)
+// before the route is imported, and restored when the file is done.
+const state = vi.hoisted(() => {
+  const originalAppUrl = process.env.APP_URL;
+  process.env.APP_URL = "https://graveyard.example/";
+  return { db: null as unknown, originalAppUrl };
+});
+afterAll(() => {
+  if (state.originalAppUrl === undefined) delete process.env.APP_URL;
+  else process.env.APP_URL = state.originalAppUrl;
+});
 vi.mock("@/lib/supabase", () => ({ db: () => state.db }));
 vi.mock("@/lib/session", () => ({ getSessionUserId: async () => "u1" }));
 
@@ -185,12 +195,17 @@ describe("POST /api/mcp, 2026-07-28 client", () => {
 describe("auth", () => {
   const listTools = { jsonrpc: "2.0", id: 1, method: "tools/list", params: {} };
 
-  it("answers no token with 401 and a challenge pointing at the protected resource metadata", async () => {
-    const res = await post(listTools, { "mcp-protocol-version": LEGACY });
+  it("answers no token with 401 and a challenge pointing at APP_URL's protected resource metadata", async () => {
+    // A forwarded host (or the request's own URL) must not move the metadata address off APP_URL.
+    const res = await post(listTools, {
+      "mcp-protocol-version": LEGACY,
+      "x-forwarded-host": "attacker.example",
+      "x-forwarded-proto": "https",
+    });
     expect(res.status).toBe(401);
-    const challenge = res.headers.get("www-authenticate") ?? "";
-    expect(challenge).toMatch(/^Bearer /);
-    expect(challenge).toContain('resource_metadata="http://localhost/.well-known/oauth-protected-resource"');
+    expect(res.headers.get("www-authenticate")).toBe(
+      'Bearer error="invalid_token", error_description="No authorization provided", resource_metadata="https://graveyard.example/.well-known/oauth-protected-resource"'
+    );
   });
 
   it("ignores the session cookie: a signed-in browser without a bearer token still gets 401", async () => {
