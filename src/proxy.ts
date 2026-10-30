@@ -22,6 +22,12 @@ const GATE_VALUE = "gate-ok";
 //                      access token, bearer only)
 //  /api/episodes/<id>/audio|markdown — stable links an assistant shares; each
 //                      carries its own lock (the session cookie or a bearer token)
+//  /oauth/…          — OAuth for web chat assistants: /oauth/token and
+//                      /oauth/register are public machine endpoints that
+//                      assistants call server to server, and /oauth/authorize
+//                      (with its consent page) requires the X sign-in itself
+//  /api/oauth/decision — the consent form's POST; it needs the session cookie
+//                      and a signed, user-bound consent blob
 // /.well-known/… never gets here: the matcher below skips any path with a dot.
 const OPEN_PATHS = [
   /^\/gate$/,
@@ -30,6 +36,8 @@ const OPEN_PATHS = [
   /^\/icon$/,
   /^\/api\/mcp$/,
   /^\/api\/episodes\/[^/]+\/(audio|markdown)$/,
+  /^\/oauth\//,
+  /^\/api\/oauth\/decision$/,
 ];
 
 function hasValidGateCookie(req: NextRequest): boolean {
