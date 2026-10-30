@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeDb } from "./fake-db";
 import type { FakeDb } from "./fake-db";
@@ -31,6 +32,8 @@ import {
   maybeRescheduleBriefJob,
   runBriefJob,
   scheduleBriefJob,
+  TOKEN_REVOKED_MESSAGE,
+  USER_NOT_ALLOWED_MESSAGE,
   validateBriefJobInput,
 } from "@/lib/jobs";
 import type { BriefJobParams } from "@/lib/jobs";
@@ -97,9 +100,17 @@ function draftEpisode(id: string, extra: Row = {}): Row {
   };
 }
 
-/** The fake project: tables, a claim_brief_job that behaves like the SQL, record_usage, chunk listings. */
-function project({ jobs = [], episodes = [] }: { jobs?: Row[]; episodes?: Row[] } = {}) {
-  fake = createFakeDb({ brief_jobs: jobs, episodes });
+/**
+ * The fake project: tables (the job's user is allowed, its token live), a claim_brief_job that behaves
+ * like the SQL (a fresh lease_id on every claim), record_usage, chunk listings.
+ */
+function project({
+  jobs = [],
+  episodes = [],
+  users = [{ id: USER, is_allowed: true }],
+  tokens = [{ id: "tok-1", user_id: USER, revoked_at: null, expires_at: null }],
+}: { jobs?: Row[]; episodes?: Row[]; users?: Row[]; tokens?: Row[] } = {}) {
+  fake = createFakeDb({ brief_jobs: jobs, episodes, users, api_tokens: tokens });
   fake.functions.claim_brief_job = vi.fn((args: Record<string, unknown>) => {
     const row = fake.tables.brief_jobs.find((r) => r.id === args.p_job_id);
     if (!row) return [];
@@ -107,7 +118,7 @@ function project({ jobs = [], episodes = [] }: { jobs?: Row[]; episodes?: Row[] 
     const stale = row.status === "running" && row.heartbeat_at !== null && Date.parse(row.heartbeat_at as string) < staleBefore;
     if (row.status !== "queued" && !stale) return [];
     const now = new Date().toISOString();
-    Object.assign(row, { status: "running", heartbeat_at: now, started_at: row.started_at ?? now });
+    Object.assign(row, { status: "running", heartbeat_at: now, started_at: row.started_at ?? now, lease_id: randomUUID() });
     return [{ ...row }];
   });
   fake.functions.record_usage = vi.fn((args: Record<string, unknown>) => {
@@ -521,6 +532,213 @@ describe("runBriefJob: failures", () => {
     expect(job()).toMatchObject({ status: "failed", stage: "failed", error: message, finished_at: expect.any(String) });
     expect(episode("ep-1")).toEqual(before);
     expect(console.error).toHaveBeenCalledWith("Brief job job-1 failed:", expect.any(Error));
+  });
+});
+
+// Revoking a token in the Assistants panel, or taking a user off the allowlist, must stop the briefs they
+// already started, not just new ones: the runner checks before every step that costs money.
+describe("runBriefJob: a revoked token or a disallowed user stops the job", () => {
+  const revokeToken = () => void (fake.tables.api_tokens[0].revoked_at = new Date().toISOString());
+  const disallowUser = () => void (fake.tables.users[0].is_allowed = false);
+
+  /** Has `lose` happen as the paid call of the given stage finishes (on its `nth` call). */
+  function loseDuring(stage: "prepare" | "script" | "render", lose: () => void, nth = 1) {
+    let n = 0;
+    const once = () => ++n === nth && lose();
+    if (stage === "prepare") {
+      const real = vi.mocked(prepareBrief).getMockImplementation()!;
+      vi.mocked(prepareBrief).mockImplementation(async (...args) => {
+        const out = await real(...args);
+        once();
+        return out;
+      });
+    } else if (stage === "script") {
+      const real = vi.mocked(scriptBrief).getMockImplementation()!;
+      vi.mocked(scriptBrief).mockImplementation(async (...args) => {
+        const out = await real(...args);
+        once();
+        return out;
+      });
+    } else {
+      const real = vi.mocked(renderChunk).getMockImplementation()!;
+      vi.mocked(renderChunk).mockImplementation(async (...args) => {
+        const out = await real(...args);
+        once();
+        return out;
+      });
+    }
+  }
+
+  const podcast = (extra: Row = {}) => project({ jobs: [jobRow({ token_id: "tok-1", ...extra })] });
+
+  it("checks right after the claim: a token revoked before the run starts spends nothing, not even the sync", async () => {
+    podcast({ params: { format: "both", targetMinutes: 15, syncFirst: true } });
+    revokeToken();
+    await runBriefJob("job-1");
+    expect(calls).toEqual([]);
+    expect(usage).toEqual([]);
+    expect(job()).toMatchObject({ status: "failed", stage: "failed", error: TOKEN_REVOKED_MESSAGE });
+  });
+
+  it.each([
+    ["the script", "prepare", 1, ["select", "prepare:writing"]],
+    ["the render loop", "script", 1, ["select", "prepare:writing", "script:scripting:15"]],
+    [
+      "the next chunk",
+      "render",
+      1,
+      ["select", "prepare:writing", "script:scripting:15", "render:rendering:0:0/30"],
+    ],
+    [
+      "publishing",
+      "render",
+      3,
+      [
+        "select",
+        "prepare:writing",
+        "script:scripting:15",
+        "render:rendering:0:0/30",
+        "render:rendering:12:12/30",
+        "render:rendering:24:24/30",
+      ],
+    ],
+  ] as const)("a token revoked mid-run stops the job before %s", async (_label, stage, nth, expected) => {
+    podcast();
+    loseDuring(stage, revokeToken, nth);
+    await runBriefJob("job-1");
+    expect(calls).toEqual(expected);
+    expect(finalizeBrief).not.toHaveBeenCalled();
+    expect(job()).toMatchObject({
+      status: "failed",
+      stage: "failed",
+      error: TOKEN_REVOKED_MESSAGE,
+      episode_id: "ep-new",
+      finished_at: expect.any(String),
+    });
+    // The draft stays as it was, resumable from the dashboard.
+    expect(episode("ep-new").status).toBe("draft");
+  });
+
+  it("an expired token, or one whose row is gone, stops it the same way", async () => {
+    podcast();
+    fake.tables.api_tokens[0].expires_at = new Date(Date.now() - 1000).toISOString();
+    await runBriefJob("job-1");
+    expect(calls).toEqual([]);
+    expect(job()).toMatchObject({ status: "failed", error: TOKEN_REVOKED_MESSAGE });
+
+    podcast({ token_id: "tok-gone" });
+    await runBriefJob("job-1");
+    expect(calls).toEqual([]);
+    expect(job()).toMatchObject({ status: "failed", error: TOKEN_REVOKED_MESSAGE });
+  });
+
+  it("a user taken off the allowlist mid-run is stopped too, with or without a token", async () => {
+    podcast();
+    loseDuring("script", disallowUser);
+    await runBriefJob("job-1");
+    expect(renderChunk).not.toHaveBeenCalled();
+    expect(job()).toMatchObject({ status: "failed", error: USER_NOT_ALLOWED_MESSAGE });
+
+    project({ jobs: [jobRow({ token_id: null })], users: [{ id: USER, is_allowed: false }] });
+    calls = [];
+    await runBriefJob("job-1");
+    expect(calls).toEqual([]);
+    expect(job()).toMatchObject({ status: "failed", error: USER_NOT_ALLOWED_MESSAGE });
+  });
+
+  it("a live token and an allowed user run the job to the end", async () => {
+    podcast({ params: { format: "markdown", syncFirst: true } });
+    await runBriefJob("job-1");
+    expect(job()).toMatchObject({ status: "done", error: null });
+  });
+});
+
+// A runner that was only slow (not dead) can be taken over when its heartbeat looks stale. Its writes are
+// fenced on the lease it claimed, so once another runner holds the job it stops at its next write and
+// overwrites nothing.
+describe("runBriefJob: the fenced lease", () => {
+  it("a runner whose lease was taken over stops at its next write; the new lease holder's writes win", async () => {
+    project({ jobs: [jobRow({ token_id: "tok-1" })] });
+    const errorSpy = vi.mocked(console.error);
+    const realPrepare = vi.mocked(prepareBrief).getMockImplementation()!;
+    let firstLease: unknown;
+    vi.mocked(prepareBrief).mockImplementationOnce(async (...args) => {
+      // Runner A is mid-way through the writing pass when its heartbeat goes stale and runner B claims the
+      // job and finishes it.
+      firstLease = job().lease_id;
+      job().heartbeat_at = new Date(Date.now() - 5 * MINUTE).toISOString();
+      await runBriefJob("job-1");
+      expect(job()).toMatchObject({ status: "done", stage: "done", episode_id: "ep-new" });
+      // A's own writing pass then lands, as a second episode.
+      const out = await realPrepare(...args);
+      return { ...out, episode: { ...out.episode, id: "ep-a" } as typeof out.episode };
+    });
+
+    await runBriefJob("job-1"); // runner A
+    expect(job().lease_id).not.toBe(firstLease);
+    // B's outcome stands: A didn't record its episode, didn't script or render, and didn't mark anything.
+    expect(job()).toMatchObject({ status: "done", stage: "done", episode_id: "ep-new", rendered_lines: 30, error: null });
+    expect(calls.filter((c) => c.startsWith("prepare"))).toHaveLength(2);
+    expect(scriptBrief).toHaveBeenCalledTimes(1);
+    expect(finalizeBrief).toHaveBeenCalledTimes(1);
+    // One line for the stop, none for a failure.
+    expect(errorSpy).toHaveBeenCalledWith("Brief job job-1: another runner took the job over; this one stopped");
+    expect(errorSpy).not.toHaveBeenCalledWith("Brief job job-1 failed:", expect.anything());
+  });
+
+  it("a runner that fails after losing its lease doesn't record the failure over the new holder's job", async () => {
+    project({ jobs: [jobRow({ episode_id: "ep-1" })], episodes: [draftEpisode("ep-1", { script: lines(30) })] });
+    vi.mocked(renderChunk).mockImplementationOnce(async () => {
+      job().lease_id = "lease-of-runner-b"; // taken over while this chunk rendered
+      job().stage = "rendering";
+      throw new Error("Chunk upload failed");
+    });
+    await runBriefJob("job-1");
+    expect(job()).toMatchObject({ status: "running", stage: "rendering", lease_id: "lease-of-runner-b", error: null });
+    expect(console.error).toHaveBeenCalledWith("Brief job job-1: another runner took the job over; this one stopped");
+  });
+
+  it("the outcome write is fenced too: a runner taken over during finalize doesn't mark the job done", async () => {
+    project({ jobs: [jobRow({ episode_id: "ep-1" })], episodes: [draftEpisode("ep-1", { script: lines(30) })] });
+    chunkFiles["u1/ep-1/chunks"] = ["00000.mp3", "00012.mp3", "00024.mp3"];
+    const realFinalize = vi.mocked(finalizeBrief).getMockImplementation()!;
+    vi.mocked(finalizeBrief).mockImplementationOnce(async (...args) => {
+      const out = await realFinalize(...args);
+      job().lease_id = "lease-of-runner-b";
+      return out;
+    });
+    await runBriefJob("job-1");
+    expect(job()).toMatchObject({ status: "running", stage: "publishing", finished_at: null });
+  });
+
+  it("the heartbeat is fenced: it never beats over the new holder's lease, and stops", async () => {
+    vi.useFakeTimers({ now: new Date("2026-10-29T12:00:00.000Z") });
+    project({ jobs: [jobRow({ params: { format: "markdown", syncFirst: false } })] });
+    const markdownPrepare = vi.mocked(prepareBrief).getMockImplementation()!;
+    let release = () => {};
+    vi.mocked(prepareBrief).mockImplementation(async (...args) => {
+      await new Promise<void>((resolve) => (release = resolve));
+      return markdownPrepare(...args);
+    });
+
+    const run = runBriefJob("job-1");
+    await vi.advanceTimersByTimeAsync(31_000);
+    expect(job().heartbeat_at).toBe("2026-10-29T12:00:30.000Z");
+    // Runner B takes over and beats on its own schedule.
+    Object.assign(job(), { lease_id: "lease-of-runner-b", heartbeat_at: "2026-10-29T12:00:31.000Z" });
+    await vi.advanceTimersByTimeAsync(5 * MINUTE);
+    expect(job().heartbeat_at).toBe("2026-10-29T12:00:31.000Z");
+
+    release();
+    await run;
+    expect(job()).toMatchObject({ status: "running", episode_id: null, lease_id: "lease-of-runner-b" });
+  });
+
+  it("refuses to run on a claim that hands out no lease (the migration isn't applied)", async () => {
+    project({ jobs: [jobRow()] });
+    fake.functions.claim_brief_job = vi.fn(() => [{ ...job(), status: "running" }]);
+    await expect(runBriefJob("job-1")).rejects.toThrow(/no lease_id/);
+    expect(calls).toEqual([]);
   });
 });
 

@@ -20,10 +20,14 @@ import { db } from "./supabase";
 //      code bound to the client, redirect URI, scopes and challenge.
 //   4. It trades the code and its verifier at POST /oauth/token for an
 //      ordinary api_tokens row (client_id set, 30 days) plus a rotating
-//      refresh token.
+//      refresh token. A rotated-away refresh token presented again revokes
+//      the row, and a refresh after 90 days without use is refused.
 //
 // Codes, access tokens and refresh tokens are stored only as SHA-256 hex and
 // never logged. Every URL here comes from APP_URL, never from a request's Host.
+// Nothing here redirects the browser to a client before the user has acted:
+// a bad authorization request gets an error page with a link back (RFC 9700
+// §4.11), so a registered redirect URI can't turn this domain into a redirector.
 
 export const APP_NAME = "Bookmark Graveyard";
 export const SUPPORTED_SCOPES: readonly ApiScope[] = ["read", "write"];
@@ -32,10 +36,18 @@ export const CODE_TTL_MS = 5 * 60 * 1000;
 export const CONSENT_TTL_MS = 10 * 60 * 1000;
 export const ACCESS_TOKEN_DAYS = 30;
 export const ACCESS_TOKEN_SECONDS = ACCESS_TOKEN_DAYS * 24 * 60 * 60;
-/** Registration answers 503 once this many clients exist (after pruning). */
+/** A refresh is refused once the connection has gone this long without use (API calls and refreshes both count). */
+export const REFRESH_IDLE_DAYS = 90;
+/** At this many registrations, a new one first evicts the oldest registration with no live token. */
 export const MAX_CLIENTS = 1000;
-/** Registrations older than this with no token and no pending code are pruned. */
-export const CLIENT_MAX_AGE_DAYS = 30;
+/** Registrations older than this that never produced a code or a token are pruned. */
+export const CLIENT_UNUSED_MINUTES = 60;
+/** Registrations older than this whose tokens are all revoked, with no pending code, are pruned. */
+export const CLIENT_STALE_DAYS = 30;
+/** How many evictions one registration may make before it registers anyway. */
+export const MAX_EVICTIONS_PER_REGISTRATION = 5;
+/** The largest body /oauth/register and /oauth/token read. */
+export const OAUTH_BODY_MAX = 64 * 1024;
 export const CLIENT_NAME_MAX = 100;
 export const DEFAULT_CLIENT_NAME = "Unnamed client";
 export const MAX_REDIRECT_URIS = 10;
@@ -82,6 +94,9 @@ export function authorizationServerMetadata() {
     grant_types_supported: ["authorization_code", "refresh_token"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
+    // RFC 9207: every authorization response carries iss, so a client talking to
+    // several servers can tell which one answered (mix-up attacks).
+    authorization_response_iss_parameter_supported: true,
   };
 }
 
@@ -137,15 +152,49 @@ export function oauthError(
   return NextResponse.json({ error, error_description: description }, { status, headers });
 }
 
+/**
+ * Whether the request declares a body larger than `max` bytes in Content-Length,
+ * so it can be refused before a byte of it is read. A request without the header
+ * (chunked) passes; the route still checks what it actually read.
+ */
+export function declaresOversizedBody(req: Request, max = OAUTH_BODY_MAX): boolean {
+  const declared = Number(req.headers.get("content-length"));
+  return Number.isFinite(declared) && declared > max;
+}
+
 const escapeHtml = (text: string) =>
   text.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
 
+/** Where a redirect URI leads, for the user to read: its host, or its scheme for an app link (cursor://). */
+export function redirectDestination(redirectUri: string): string {
+  const url = new URL(redirectUri);
+  return url.protocol === "https:" || url.protocol === "http:" ? url.host : url.protocol.replace(/:$/, "");
+}
+
 /**
- * The page shown instead of redirecting when the redirect target can't be
- * trusted (unknown client, unregistered redirect URI) or the request can't be
- * read. `message` is always one of our fixed sentences, never request input.
+ * An error response the user may carry back to the client by clicking a link:
+ * offered only once the client and its redirect URI checked out, and never
+ * followed automatically (RFC 9700 §4.11.2).
  */
-export function oauthErrorPage(message: string, status = 400): Response {
+export interface ReturnLink {
+  /** The redirect URI with error, error_description, state and iss. */
+  href: string;
+  /** Its host or scheme, for "Return to …". */
+  destination: string;
+}
+
+/**
+ * The page shown for a request this server won't act on: an untrusted
+ * redirect target (unknown client, unregistered redirect URI), a request that
+ * can't be read, or any other invalid authorization request. `message` is
+ * always one of our fixed sentences, never request input. With `returnTo`, the
+ * page also offers a plain link back to the client carrying the error; nothing
+ * happens until the user clicks it.
+ */
+export function oauthErrorPage(message: string, status = 400, returnTo: ReturnLink | null = null): Response {
+  const back = returnTo
+    ? `<p><a href="${escapeHtml(returnTo.href)}" rel="noreferrer">Return to ${escapeHtml(returnTo.destination)}</a></p>\n`
+    : "";
   const html = `<!doctype html>
 <html lang="en">
 <head>
@@ -159,6 +208,7 @@ main{max-width:28rem}
 h1{font-size:1.5rem;margin:0 0 .75rem}
 p{color:#a1a1aa;margin:0 0 .75rem}
 .app{text-transform:uppercase;letter-spacing:.08em;font-size:.75rem;color:#71717a}
+a{color:#7dd3fc}
 </style>
 </head>
 <body>
@@ -167,7 +217,7 @@ p{color:#a1a1aa;margin:0 0 .75rem}
 <h1>This connection request can't be completed</h1>
 <p>${escapeHtml(message)}</p>
 <p>Go back to the app you came from and add the connector again.</p>
-</main>
+${back}</main>
 </body>
 </html>
 `;
@@ -343,17 +393,12 @@ export type AuthorizeErrorCode = "invalid_request" | "unsupported_response_type"
 
 export type AuthorizeCheck =
   | { ok: true; request: AuthorizeRequest }
-  /** The redirect target can't be trusted: show an error page, never redirect. */
-  | { ok: false; redirect: false; message: string }
-  /** The client is known and the redirect URI registered: send the error back to it. */
-  | {
-      ok: false;
-      redirect: true;
-      redirectUri: string;
-      error: AuthorizeErrorCode;
-      description: string;
-      state: string | null;
-    };
+  /**
+   * Refused: show an error page with `message`, never redirect. `returnTo` is
+   * set only when the client is known and the redirect URI registered: the
+   * error response, offered as a link the user may click.
+   */
+  | { ok: false; message: string; returnTo: ReturnLink | null };
 
 const AUTHORIZE_PARAMS = [
   "response_type",
@@ -367,34 +412,47 @@ const AUTHORIZE_PARAMS = [
 ];
 
 /**
+ * An authorization response for the client (RFC 6749 §4.1.2): `redirectUri`
+ * with `params` and, per RFC 9207, `iss`, so the client can check which server
+ * answered.
+ */
+export function authorizationResponseUrl(redirectUri: string, params: Record<string, string | null | undefined>): string {
+  return withParams(redirectUri, { ...params, iss: issuer() });
+}
+
+/**
  * Checks an authorization request in the order RFC 6749 §4.1.2.1 asks for:
- * client and redirect URI first (failures there never redirect), then
- * everything else (failures go back to the client with `error` and `state`).
- * Throws only when the database can't be asked.
+ * client and redirect URI first, then everything else. Nothing fails with a
+ * redirect: once the client and redirect URI check out, a failure carries a
+ * link back with `error`, `error_description` and `state` for the user to
+ * click (RFC 9700 §4.11.2), since anyone can register a client with any
+ * redirect URI. Throws only when the database can't be asked.
  */
 export async function checkAuthorizeRequest(params: URLSearchParams): Promise<AuthorizeCheck> {
   const clientIds = params.getAll("client_id");
   const redirectUris = params.getAll("redirect_uri");
   if (clientIds.length !== 1 || redirectUris.length !== 1) {
-    return { ok: false, redirect: false, message: "The request needs exactly one client_id and one redirect_uri." };
+    return { ok: false, message: "The request needs exactly one client_id and one redirect_uri.", returnTo: null };
   }
   const client = await getClient(clientIds[0]);
   if (!client) {
-    return { ok: false, redirect: false, message: "The app asking for access isn't registered here." };
+    return { ok: false, message: "The app asking for access isn't registered here.", returnTo: null };
   }
   const redirectUri = redirectUris[0];
   if (!redirectUriMatches(client.redirect_uris, redirectUri)) {
-    return { ok: false, redirect: false, message: "The app asked to return to an address it didn't register." };
+    return { ok: false, message: "The app asked to return to an address it didn't register.", returnTo: null };
   }
 
   const state = params.get("state");
+  // `description` is always our own wording (the only interpolations are a name
+  // from AUTHORIZE_PARAMS and our resource URL), so the page may show it.
   const fail = (error: AuthorizeErrorCode, description: string): AuthorizeCheck => ({
     ok: false,
-    redirect: true,
-    redirectUri,
-    error,
-    description,
-    state,
+    message: `The app's request can't be accepted: ${description}.`,
+    returnTo: {
+      href: authorizationResponseUrl(redirectUri, { error, error_description: description, state }),
+      destination: redirectDestination(redirectUri),
+    },
   });
 
   const repeated = AUTHORIZE_PARAMS.find((name) => params.getAll(name).length > 1);
@@ -402,7 +460,7 @@ export async function checkAuthorizeRequest(params: URLSearchParams): Promise<Au
 
   const responseType = params.get("response_type");
   if (!responseType) return fail("invalid_request", "response_type is required");
-  if (responseType !== "code") return fail("unsupported_response_type", 'Only response_type "code" is supported');
+  if (responseType !== "code") return fail("unsupported_response_type", 'only response_type "code" is supported');
 
   const codeChallenge = params.get("code_challenge");
   if (!codeChallenge) return fail("invalid_request", "code_challenge is required (PKCE)");
@@ -553,6 +611,16 @@ export async function issueAuthorizationCode(grant: ConsentGrant): Promise<strin
     });
   if (error) throw new Error(`Couldn't save the authorization code: ${error.message}`);
   return code;
+}
+
+/**
+ * Whether a connection last used at `lastUsedAt` has gone REFRESH_IDLE_DAYS
+ * without use, so its refresh token no longer works. An unreadable time counts
+ * as idle.
+ */
+export function isRefreshIdle(lastUsedAt: string, now = Date.now()): boolean {
+  const last = Date.parse(lastUsedAt);
+  return !(now - last < REFRESH_IDLE_DAYS * 24 * 60 * 60 * 1000);
 }
 
 /** Whether the user still exists and is still on the allowlist. Throws only when the database can't be asked. */

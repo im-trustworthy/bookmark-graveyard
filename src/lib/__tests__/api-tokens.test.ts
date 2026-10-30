@@ -15,6 +15,8 @@ import {
   mintApiToken,
   mintOAuthToken,
   revokeApiToken,
+  revokeClientTokens,
+  revokeReusedRefreshToken,
   rotateOAuthToken,
   verifyApiToken,
 } from "@/lib/api-tokens";
@@ -267,7 +269,13 @@ describe("OAuth tokens: mintOAuthToken / findRefreshGrant / rotateOAuthToken", (
       userId: "u1",
       clientId: CLIENT,
       scopes: ["read"],
+      lastUsedAt: T0.toISOString(), // never used yet: when it was minted
     });
+    vi.setSystemTime(T0.getTime() + DAY);
+    await verifyApiToken((await oauthToken(["read"])).token); // another row: no effect on this one
+    expect((await findRefreshGrant(refreshToken))?.lastUsedAt).toBe(T0.toISOString());
+    rowFor(record.id).last_used_at = new Date(T0.getTime() + DAY).toISOString();
+    expect((await findRefreshGrant(refreshToken))?.lastUsedAt).toBe(new Date(T0.getTime() + DAY).toISOString());
     expect(await findRefreshGrant(`bgr_${"A".repeat(43)}`)).toBeNull();
     expect(await findRefreshGrant("bg_nope")).toBeNull();
 
@@ -290,8 +298,46 @@ describe("OAuth tokens: mintOAuthToken / findRefreshGrant / rotateOAuthToken", (
     expect(await verifyApiToken(first.token)).toBeNull();
     expect(await verifyApiToken(rotated.token)).toMatchObject({ scopes: ["read"] });
     expect(await findRefreshGrant(first.refreshToken)).toBeNull();
+    // The replaced refresh token's hash is kept, so a reuse can be recognized.
+    expect(rowFor(first.record.id)).toMatchObject({
+      refresh_token_hash: sha256(rotated.refreshToken),
+      previous_refresh_token_hash: sha256(first.refreshToken),
+    });
 
     expect(await rotateOAuthToken(grant, first.refreshToken, { scopes: ["read"], expiresInDays: 30 })).toBeNull();
+  });
+
+  it("revokes the row when a rotated-away refresh token comes back, and only then", async () => {
+    const first = await oauthToken(["write"]);
+    const bystander = await oauthToken(["read"]);
+    expect(await revokeReusedRefreshToken(first.refreshToken)).toBeNull(); // still current: not a reuse
+    expect(await revokeReusedRefreshToken("bgr_nope")).toBeNull();
+    expect(rowFor(first.record.id).revoked_at ?? null).toBeNull();
+
+    const grant = (await findRefreshGrant(first.refreshToken))!;
+    const rotated = (await rotateOAuthToken(grant, first.refreshToken, { scopes: ["write"], expiresInDays: 30 }))!;
+    vi.setSystemTime(T0.getTime() + DAY);
+    expect(await revokeReusedRefreshToken(first.refreshToken)).toBe(first.record.id);
+    expect(rowFor(first.record.id).revoked_at).toBe(new Date(T0.getTime() + DAY).toISOString());
+    expect(await verifyApiToken(rotated.token)).toBeNull();
+    expect(await findRefreshGrant(rotated.refreshToken)).toBeNull();
+    expect(await verifyApiToken(bystander.token)).not.toBeNull();
+
+    // A second reuse names the row again and keeps the first revocation time.
+    vi.setSystemTime(T0.getTime() + 2 * DAY);
+    expect(await revokeReusedRefreshToken(first.refreshToken)).toBe(first.record.id);
+    expect(rowFor(first.record.id).revoked_at).toBe(new Date(T0.getTime() + DAY).toISOString());
+  });
+
+  it("revokeClientTokens revokes one client's live tokens for one user", async () => {
+    const mine = await oauthToken(["read"]);
+    const other = await mintOAuthToken("u1", { clientId: "d".repeat(43), name: "Other", scopes: ["read"], expiresInDays: 30 });
+    const theirs = await mintOAuthToken("u2", { clientId: CLIENT, name: "Claude", scopes: ["read"], expiresInDays: 30 });
+    const dashboard = await mintApiToken("u1", { name: "Grok", scopes: ["read"] });
+    expect(await revokeClientTokens("u1", CLIENT)).toBe(1);
+    expect(await verifyApiToken(mine.token)).toBeNull();
+    for (const kept of [other, theirs, dashboard]) expect(await verifyApiToken(kept.token)).not.toBeNull();
+    expect(await revokeClientTokens("u1", CLIENT)).toBe(0);
   });
 
   it("refuses to widen", async () => {

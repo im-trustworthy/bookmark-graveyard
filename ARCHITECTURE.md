@@ -226,12 +226,13 @@ browser has no direct database access. Only the server's service-role client tou
 | `usage_events` | One row per spend-incurring action, and per assistant tool call (`mcp_call`), for the rolling 24-hour caps |
 | `record_usage()` | Postgres function that counts and inserts atomically, under a per-user-and-kind advisory lock |
 | `storage_usage_bytes()`, `database_size_bytes()` | Service-role-only functions that measure capacity |
-| `api_tokens` | Assistant tokens: name, display prefix, SHA-256 `token_hash`, scopes, and for sign-in tokens a `client_id` and `refresh_token_hash`, plus `last_used_at`, `expires_at` and `revoked_at` |
-| `brief_jobs` | One row per assistant-started brief: validated params, status (`queued`, `running`, `done`, `failed`), stage, `episode_id`, progress counters, `heartbeat_at`, and the `token_id` that started it (no foreign key) |
-| `claim_brief_job()` | Postgres function that is the job runner's lease: claims a queued job, or takes over a stale one, in one statement |
+| `api_tokens` | Assistant tokens: name, display prefix, SHA-256 `token_hash`, scopes, and for sign-in tokens a `client_id`, `refresh_token_hash` and `previous_refresh_token_hash` (the refresh token the last rotation replaced, for reuse detection), plus `last_used_at`, `expires_at` and `revoked_at` |
+| `brief_jobs` | One row per assistant-started brief: validated params, status (`queued`, `running`, `done`, `failed`), stage, `episode_id`, progress counters, `heartbeat_at`, the current runner's `lease_id`, and the `token_id` that started it (no foreign key) |
+| `claim_brief_job()` | Postgres function that is the job runner's lease: claims a queued job, or takes over a stale one, in one statement, stamping a fresh `lease_id` |
 | `oauth_clients` | Assistants that registered themselves for sign-in: name and redirect URIs, public clients only |
 | `oauth_codes` | Authorization codes: hashed, five minutes, single use, with the PKCE challenge and the token each produced |
-| `prune_oauth_clients()` | Postgres function that deletes stale unused registrations and returns how many remain |
+| `prune_oauth_clients()` | Postgres function that deletes registrations unused after an hour and fully revoked ones after 30 days, and returns how many remain |
+| `evict_oauth_client()` | Postgres function that deletes the oldest registration with no live token, to make room at the 1,000-client ceiling |
 | Storage bucket `episodes` | The markdown and MP3 files themselves. Private, served to the browser via 24-hour signed URLs, and to assistants through stable links that mint a fresh one-hour URL on each visit |
 
 ## Grok model blend
@@ -346,9 +347,10 @@ background jobs (below).
   request's `Host` or `X-Forwarded-*` headers, because clients compare it with the address they
   connected to. An authenticated `GET` or `DELETE` answers 405, as a stateless server does.
 - **Content is not instructions.** The server's `instructions` and every tool description tell the
-  model that bookmark text, summaries and briefs were written by other people and are information to
-  report, never directions to follow. The server cannot control what a client's model does with
-  them, and it never acts on tool output itself.
+  model that bookmark text, summaries, briefs, topic names and titles were written by other people
+  (or by the model from their posts) and are information to report, never directions to follow.
+  Topic names and episode titles are cut to 120 characters in every tool's output. The server cannot
+  control what a client's model does with them, and it never acts on tool output itself.
 
 ### Tokens
 
@@ -362,7 +364,7 @@ background jobs (below).
   `write` adds `generate_brief` and `hide_bookmark`, and implies `read`. A token may expire (the
   panel offers 90 days) and is revoked by setting `revoked_at`. `last_used_at` is rewritten at most
   every five minutes, so a chatty client does not turn every call into a write. A person can hold 25
-  active tokens, checked when one is created in the panel.
+  active tokens, checked when one is created in the panel and when a sign-in mints one.
 - **Management is cookie-only.** `GET` and `POST /api/tokens` and `DELETE /api/tokens/[id]` accept the
   session cookie and never a bearer token, so a leaked token cannot mint, list or revoke tokens. The
   Assistants panel on the dashboard (`src/app/assistant-settings.tsx`) is their only client. It shows
@@ -382,29 +384,41 @@ app is also a small OAuth 2.1 authorization server for its own tokens
   path-insertion address, since clients try different ones. Everything is built from `APP_URL`.
 - **Registration.** Dynamic client registration (RFC 7591) at `/oauth/register`, for public clients
   only: no secret is issued, and the only token endpoint auth method is `none`. It is open to anyone,
-  so each registration first prunes stale ones (older than 30 days with no token and no code, in
-  `prune_oauth_clients()`), and past 1,000 clients it answers 503. Redirect URIs must be
-  `https`, `http` on a loopback host, or an app scheme such as `cursor://`. They match exactly,
-  except that a loopback URI may use any port.
+  so a flood must not lock real clients out: each registration first prunes registrations that never
+  got a code or a token after an hour, and fully revoked ones after 30 days
+  (`prune_oauth_clients()`). At 1,000 clients it evicts the oldest one with no live token
+  (`evict_oauth_client()`, at most five per registration), and answers 503 only when every client is a
+  live connection. A body declared over 64 KB is refused with 413 before it is read, here and at
+  `/oauth/token`. Redirect URIs must be `https`, `http` on a loopback host, or an app scheme such as
+  `cursor://`. They match exactly, except that a loopback URI may use any port.
 - **Authorization.** `GET /oauth/authorize` is a route handler, so it can answer with real status
-  codes. A bad client or an unregistered redirect URI gets an error page and never a redirect; any
-  other error goes back to the client; a missing X session goes to sign-in and returns. Otherwise it
-  redirects to the consent page, `/oauth/authorize/consent`, which checks everything again. PKCE with
-  `S256` is required.
+  codes. It never redirects to the client before the user has acted, because anyone can register a
+  client with any redirect URI and an automatic error redirect would make the app an open redirector
+  (RFC 9700 section 4.11). Every invalid request gets a 400 error page in the app's own wording; when
+  the client and redirect URI check out, the page offers a plain "Return to *host*" link carrying
+  `error`, `error_description`, `state` and `iss` for the user to click. A missing X session goes to
+  sign-in and returns. Otherwise it redirects to the consent page, `/oauth/authorize/consent`, which
+  checks everything again. PKCE with `S256` is required.
 - **Consent.** The page shows which client is asking, the scopes, the account and where you will
   land. Its form posts one hidden field to `/api/oauth/decision`: the validated request plus the
   user's id, sealed with an HMAC under `SESSION_SECRET` (with a purpose prefix, so it cannot pass for
   a session or gate signature) and valid for ten minutes. Editing the form cannot change what was
   approved, and the decision route checks the same-origin header, the signed-in user, the client and
-  its redirect URI once more.
+  its redirect URI once more. Its two redirects, the code on approve and `access_denied` on deny, are
+  the only ones to a client, both follow a click, and both carry `iss` (RFC 9207, advertised as
+  `authorization_response_iss_parameter_supported`).
 - **Codes and tokens.** Approve stores a single-use code (hashed, five minutes) next to the PKCE
   challenge, redirect URI and scopes. `POST /oauth/token` trades the code and its verifier for an
   ordinary `api_tokens` row (30 days, tagged with the client's id) and a rotating refresh token
   (`bgr_` plus 32 random bytes, stored hashed on the same row). The request that flips `used_at`
   wins, and a replayed code is refused and revokes the token it produced (RFC 6749 section 4.1.2:
-  the code may have leaked). A refresh rewrites the same row with a new access token and a new
-  refresh token, so the old pair dies together and the panel shows one entry per connected client.
-  Scopes may narrow on a refresh, never widen. Codes and tokens are never logged or echoed in errors.
+  the code may have leaked). Before minting, the client's earlier live tokens for that user are
+  revoked (one connection per client per user), and the new one must fit under the 25-active-token
+  cap like a panel token. A refresh rewrites the same row with a new access token and a new refresh
+  token, so the old pair dies together and the panel shows one entry per connected client, and keeps
+  the replaced refresh token's hash: presenting that one again revokes the row (RFC 9700 section
+  4.14.2). A refresh after 90 days without use (no API call and no refresh) is refused. Scopes may
+  narrow on a refresh, never widen. Codes and tokens are never logged or echoed in errors.
 
 ### Tools
 
@@ -415,10 +429,10 @@ says what it costs, what its dates mean and that post text is content.
 | Tool | Scope | What it does |
 | --- | --- | --- |
 | `search_bookmarks` | read | Every word of `query` must appear in the post text, its summary, or the author's handle or name. Filters: topics, post dates (the post's own date, as the dashboard uses), and `credibility: "flagged"`. Newest post first, post text cut to 500 characters, 1 to 50 results. Reads at most the newest 1,000 visible bookmarks. |
-| `list_topics` | read | The dashboard's topic chips with counts, for an optional date range. |
-| `list_episodes` | read | Ready briefs, newest first, with stable `links`. |
+| `list_topics` | read | The dashboard's topic chips with counts, for an optional date range. Names cut to 120 characters. |
+| `list_episodes` | read | Ready briefs, newest first, with stable `links`. Titles cut to 120 characters. |
 | `get_episode` | read | One ready brief, with its markdown (cut at 60,000 characters, with a `truncated` flag) and optionally the script. |
-| `get_brief_status` | read | A background job's status, stage and progress, or the newest job for an episode. Also restarts a stalled job and says so in `rescheduled`. |
+| `get_brief_status` | read | A background job's status, stage and progress, or the newest job for an episode. With a write token it also restarts a stalled job and says so in `rescheduled`; a read-only token only gets the report, since restarting resumes paid work. |
 | `generate_brief` | write | Validates like the prepare route, runs the free selection check (an empty match answers at once and spends nothing), queues a job and returns a `job_id`. |
 | `hide_bookmark` | write | The same update as `POST /api/bookmarks/hide`. |
 
@@ -449,10 +463,19 @@ around them, with the same guards and caps), and `src/lib/jobs.ts` drives them o
   `heartbeat_at` is older than the stale window (90 seconds, `BRIEF_JOB_STALE_SECONDS`). Two runners
   racing for one job cannot both win; the loser gets no row and stops. This is the single-generation
   lease the roadmap listed as deferred, for assistant-started briefs only.
+- **Fencing.** Each claim stamps a fresh `lease_id`, and every write the runner makes (stage,
+  heartbeat, progress, episode, outcome) is filtered on it and checks that it matched a row. A runner
+  that was slow rather than dead, and was taken over, finds its next write matching nothing and stops
+  there without writing anything more, so the new lease holder's progress stands.
 - **Heartbeat.** The runner bumps `heartbeat_at` at every stage change and after every rendered
   chunk, and a timer beats three times per stale window, so one long paid call, such as the writing
-  pass, does not look dead. The timer dies with the process, which is what lets a cut-off run go
-  stale.
+  pass, does not look dead. The timer's writes are fenced too, and it stops once the lease is gone.
+  It dies with the process, which is what lets a cut-off run go stale.
+- **Access checks.** Right after the claim and before every paid step (sync, the writing pass, the
+  script, each rendered chunk, finalize), the runner checks that the token that started the job is
+  still live and its owner still allowed. Otherwise the job fails with "The token that started this
+  brief was revoked" or "This account can no longer use this server", so revoking a token stops the
+  briefs it started too.
 - **Resume from persisted state.** A re-claimed job works out where to continue from the episode,
   the way the dashboard's Resume banner does (`deriveDigestStage`). No script yet means write one.
   Some chunks rendered means continue from the last one. All chunks rendered means finalize. So it
@@ -473,10 +496,10 @@ around them, with the same guards and caps), and `src/lib/jobs.ts` drives them o
 | Host | What happens |
 | --- | --- |
 | [Render](https://render.com) or any long-lived Node process | The `after()` callback runs to the end. The whole job finishes in one run: around 3 minutes for markdown, 12 for a podcast. One status check finds it done. |
-| [Vercel](https://vercel.com) or any host that ends a request's background work early | The callback is cut off at `maxDuration` (300 seconds), mid-render. The heartbeat goes stale, and the next `get_brief_status` call re-claims the job and continues from the last rendered chunk. A podcast takes a few checks. |
+| [Vercel](https://vercel.com) or any host that ends a request's background work early | The callback is cut off at `maxDuration` (300 seconds), mid-render. The heartbeat goes stale, and the next `get_brief_status` call from a write token re-claims the job and continues from the last rendered chunk. A podcast takes a few checks. |
 
-So on a request-bound host, polling is what keeps a job alive, and the tool description tells the
-model so. [ROADMAP.md](ROADMAP.md) has the follow-up that removes that dependence.
+So on a request-bound host, polling with a write token is what keeps a job alive, and the tool
+description tells the model so. [ROADMAP.md](ROADMAP.md) has the follow-up that removes that dependence.
 
 ### Stable episode links
 
@@ -537,7 +560,8 @@ cookie), so an OAuth sign-in survives a gated instance. Both accept only paths o
   once per user per invocation.
 - **Assistant access.** `/api/mcp` takes bearer tokens only, never the cookie. Tokens are hashed at
   rest, scoped, revocable at once and managed only with the session cookie. Sign-in uses PKCE,
-  single-use codes, rotating refresh tokens and an HMAC-sealed consent. See
+  single-use codes, rotating refresh tokens with reuse detection, an HMAC-sealed consent, and no
+  redirect to a client before the user acts. See
   [Connector (MCP)](#connector-mcp).
 - **Input and error handling.** Voice keys and ids are validated (printable ASCII, URL-safe ids)
   and never echoed or logged. Route errors log full detail server-side and show the client only a

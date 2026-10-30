@@ -12,11 +12,13 @@ import { db } from "./supabase";
 // Tokens minted through OAuth (src/lib/oauth.ts) are the same rows with
 // client_id set and a refresh token ("bgr_" plus 32 random bytes, stored as
 // refresh_token_hash). Refreshing rewrites that row in place, so the old access
-// and refresh tokens stop working together.
+// and refresh tokens stop working together, and keeps the replaced refresh
+// token's hash as previous_refresh_token_hash: presenting that one again means
+// it leaked, and revokes the row.
 
 export type ApiScope = "read" | "write";
 
-/** Every column the dashboard may see: everything except token_hash and refresh_token_hash. */
+/** Every column the dashboard may see: everything except the token and refresh token hashes. */
 export interface ApiTokenRecord {
   id: string;
   name: string;
@@ -176,19 +178,22 @@ export interface RefreshGrant {
   userId: string;
   clientId: string | null;
   scopes: ApiScope[];
+  /** When the connection was last used (an API call or a refresh), or minted if never. */
+  lastUsedAt: string;
 }
 
 /**
  * The grant behind a presented refresh token, or null when it is unknown (or
- * already rotated away), revoked, or belongs to a user who is no longer
- * allowed. An expired access token can still be refreshed: that is what
- * refreshing is for. Throws only when the database can't be asked.
+ * already rotated away: see revokeReusedRefreshToken), revoked, or belongs to
+ * a user who is no longer allowed. An expired access token can still be
+ * refreshed: that is what refreshing is for. Throws only when the database
+ * can't be asked.
  */
 export async function findRefreshGrant(refreshToken: string): Promise<RefreshGrant | null> {
   if (!REFRESH_TOKEN_SHAPE.test(refreshToken)) return null; // not one of ours: no lookup
   const { data: row, error } = await db()
     .from("api_tokens")
-    .select("id, user_id, client_id, scopes, revoked_at")
+    .select("id, user_id, client_id, scopes, revoked_at, last_used_at, created_at")
     .eq("refresh_token_hash", hashToken(refreshToken))
     .maybeSingle();
   if (error) throw new Error(`Refresh token lookup failed: ${error.message}`);
@@ -208,15 +213,63 @@ export async function findRefreshGrant(refreshToken: string): Promise<RefreshGra
     userId: String(row.user_id),
     clientId: (row.client_id as string | null | undefined) ?? null,
     scopes,
+    lastUsedAt: String(row.last_used_at ?? row.created_at),
   };
+}
+
+/**
+ * Refresh-token reuse detection (RFC 9700 §4.14.2): when `refreshToken` is the
+ * one a rotation replaced, it has leaked, or the client is replaying it.
+ * Either way neither copy can be trusted, so the row is revoked: the access
+ * and refresh tokens issued after it stop working too. Returns the row's id
+ * (already revoked or not), or null when the token was never rotated away.
+ * Throws only when the database can't be asked.
+ */
+export async function revokeReusedRefreshToken(refreshToken: string): Promise<string | null> {
+  if (!REFRESH_TOKEN_SHAPE.test(refreshToken)) return null;
+  const { data: row, error } = await db()
+    .from("api_tokens")
+    .select("id, revoked_at")
+    .eq("previous_refresh_token_hash", hashToken(refreshToken))
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error(`Refresh token reuse lookup failed: ${error.message}`);
+  if (!row) return null;
+  if (!row.revoked_at) {
+    const { error: revokeError } = await db()
+      .from("api_tokens")
+      .update({ revoked_at: new Date().toISOString() })
+      .eq("id", row.id)
+      .is("revoked_at", null);
+    if (revokeError) throw new Error(`Couldn't revoke token ${row.id} after refresh token reuse: ${revokeError.message}`);
+  }
+  return String(row.id);
+}
+
+/**
+ * Revokes every live token `clientId` holds for `userId`, so one registered
+ * client keeps one connection per user: a client that exchanges a fresh code
+ * has lost or dropped the tokens it had. Returns how many it revoked.
+ */
+export async function revokeClientTokens(userId: string, clientId: string): Promise<number> {
+  const { data, error } = await db()
+    .from("api_tokens")
+    .update({ revoked_at: new Date().toISOString() })
+    .eq("user_id", userId)
+    .eq("client_id", clientId)
+    .is("revoked_at", null)
+    .select("id");
+  if (error) throw new Error(`Couldn't revoke the client's earlier tokens: ${error.message}`);
+  return Array.isArray(data) ? data.length : 0;
 }
 
 /**
  * Refresh-token rotation: writes a new access token and a new refresh token
  * onto the grant's row (with `scopes`, which may only narrow, and a fresh
- * expiry), so the presented pair stops working. The write is conditional on
- * the row still holding `refreshToken`, so of two concurrent refreshes with the
- * same token only one wins; the other gets null.
+ * expiry), so the presented pair stops working, and keeps the presented
+ * refresh token's hash as previous_refresh_token_hash for reuse detection.
+ * The write is conditional on the row still holding `refreshToken`, so of two
+ * concurrent refreshes with the same token only one wins; the other gets null.
  */
 export async function rotateOAuthToken(
   grant: RefreshGrant,
@@ -234,6 +287,7 @@ export async function rotateOAuthToken(
       token_hash: hashToken(token),
       prefix: token.slice(0, DISPLAY_PREFIX_LENGTH),
       refresh_token_hash: hashToken(nextRefreshToken),
+      previous_refresh_token_hash: hashToken(refreshToken),
       scopes,
       expires_at: expiryFrom(now, opts.expiresInDays),
       last_used_at: now.toISOString(),

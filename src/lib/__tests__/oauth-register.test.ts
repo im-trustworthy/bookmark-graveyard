@@ -190,27 +190,141 @@ describe("POST /oauth/register", () => {
     expect(clients()[0].client_name).toBe(expected);
   });
 
-  it("prunes stale clients that never got a token or a code, keeping the rest", async () => {
-    const old = new Date(T0.getTime() - 31 * DAY).toISOString();
-    const recent = new Date(T0.getTime() - 29 * DAY).toISOString();
-    fake.tables.oauth_clients.push(
-      { client_id: "stale", redirect_uris: ["https://a.example/cb"], created_at: old },
-      { client_id: "stale-with-token", redirect_uris: ["https://a.example/cb"], created_at: old },
-      { client_id: "stale-with-code", redirect_uris: ["https://a.example/cb"], created_at: old },
-      { client_id: "recent", redirect_uris: ["https://a.example/cb"], created_at: recent }
-    );
-    fake.tables.api_tokens.push({ id: "t1", client_id: "stale-with-token" });
-    fake.tables.oauth_codes.push({ code_hash: "h", client_id: "stale-with-code" });
-
-    const { status, json } = await read(await register({ redirect_uris: ["https://a.example/cb"] }));
-    expect(status).toBe(201);
-    expect(clients().map((c) => c.client_id)).toEqual(["stale-with-token", "stale-with-code", "recent", json.client_id]);
+  it("refuses a body over 64 KB from its Content-Length, before reading it", async () => {
+    const req = jsonPost("http://localhost:3000/oauth/register", { redirect_uris: ["https://a.example/cb"] }, {
+      "Content-Length": String(64 * 1024 + 1),
+    });
+    const text = vi.spyOn(req, "text");
+    const res = await POST(req);
+    const { status, json } = await read(res);
+    expect(status).toBe(413);
+    expect(json).toEqual({ error: "invalid_client_metadata", error_description: "The registration request is too large" });
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+    expect(text).not.toHaveBeenCalled();
+    expect(clients()).toEqual([]);
   });
 
-  it("answers 503 and stores nothing once 1,000 clients exist", async () => {
-    for (let i = 0; i < 1000; i++) {
-      fake.tables.oauth_clients.push({ client_id: `c${i}`, redirect_uris: [], created_at: T0.toISOString() });
+  it("still measures a body sent without Content-Length", async () => {
+    const big = { redirect_uris: ["https://a.example/cb"], client_name: "x".repeat(64 * 1024) };
+    const { status, json } = await read(await register(big));
+    expect(status).toBe(413);
+    expect(json.error).toBe("invalid_client_metadata");
+    expect(clients()).toEqual([]);
+  });
+
+  it("asks the database to prune with the hour and 30-day windows", async () => {
+    const prune = vi.spyOn(fake.functions, "prune_oauth_clients");
+    expect((await register({ redirect_uris: ["https://a.example/cb"] })).status).toBe(201);
+    expect(prune).toHaveBeenCalledWith({ p_unused_minutes: 60, p_stale_days: 30 });
+  });
+
+  it("answers 500 with an OAuth error when the database fails", async () => {
+    delete fake.functions.prune_oauth_clients;
+    const { status, json } = await read(await register({ redirect_uris: ["https://a.example/cb"] }));
+    expect(status).toBe(500);
+    expect(json.error).toBe("server_error");
+  });
+});
+
+// A flood of registrations must not lock real sign-ups out: what is never used
+// goes within the hour, and at the ceiling the oldest client nobody is
+// connected through makes room. 503 is left for a server with a thousand live
+// connections.
+describe("POST /oauth/register: pruning and eviction", () => {
+  const MINUTE = 60 * 1000;
+  const ago = (ms: number) => new Date(T0.getTime() - ms).toISOString();
+  const addClient = (client_id: string, created_at: string) =>
+    fake.tables.oauth_clients.push({ client_id, redirect_uris: ["https://a.example/cb"], created_at });
+  const ids = () => clients().map((c) => c.client_id);
+  /** 1,000 clients, c0 to c999, created a minute apart from 2,000 minutes ago (c0 oldest). */
+  function fillToCeiling() {
+    for (let i = 0; i < 1000; i++) addClient(`c${i}`, ago((2000 - i) * MINUTE));
+  }
+  const liveToken = (client_id: string, extra: Record<string, unknown> = {}) =>
+    fake.tables.api_tokens.push({ id: `t-${client_id}`, client_id, revoked_at: null, expires_at: null, ...extra });
+
+  it("prunes a client that never got a code or a token after 61 minutes, but not after 59", async () => {
+    addClient("unused-61", ago(61 * MINUTE));
+    addClient("unused-59", ago(59 * MINUTE));
+    const { status, json } = await read(await register({ redirect_uris: ["https://a.example/cb"] }));
+    expect(status).toBe(201);
+    expect(ids()).toEqual(["unused-59", json.client_id]);
+  });
+
+  it("keeps a client that has a code or a token, however young or old", async () => {
+    addClient("with-code", ago(61 * MINUTE));
+    addClient("with-token", ago(61 * MINUTE));
+    fake.tables.oauth_codes.push({ code_hash: "h", client_id: "with-code", expires_at: ago(-MINUTE) });
+    liveToken("with-token");
+    await register({ redirect_uris: ["https://a.example/cb"] });
+    expect(ids()).toEqual(expect.arrayContaining(["with-code", "with-token"]));
+  });
+
+  it("prunes a client older than 30 days whose tokens are all revoked and whose codes expired", async () => {
+    addClient("revoked-31d", ago(31 * DAY));
+    addClient("revoked-29d", ago(29 * DAY));
+    addClient("live-31d", ago(31 * DAY));
+    addClient("pending-code-31d", ago(31 * DAY));
+    liveToken("revoked-31d", { revoked_at: ago(DAY) });
+    liveToken("revoked-29d", { revoked_at: ago(DAY) });
+    liveToken("live-31d");
+    liveToken("pending-code-31d", { revoked_at: ago(DAY) });
+    fake.tables.oauth_codes.push(
+      { code_hash: "old", client_id: "revoked-31d", expires_at: ago(DAY) },
+      { code_hash: "pending", client_id: "pending-code-31d", expires_at: ago(-MINUTE) }
+    );
+    const { json } = await read(await register({ redirect_uris: ["https://a.example/cb"] }));
+    expect(ids()).toEqual(["revoked-29d", "live-31d", "pending-code-31d", json.client_id]);
+  });
+
+  it("at the ceiling, evicts the oldest never-used client and registers", async () => {
+    // A flood in progress: 1,000 never-used clients younger than an hour, so pruning frees nothing.
+    fillToCeiling();
+    for (const client of clients()) client.created_at = ago(30 * MINUTE);
+    clients()[0].created_at = ago(59 * MINUTE); // c0 is the oldest
+    const res = await register({ redirect_uris: ["https://a.example/cb"] });
+    const { status, json } = await read(res);
+    expect(status).toBe(201);
+    expect(ids()).not.toContain("c0");
+    expect(ids()).toContain(json.client_id);
+    expect(clients()).toHaveLength(1000);
+  });
+
+  it("never evicts a client with a live token: it takes the oldest one without", async () => {
+    fillToCeiling();
+    // Pruning can't help: every client has a token; c0 and c1 are live, c2's expired, the rest revoked
+    // but younger than 30 days.
+    for (const client of clients()) {
+      client.created_at = ago(DAY);
+      liveToken(String(client.client_id), { revoked_at: ago(MINUTE) });
     }
+    clients()[0].created_at = ago(3 * DAY);
+    clients()[1].created_at = ago(3 * DAY);
+    clients()[2].created_at = ago(2 * DAY);
+    fake.tables.api_tokens[0].revoked_at = null;
+    fake.tables.api_tokens[1].revoked_at = null;
+    fake.tables.api_tokens[1].expires_at = ago(-DAY);
+    fake.tables.api_tokens[2].revoked_at = null;
+    fake.tables.api_tokens[2].expires_at = ago(MINUTE);
+
+    expect((await register({ redirect_uris: ["https://a.example/cb"] })).status).toBe(201);
+    expect(ids()).toEqual(expect.arrayContaining(["c0", "c1"]));
+    expect(ids()).not.toContain("c2");
+  });
+
+  it("never evicts a client whose user is mid-way through connecting (an unused, unexpired code)", async () => {
+    fillToCeiling();
+    for (const client of clients()) client.created_at = ago(30 * MINUTE);
+    clients()[0].created_at = ago(59 * MINUTE);
+    fake.tables.oauth_codes.push({ code_hash: "h", client_id: "c0", used_at: null, expires_at: ago(-MINUTE) });
+    expect((await register({ redirect_uris: ["https://a.example/cb"] })).status).toBe(201);
+    expect(ids()).toContain("c0");
+    expect(clients()).toHaveLength(1000);
+  });
+
+  it("answers 503 and stores nothing only when every client has a live token", async () => {
+    fillToCeiling();
+    for (const client of clients()) liveToken(String(client.client_id));
     const res = await register({ redirect_uris: ["https://a.example/cb"] });
     const { status, json } = await read(res);
     expect(status).toBe(503);
@@ -219,17 +333,20 @@ describe("POST /oauth/register", () => {
     expect(clients()).toHaveLength(1000);
   });
 
-  it("registers again once pruning makes room", async () => {
-    const old = new Date(T0.getTime() - 40 * DAY).toISOString();
-    for (let i = 0; i < 1000; i++) {
-      fake.tables.oauth_clients.push({ client_id: `c${i}`, redirect_uris: [], created_at: i === 0 ? old : T0.toISOString() });
-    }
+  it("evicts a few at most, then registers anyway", async () => {
+    // Over the ceiling (registrations raced): five evictions, then the new client goes in.
+    for (let i = 0; i < 1010; i++) addClient(`c${i}`, ago((2000 - i) * MINUTE));
+    for (const client of clients()) liveToken(String(client.client_id), { expires_at: ago(MINUTE) });
+    const evict = vi.spyOn(fake.functions, "evict_oauth_client");
     expect((await register({ redirect_uris: ["https://a.example/cb"] })).status).toBe(201);
-    expect(clients()).toHaveLength(1000);
+    expect(evict).toHaveBeenCalledTimes(5);
+    expect(clients()).toHaveLength(1006);
   });
 
-  it("answers 500 with an OAuth error when the database fails", async () => {
-    delete fake.functions.prune_oauth_clients;
+  it("answers 500 when eviction fails", async () => {
+    fillToCeiling();
+    for (const client of clients()) client.created_at = ago(30 * MINUTE);
+    delete fake.functions.evict_oauth_client;
     const { status, json } = await read(await register({ redirect_uris: ["https://a.example/cb"] }));
     expect(status).toBe(500);
     expect(json.error).toBe("server_error");

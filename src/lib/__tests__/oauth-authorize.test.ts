@@ -52,6 +52,15 @@ async function renderConsent(query: URLSearchParams): Promise<string> {
 
 const consentField = (html: string) => html.match(/name="consent" value="([^"]+)"/)?.[1] ?? null;
 
+const ENTITIES: Record<string, string> = { amp: "&", quot: '"', lt: "<", gt: ">", "#39": "'", "#x27": "'" };
+const decodeHtml = (text: string) => text.replace(/&(amp|quot|lt|gt|#39|#x27);/g, (_, name: string) => ENTITIES[name]);
+
+/** The "Return to …" link on an error page, decoded, or null when the page offers none. */
+function returnLink(html: string): { href: URL; label: string } | null {
+  const match = html.match(/<a href="([^"]+)"[^>]*>(Return to [^<]+)<\/a>/);
+  return match ? { href: new URL(decodeHtml(match[1])), label: decodeHtml(match[2]) } : null;
+}
+
 const decide = (consent: string, decision: string, headers: Record<string, string> = { Origin: APP }) =>
   decisionRoute(formPost(`${APP}/api/oauth/decision`, { consent, decision }, headers));
 
@@ -113,6 +122,8 @@ describe("GET /oauth/authorize: an untrusted redirect target gets an error page,
     const html = await res.text();
     expect(html).toContain("can't be completed");
     expect(html).not.toContain("evil.example");
+    // Nowhere to send the user back to: the target is exactly what can't be trusted.
+    expect(returnLink(html)).toBeNull();
   });
 
   it("treats a repeated client_id or redirect_uri as untrusted", async () => {
@@ -121,6 +132,7 @@ describe("GET /oauth/authorize: an untrusted redirect target gets an error page,
     const res = await authorize(query);
     expect(res.status).toBe(400);
     expect(res.headers.get("location")).toBeNull();
+    expect(returnLink(await res.text())).toBeNull();
   });
 
   it("answers 500 without redirecting when the database can't be asked", async () => {
@@ -131,31 +143,46 @@ describe("GET /oauth/authorize: an untrusted redirect target gets an error page,
   });
 });
 
-describe("GET /oauth/authorize: other problems go back to the client", () => {
+// RFC 9700 §4.11: anyone can register a client with any https or app-scheme
+// redirect URI, so an automatic error redirect would turn this domain into an
+// open redirector. Every failure is a page; the link back only goes when clicked.
+describe("GET /oauth/authorize: other problems get an error page with a link back, never a redirect", () => {
   it.each([
-    ["no code_challenge", { code_challenge: null }, "invalid_request"],
-    ["a code_challenge that's too short", { code_challenge: "a".repeat(42) }, "invalid_request"],
-    ["a code_challenge with a bad character", { code_challenge: `${"a".repeat(42)}+` }, "invalid_request"],
-    ["no code_challenge_method", { code_challenge_method: null }, "invalid_request"],
-    ["the plain method", { code_challenge_method: "plain" }, "invalid_request"],
-    ["a lowercase method", { code_challenge_method: "s256" }, "invalid_request"],
-    ["no response_type", { response_type: null }, "invalid_request"],
-    ["the implicit flow", { response_type: "token" }, "unsupported_response_type"],
-    ["an unknown scope", { scope: "read admin" }, "invalid_scope"],
-    ["an OpenID scope", { scope: "openid" }, "invalid_scope"],
-    ["a scope in the wrong case", { scope: "READ" }, "invalid_scope"],
-    ["another resource", { resource: "https://evil.example/api/mcp" }, "invalid_target"],
-    ["the app root as the resource", { resource: APP }, "invalid_target"],
-    ["a resource with a different path", { resource: `${APP}/api/mcpx` }, "invalid_target"],
-  ])("%s → 302 with %s", async (_label, overrides, error) => {
+    ["no code_challenge", { code_challenge: null }, "invalid_request", "code_challenge is required (PKCE)"],
+    ["a code_challenge that's too short", { code_challenge: "a".repeat(42) }, "invalid_request", "code_challenge must be"],
+    ["a code_challenge with a bad character", { code_challenge: `${"a".repeat(42)}+` }, "invalid_request", "code_challenge must be"],
+    ["no code_challenge_method", { code_challenge_method: null }, "invalid_request", 'code_challenge_method must be "S256"'],
+    ["the plain method", { code_challenge_method: "plain" }, "invalid_request", 'code_challenge_method must be "S256"'],
+    ["a lowercase method", { code_challenge_method: "s256" }, "invalid_request", 'code_challenge_method must be "S256"'],
+    ["no response_type", { response_type: null }, "invalid_request", "response_type is required"],
+    ["the implicit flow", { response_type: "token" }, "unsupported_response_type", 'only response_type "code"'],
+    ["an unknown scope", { scope: "read admin" }, "invalid_scope", "scope may only contain"],
+    ["an OpenID scope", { scope: "openid" }, "invalid_scope", "scope may only contain"],
+    ["a scope in the wrong case", { scope: "READ" }, "invalid_scope", "scope may only contain"],
+    ["another resource", { resource: "https://evil.example/api/mcp" }, "invalid_target", `resource must be ${RESOURCE}`],
+    ["the app root as the resource", { resource: APP }, "invalid_target", `resource must be ${RESOURCE}`],
+    ["a resource with a different path", { resource: `${APP}/api/mcpx` }, "invalid_target", `resource must be ${RESOURCE}`],
+  ])("%s → 400 page naming it, with a link back carrying %s", async (_label, overrides, error, wording) => {
     const res = await authorize(authorizeQuery(overrides));
-    expect(res.status).toBe(302);
-    const target = locationOf(res);
-    expect(`${target.origin}${target.pathname}`).toBe(REDIRECT);
-    expect(target.searchParams.get("error")).toBe(error);
-    expect(target.searchParams.get("error_description")).toEqual(expect.any(String));
-    expect(target.searchParams.get("state")).toBe("st-123");
-    expect(target.searchParams.has("code")).toBe(false);
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
+    expect(res.headers.get("content-type")).toMatch(/^text\/html/);
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
+    const html = await res.text();
+    expect(html).toContain("can't be completed");
+    expect(decodeHtml(html)).toContain(`The app's request can't be accepted: ${wording}`);
+    // No script, no meta refresh: nothing moves the browser on its own.
+    expect(html).not.toMatch(/<script|http-equiv/i);
+
+    const link = returnLink(html)!;
+    expect(link.label).toBe("Return to claude.ai");
+    expect(`${link.href.origin}${link.href.pathname}`).toBe(REDIRECT);
+    expect(link.href.searchParams.get("error")).toBe(error);
+    expect(link.href.searchParams.get("error_description")).toContain(wording);
+    expect(link.href.searchParams.get("state")).toBe("st-123");
+    expect(link.href.searchParams.get("iss")).toBe(APP);
+    expect(link.href.searchParams.has("code")).toBe(false);
   });
 
   it("keeps a query string the client registered, and leaves state out when none was sent", async () => {
@@ -163,32 +190,47 @@ describe("GET /oauth/authorize: other problems go back to the client", () => {
     const res = await authorize(
       authorizeQuery({ redirect_uri: "https://claude.ai/cb?tenant=a b&x=1", state: null, code_challenge_method: "plain" })
     );
-    const target = locationOf(res);
-    expect(target.searchParams.get("tenant")).toBe("a b");
-    expect(target.searchParams.get("x")).toBe("1");
-    expect(target.searchParams.get("error")).toBe("invalid_request");
-    expect(target.searchParams.has("state")).toBe(false);
+    expect(res.status).toBe(400);
+    const { href } = returnLink(await res.text())!;
+    expect(href.searchParams.get("tenant")).toBe("a b");
+    expect(href.searchParams.get("x")).toBe("1");
+    expect(href.searchParams.get("error")).toBe("invalid_request");
+    expect(href.searchParams.has("state")).toBe(false);
   });
 
-  it("echoes state verbatim", async () => {
-    const weird = "a b&c=d/é?#%";
-    const target = locationOf(await authorize(authorizeQuery({ state: weird, scope: "admin" })));
-    expect(target.searchParams.get("state")).toBe(weird);
+  it("echoes state verbatim in the link, and escapes it in the page", async () => {
+    const weird = 'a b&c=d/é?#%"><script>alert(1)</script>';
+    const res = await authorize(authorizeQuery({ state: weird, scope: "admin" }));
+    const html = await res.text();
+    expect(html).not.toContain("<script>");
+    expect(returnLink(html)!.href.searchParams.get("state")).toBe(weird);
   });
 
   it("rejects a repeated parameter with invalid_request", async () => {
     const query = authorizeQuery();
     query.append("scope", "write");
-    const target = locationOf(await authorize(query));
-    expect(target.searchParams.get("error")).toBe("invalid_request");
-    expect(target.searchParams.get("error_description")).toMatch(/scope/);
+    const res = await authorize(query);
+    expect(res.status).toBe(400);
+    const { href } = returnLink(await res.text())!;
+    expect(href.searchParams.get("error")).toBe("invalid_request");
+    expect(href.searchParams.get("error_description")).toMatch(/^scope was sent more than once$/);
   });
 
-  it("returns errors to a custom-scheme redirect too", async () => {
+  it("offers the link back to a custom-scheme redirect too, named by its scheme", async () => {
     const uri = "cursor://anysphere.cursor-mcp/oauth/callback";
-    const target = locationOf(await authorize(authorizeQuery({ redirect_uri: uri, response_type: "token" })));
-    expect(target.protocol).toBe("cursor:");
-    expect(target.searchParams.get("error")).toBe("unsupported_response_type");
+    const res = await authorize(authorizeQuery({ redirect_uri: uri, response_type: "token" }));
+    expect(res.status).toBe(400);
+    expect(res.headers.get("location")).toBeNull();
+    const link = returnLink(await res.text())!;
+    expect(link.label).toBe("Return to cursor");
+    expect(link.href.protocol).toBe("cursor:");
+    expect(link.href.searchParams.get("error")).toBe("unsupported_response_type");
+  });
+
+  it("checks the client before anything else, so a bad client with a bad PKCE gets no link", async () => {
+    const res = await authorize(authorizeQuery({ client_id: "u".repeat(43), code_challenge: null }));
+    expect(res.status).toBe(400);
+    expect(returnLink(await res.text())).toBeNull();
   });
 });
 
@@ -296,6 +338,25 @@ describe("the consent page", () => {
     }
   });
 
+  it("names the problem as /oauth/authorize does: a link back only for a trusted redirect URI", async () => {
+    const untrusted = await renderConsent(authorizeQuery({ redirect_uri: "https://evil.example/cb" }));
+    expect(decodeHtml(untrusted)).toContain("The app asked to return to an address it didn't register.");
+    expect(returnLink(untrusted)).toBeNull();
+    expect(untrusted).not.toContain("evil.example");
+
+    const invalid = await renderConsent(authorizeQuery({ code_challenge_method: "plain" }));
+    expect(decodeHtml(invalid)).toContain('The app\'s request can\'t be accepted: code_challenge_method must be "S256".');
+    const link = returnLink(invalid)!;
+    expect(link.label).toBe("Return to claude.ai");
+    expect(`${link.href.origin}${link.href.pathname}`).toBe(REDIRECT);
+    expect(Object.fromEntries(link.href.searchParams)).toEqual({
+      error: "invalid_request",
+      error_description: 'code_challenge_method must be "S256"',
+      state: "st-123",
+      iss: APP,
+    });
+  });
+
   it("refuses an account that is no longer allowed", async () => {
     fake.tables.users[0].is_allowed = false;
     const html = await renderConsent(authorizeQuery());
@@ -345,6 +406,8 @@ describe("POST /api/oauth/decision", () => {
     const target = locationOf(res);
     expect(`${target.origin}${target.pathname}`).toBe(REDIRECT);
     expect(target.searchParams.get("state")).toBe("st-123");
+    // RFC 9207: the response names its issuer.
+    expect(target.searchParams.get("iss")).toBe(APP);
     const code = target.searchParams.get("code")!;
     expect(code).toMatch(/^[A-Za-z0-9_-]{43}$/);
 
@@ -376,6 +439,7 @@ describe("POST /api/oauth/decision", () => {
     const target = locationOf(res);
     expect(target.searchParams.get("error")).toBe("access_denied");
     expect(target.searchParams.get("state")).toBe("st-123");
+    expect(target.searchParams.get("iss")).toBe(APP);
     expect(target.searchParams.has("code")).toBe(false);
     expect(fake.tables.oauth_codes).toEqual([]);
   });
@@ -388,6 +452,7 @@ describe("POST /api/oauth/decision", () => {
     expect(target.searchParams.get("tenant")).toBe("a");
     expect(target.searchParams.has("state")).toBe(false);
     expect(target.searchParams.has("code")).toBe(true);
+    expect(target.searchParams.get("iss")).toBe(APP);
   });
 
   it("rejects a tampered blob without redirecting", async () => {
