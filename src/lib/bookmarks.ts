@@ -11,6 +11,8 @@ export interface BookmarkAnalysis {
   summary: string | null;
   content_type: string;
   credibility: string;
+  /** Only when loaded with `withClaims`. */
+  claims?: string[];
 }
 
 /** One row of the browse query: the post plus its analysis, which is missing until the post is enriched. */
@@ -37,13 +39,18 @@ export class BookmarkQueryError extends Error {
 
 const MAX_ROWS = 1000;
 
-/** The user's non-hidden bookmarks with their analysis, newest post first (undated last), at most 1000. */
-export async function loadBookmarkRows(userId: string): Promise<BookmarkRow[]> {
+const ROW_COLUMNS = "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics";
+const ANALYSIS_COLUMNS = "topics, summary, content_type, credibility";
+
+/**
+ * The user's non-hidden bookmarks with their analysis, newest post first (undated last), at most 1000.
+ * `withClaims` adds the analysis's `claims` (the MCP search tool returns them; the dashboard doesn't).
+ */
+export async function loadBookmarkRows(userId: string, opts: { withClaims?: boolean } = {}): Promise<BookmarkRow[]> {
+  const analysis = opts.withClaims ? `${ANALYSIS_COLUMNS}, claims` : ANALYSIS_COLUMNS;
   const { data, error } = await db()
     .from("bookmarks")
-    .select(
-      "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, bookmark_analysis(topics, summary, content_type, credibility)"
-    )
+    .select(`${ROW_COLUMNS}, bookmark_analysis(${analysis})`)
     .eq("user_id", userId)
     .eq("hidden", false)
     .order("tweet_created_at", { ascending: false, nullsFirst: false })
