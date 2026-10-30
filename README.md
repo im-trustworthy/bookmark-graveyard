@@ -212,6 +212,10 @@ Your instance has one connector address: your `APP_URL` plus `/api/mcp`, such as
 `https://your-domain/api/mcp`. Assistants reach it over the internet, so use your deployed address.
 To try it from your own computer, see [SETUP.md](SETUP.md#connecting-an-assistant-mcp).
 
+Setting it up with an AI agent? Give it [docs/MCP.md](docs/MCP.md), an install guide written for
+agents, with ready-to-paste settings for Claude Code, Cursor, VS Code, ChatGPT, Grok, Gemini CLI,
+Codex and any other MCP client.
+
 There are two ways to let an assistant in:
 
 - **Sign in.** Some assistants can sign in for you: claude.ai, ChatGPT custom connectors, and
@@ -268,10 +272,12 @@ Both connect by signing in, so you do not need a token.
 - **[claude.ai](https://claude.ai).** Look for **Connectors** in the settings (it has been under
   Customize), choose to add a custom connector, give it a name and paste the connector address.
   [Anthropic's help article](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
-  has the current steps. Choose to sign in, then approve on the page that opens.
-- **[ChatGPT](https://chatgpt.com).** Look in the settings for apps or connectors and an option to
-  add a custom one. Some plans do not offer it, and it may sit behind a developer mode switch. Paste
-  the connector address and approve on the page that opens.
+  has the current steps. Choose to sign in, and if it asks which OAuth client to use, pick automatic
+  registration (not Claude's published identity). Then approve on the page that opens.
+- **[ChatGPT](https://chatgpt.com).** Open [chatgpt.com/plugins](https://chatgpt.com/plugins), click
+  **+**, then **Add custom MCP server**. Paste the connector address, choose to sign in, accept the
+  warning and create it. Some plans and workspaces do not allow custom servers, and the menu has
+  moved before (it used to sit behind a developer mode switch in the settings).
   [OpenAI's MCP guide](https://developers.openai.com/api/docs/mcp) explains the terms.
 
 ### Cursor and other editors
@@ -502,6 +508,8 @@ refuses `localhost` addresses.
 - [ARCHITECTURE.md](ARCHITECTURE.md): how it works inside, the pipeline, the data model and the
   full cost analysis.
 - [SETUP.md](SETUP.md): the long setup guide, with every option.
+- [docs/MCP.md](docs/MCP.md): connecting an AI assistant, written for agents, with settings for
+  every client.
 - [ROADMAP.md](ROADMAP.md): what is planned, and what is blocked and why.
 - [CONTRIBUTING.md](CONTRIBUTING.md): how to run it locally and send a pull request.
 - [SECURITY.md](SECURITY.md): how to report a vulnerability.
