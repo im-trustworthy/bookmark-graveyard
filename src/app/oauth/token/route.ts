@@ -1,19 +1,34 @@
 import { NextRequest, NextResponse } from "next/server";
-import { findRefreshGrant, hashToken, isExpired, mintOAuthToken, normalizeScopes, rotateOAuthToken } from "@/lib/api-tokens";
+import {
+  countActiveApiTokens,
+  findRefreshGrant,
+  hashToken,
+  isExpired,
+  MAX_ACTIVE_TOKENS,
+  mintOAuthToken,
+  normalizeScopes,
+  revokeClientTokens,
+  revokeReusedRefreshToken,
+  rotateOAuthToken,
+} from "@/lib/api-tokens";
 import type { ApiScope } from "@/lib/api-tokens";
 import {
   ACCESS_TOKEN_DAYS,
   ACCESS_TOKEN_SECONDS,
   corsHeaders,
+  declaresOversizedBody,
   getClient,
   isOurResource,
   isPkceValue,
+  isRefreshIdle,
   isUserAllowed,
   mcpResource,
+  OAUTH_BODY_MAX,
   oauthError,
   parseScopeParam,
   pkceChallenge,
   preflight,
+  REFRESH_IDLE_DAYS,
   scopeString,
   touchClient,
 } from "@/lib/oauth";
@@ -27,16 +42,21 @@ import { db } from "@/lib/supabase";
 //    verifier for an api_tokens row (30 days, tagged with the client) and a
 //    refresh token. A code works once: the request that flips used_at wins,
 //    a replay loses, and a replay of a code that already produced a token
-//    revokes that token (RFC 6749 §4.1.2: the code may have leaked).
+//    revokes that token (RFC 6749 §4.1.2: the code may have leaked). One
+//    connection per client per user: the client's earlier tokens for the
+//    user are revoked first, and the new token must fit under the account's
+//    MAX_ACTIVE_TOKENS like a dashboard token.
 //  refresh_token: rotates. The same row gets a new access token and a new
 //    refresh token, so the presented pair dies and the Assistants panel keeps
-//    one entry per connected client. Scopes may narrow, never widen.
+//    one entry per connected client. Scopes may narrow, never widen. The
+//    refresh token a rotation replaced, presented again, revokes the row
+//    (RFC 9700 §4.14.2), and a connection unused for REFRESH_IDLE_DAYS can't
+//    be refreshed.
 //
 // Codes, verifiers and tokens are never logged and never echoed in an error.
 
 const METHODS = "POST, OPTIONS";
 const HEADERS = { ...corsHeaders(METHODS), "Cache-Control": "no-store", Pragma: "no-cache" };
-const BODY_MAX = 64 * 1024;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const TOKEN_PARAMS = [
   "grant_type",
@@ -51,6 +71,8 @@ const TOKEN_PARAMS = [
 
 const fail = (error: OAuthErrorCode, description: string, status = 400) =>
   oauthError(error, description, status, HEADERS);
+
+const tooLarge = () => fail("invalid_request", "The request body is too large", 413);
 
 function tokenResponse(token: string, refreshToken: string, scopes: ApiScope[]) {
   return NextResponse.json(
@@ -68,11 +90,12 @@ function tokenResponse(token: string, refreshToken: string, scopes: ApiScope[]) 
 /**
  * The request parameters: application/x-www-form-urlencoded as the spec
  * requires, or a flat JSON object of strings, which some clients send. Null
- * when the body is neither.
+ * when the body is neither; "too large" past OAUTH_BODY_MAX.
  */
-async function readParams(req: NextRequest): Promise<URLSearchParams | null> {
+async function readParams(req: NextRequest): Promise<URLSearchParams | null | "too large"> {
   const text = await req.text().catch(() => null);
-  if (text === null || text.length > BODY_MAX) return null;
+  if (text === null) return null;
+  if (text.length > OAUTH_BODY_MAX) return "too large";
   const contentType = req.headers.get("content-type")?.toLowerCase() ?? "";
   if (!contentType.includes("json")) return new URLSearchParams(text);
 
@@ -160,6 +183,17 @@ async function exchangeCode(params: URLSearchParams): Promise<Response> {
   const userId = String(row.user_id);
   if (!(await isUserAllowed(userId))) return fail("invalid_grant", "This account can no longer use this server");
 
+  // One connection per registered client per user: a client exchanging a fresh
+  // code has lost or dropped the tokens it had, so they go, and don't pile up.
+  await revokeClientTokens(userId, clientId);
+  // The same ceiling a dashboard token is created under.
+  if ((await countActiveApiTokens(userId)) >= MAX_ACTIVE_TOKENS) {
+    return fail(
+      "invalid_grant",
+      "This account already has the maximum number of active tokens; revoke one in the Assistants panel"
+    );
+  }
+
   const scopes = normalizeScopes(
     (Array.isArray(row.scopes) ? row.scopes : []).filter((s: unknown): s is ApiScope => s === "read" || s === "write")
   );
@@ -200,9 +234,21 @@ async function refresh(params: URLSearchParams): Promise<Response> {
   const client = await getClient(clientId);
   if (!client) return fail("invalid_client", "Unknown client_id", 401);
 
-  const grant = await findRefreshGrant(refreshToken);
   const badToken = () => fail("invalid_grant", "The refresh token is invalid, revoked or already used");
-  if (!grant || grant.clientId !== clientId) return badToken();
+  const grant = await findRefreshGrant(refreshToken);
+  if (!grant) {
+    // A refresh token that a rotation already replaced: it leaked, or a client
+    // is replaying it. Revoke the connection; one log line, the token id only.
+    const reusedTokenId = await revokeReusedRefreshToken(refreshToken);
+    if (reusedTokenId) {
+      console.error(`POST /oauth/token: a rotated-away refresh token was presented again; revoked token ${reusedTokenId}`);
+    }
+    return badToken();
+  }
+  if (grant.clientId !== clientId) return badToken();
+  if (isRefreshIdle(grant.lastUsedAt)) {
+    return fail("invalid_grant", `The connection went unused for ${REFRESH_IDLE_DAYS} days; connect again`);
+  }
 
   const scopes = requested.length > 0 ? normalizeScopes(requested) : grant.scopes;
   if (!scopes.every((s) => grant.scopes.includes(s))) {
@@ -216,7 +262,11 @@ async function refresh(params: URLSearchParams): Promise<Response> {
 }
 
 export async function POST(req: NextRequest) {
+  // Refused before reading a byte when the client says how big it is; the
+  // length check after reading covers a body sent without Content-Length.
+  if (declaresOversizedBody(req)) return tooLarge();
   const params = await readParams(req);
+  if (params === "too large") return tooLarge();
   if (!params) return fail("invalid_request", "Expected an application/x-www-form-urlencoded body");
   const repeated = TOKEN_PARAMS.find((name) => params.getAll(name).length > 1);
   if (repeated) return fail("invalid_request", `${repeated} was sent more than once`);
