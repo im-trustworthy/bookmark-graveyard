@@ -198,6 +198,152 @@ The `/api/cron/sync` address then syncs and analyzes new bookmarks for everyone 
 `render.yaml` and `vercel.json` already schedule it for Fridays at 12:00 UTC. Without
 `CRON_SECRET` it stays off.
 
+## Works with your AI assistant
+
+You can connect Bookmark Graveyard to an AI assistant and then ask it things in plain chat: "What did
+I save about open-source licenses?" or "Make me a podcast from last week's AI bookmarks." The
+assistant can search your bookmarks, read your finished briefs and start a new one. It works with
+[Grok](https://grok.com), [Claude](https://claude.ai), [ChatGPT](https://chatgpt.com), editors such
+as [Cursor](https://cursor.com), and any other assistant that supports
+[MCP](https://modelcontextprotocol.io). MCP, the Model Context Protocol, is an open standard that
+lets an assistant use tools in another app, so one connector serves all of them.
+
+Your instance has one connector address: your `APP_URL` plus `/api/mcp`, such as
+`https://your-domain/api/mcp`. Assistants reach it over the internet, so use your deployed address.
+To try it from your own computer, see [SETUP.md](SETUP.md#connecting-an-assistant-mcp).
+
+There are two ways to let an assistant in:
+
+- **Sign in.** Some assistants can sign in for you: claude.ai, ChatGPT custom connectors, and
+  grok.com if its connector screen offers sign-in. Add the connector address. A page from your
+  instance opens and says what the assistant is asking for. Click **Approve**. If you are not signed
+  in, it sends you through X first. There is nothing to copy.
+- **A token.** Other assistants want a secret to send with every request, called a bearer token. It
+  works like an API key. On the dashboard, open the **Assistants** panel (just below Voices) and
+  click **Set up**. Name the token (say, "Grok"), choose **Read only** or **Read and write**, and
+  click **Create token**. Copy it right away, because it is shown once. Paste it where the assistant
+  asks for a token, an API key or an authorization header.
+
+Make one token per assistant, so you can cancel one without breaking the others. Anyone who has a
+token can read your bookmarks as you, so keep it as private as a password. Choose **Read only**
+unless you want the assistant to start briefs.
+
+Menu names in other companies' apps change often, so the steps below say what to look for. Each link
+goes to that company's current guide.
+
+### Grok
+
+- **[grok.com Connectors](https://grok.com/connectors).** Click **New Connector**, choose
+  **Custom**, paste the connector address, then finish the authentication step: sign in if it
+  offers that, or give it a token. [xAI's connector guide](https://docs.x.ai/grok/connectors#custom-mcp-connectors)
+  has the current steps. Grok refuses addresses on your own computer, so use your deployed instance
+  or a [tunnel](https://docs.x.ai/grok/connectors/custom-mcp-tunneling).
+- **[Grok Bot](https://docs.x.ai/grok-bot/overview).** Look for **Connect apps** in the sidebar, or
+  ask the Bot to add an MCP server by its address
+  ([xAI's guide](https://docs.x.ai/grok-bot/computer-and-apps)). Give it the connector address and,
+  if it asks, a token. Then a [routine](https://docs.x.ai/grok-bot/skills-routines-and-automations)
+  can use it: "Every Friday at 9:00, start a podcast brief of my last seven days of bookmarks. Check
+  on it until it is done, then post the title and the audio link."
+
+### Claude Code
+
+[Claude Code](https://code.claude.com/docs/en/mcp) is Anthropic's coding assistant for the terminal.
+To connect with sign-in:
+
+```bash
+claude mcp add --transport http bookmark-graveyard https://your-domain/api/mcp
+```
+
+Then run `/mcp` inside Claude Code and follow its sign-in. To connect with a token instead:
+
+```bash
+claude mcp add --transport http bookmark-graveyard https://your-domain/api/mcp \
+  --header "Authorization: Bearer <token>"
+```
+
+### claude.ai and ChatGPT
+
+Both connect by signing in, so you do not need a token.
+
+- **[claude.ai](https://claude.ai).** Look for **Connectors** in the settings (it has been under
+  Customize), choose to add a custom connector, give it a name and paste the connector address.
+  [Anthropic's help article](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
+  has the current steps. Choose to sign in, then approve on the page that opens.
+- **[ChatGPT](https://chatgpt.com).** Look in the settings for apps or connectors and an option to
+  add a custom one. Some plans do not offer it, and it may sit behind a developer mode switch. Paste
+  the connector address and approve on the page that opens.
+  [OpenAI's MCP guide](https://developers.openai.com/api/docs/mcp) explains the terms.
+
+### Cursor and other editors
+
+[Cursor](https://cursor.com/docs/mcp) and other editors with MCP support take the connector address
+and an `Authorization` header. In Cursor, put this in `mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "bookmark-graveyard": {
+      "url": "https://your-domain/api/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+The file format differs from editor to editor, so follow your editor's MCP guide. Grok Build, xAI's
+command-line tool, takes the same two pieces:
+`grok mcp add --transport http bookmark-graveyard https://your-domain/api/mcp --header "Authorization: Bearer <token>"`
+([xAI's guide](https://docs.x.ai/build/features/mcp-servers)). Any other MCP client works the same
+way: give it the address and the header `Authorization: Bearer <token>`.
+
+### What the assistant can do
+
+The connector gives an assistant seven tools. You never call them yourself. You ask in chat, and the
+assistant picks the right one.
+
+- **Search your bookmarks** (`search_bookmarks`). Finds posts by words, topic, date posted, or
+  "flagged as disputed or misleading". Each result has the post, its summary, key claims and topics.
+  It searches your newest 1,000 visible bookmarks.
+- **List your topics** (`list_topics`), with how many posts carry each.
+- **List your briefs** (`list_episodes`), newest first, with links to the markdown and the audio.
+- **Read a brief** (`get_episode`): the full text, and the podcast script if asked.
+- **Check on a brief** (`get_brief_status`) that is being written.
+- **Start a brief** (`generate_brief`): markdown or podcast, from a date range, topics or hand-picked
+  posts. It needs read-and-write access.
+- **Hide a bookmark** (`hide_bookmark`) from your library and every future brief. It needs
+  read-and-write access. The app cannot unhide it yet, and it does not touch X.
+
+Only starting a brief costs money. It spends one of your daily brief allowances and your xAI credits
+(plus voice credits for a podcast), the same as pressing **Create my brief**. If the assistant asks
+it to check X for new bookmarks first, X charges for those reads too. Everything else only reads
+what the app has already stored, so it is free.
+
+### Example prompts
+
+- "What did I bookmark about MCP last month?"
+- "Which topics do I save the most? Show me the top ten."
+- "Read my latest brief and give me the five points worth remembering."
+- "Make a markdown brief of my AI agent bookmarks from the past week, and tell me when it is ready."
+- "Make a podcast from everything I saved last week and give me the audio link."
+
+### Good to know
+
+- A markdown brief takes about 3 minutes, and a podcast about 12. The assistant starts it, then
+  checks on it about once a minute until it is done.
+- Links the assistant shares keep working, but they open only after you sign in. On a device where
+  you are not signed in to Bookmark Graveyard, you land on the sign-in page. Sign in, then open the
+  link again.
+- On [Vercel](https://vercel.com) and similar hosts, background work is
+  [cut off after five minutes](https://vercel.com/docs/functions/configuring-functions/duration). A
+  long podcast then needs the assistant to keep checking in, and each check carries it forward. On
+  [Render](https://render.com) and other always-on hosts it finishes on its own.
+- Bookmark text is written by other people. The assistant is told to treat it as information, not
+  as instructions, but no assistant is perfectly safe from a post that tries to steer it. Give
+  read-and-write access only to assistants you trust.
+- To cut an assistant off, click **Revoke** next to its token in the Assistants panel. Assistants
+  that connected by signing in are listed there too, tagged "Connected by sign-in". The assistant
+  loses access on its next request.
+
 ## Deploy anywhere
 
 Bookmark Graveyard is a standard Node.js app. Use any host that runs Node 22+ and takes environment
@@ -228,7 +374,9 @@ After you deploy:
 4. **Set `CRON_SECRET`** if you want the weekly sync.
 5. **Optionally set `GATE_PASSWORD`.** It puts a single shared password in front of every page,
    including the landing page, for people who want the instance unlisted. Leave it unset for no
-   wall.
+   wall. A few endpoints stay open on purpose, including the assistant connector at `/api/mcp`,
+   because each one has its own lock. [SETUP.md](SETUP.md#what-the-password-gate-leaves-open) lists
+   them.
 
 **Fully local.** You can run the database on your own computer too. Install
 [Docker](https://www.docker.com) and the
@@ -247,6 +395,7 @@ Prices as of October 2026.
 | --- | --- | --- |
 | X: reading bookmarks | $0.001 per post read | Each check re-reads your whole list: a few cents for a small library, at most about $0.80 for 800 posts |
 | [Grok](https://x.ai): tagging, summaries and writing the brief | Per token, with a cheap model for bulk work and a smarter one for writing | Typically well under $1 a month for a sync and a weekly brief |
+| AI assistant: searching and reading | Free | Reads what the app already stored and spends no credits. Starting a brief from an assistant costs the same as the dashboard button |
 | Podcast voice: Grok Voice | $15 per 1M characters, on the same xAI credits | About $0.20 per 15-minute episode |
 | Podcast voice: [ElevenLabs](https://elevenlabs.io) Creator plan | $22 a month for 121,000 credits | About $1.25 per episode |
 | Podcast voice: ElevenLabs usage-based | $0.04 per 1,000 characters (Turbo) | About $0.55 per episode |
@@ -267,6 +416,8 @@ Daily limits built into the app also stop a bug or a stolen session from running
   bucket called `episodes`. The app opens them with links that expire after 24 hours.
 - Your X sign-in tokens, and any voice API key you paste into the Voices panel. Both are encrypted
   with AES-GCM under `APP_ENCRYPTION_KEY`. The panel shows a key's last four characters at most.
+- Assistant access: a one-way hash of each assistant token (never the token itself), the assistants
+  you approved by signing in, and a record of the briefs an assistant started.
 
 **What leaves your server:**
 
@@ -276,6 +427,9 @@ Daily limits built into the app also stop a bug or a stolen session from running
   it. Grok's live search runs on xAI's side when a post says its link is in the replies.
 - [ElevenLabs](https://elevenlabs.io), only if you choose it: script lines to speak, and video audio
   to transcribe.
+- An AI assistant you connect. Whatever it asks for, such as your bookmark text, summaries and
+  briefs, goes to that assistant's company and is handled under its terms. Connect only assistants
+  you trust with your reading list.
 - The websites your bookmarks link to. The server fetches those articles, and it refuses private
   addresses.
 - The optional daily [GitHub Actions](https://docs.github.com/actions) job downloads X's public
@@ -332,7 +486,15 @@ Four optional environment variables tune it:
 - `KEEP_RECENT_AUDIO`: how many of each person's newest briefs keep their audio. The default is 4.
 
 **"Daily limit reached."** The app caps paid actions per person per day. Wait, or raise the cap with
-`LIMIT_<KIND>_PER_DAY`, such as `LIMIT_SYNC_PER_DAY`.
+`LIMIT_<KIND>_PER_DAY`, such as `LIMIT_SYNC_PER_DAY`. Assistant tool calls have their own cap,
+`LIMIT_MCP_CALL_PER_DAY`, which is 1,000.
+
+**An assistant says "unauthorized", or sign-in to it fails.** The connector address must be your
+`APP_URL` plus `/api/mcp`, character for character, including `https`, any `www.` and any port. The
+app builds its sign-in details from `APP_URL`, so a deployed instance whose `APP_URL` still says
+`http://localhost:3000` cannot sign an assistant in. With a token, check that you copied all of it
+(it starts with `bg_`) and that it has not been revoked or expired in the Assistants panel. Grok also
+refuses `localhost` addresses.
 
 ## More
 
