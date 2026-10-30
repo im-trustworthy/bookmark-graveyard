@@ -8,10 +8,15 @@ import { db } from "./supabase";
 // prefix; the plaintext is returned once by mintApiToken and never logged or
 // put in an error message. The table is managed from the dashboard through the
 // cookie-only /api/tokens routes, so a token can never mint another token.
+//
+// Tokens minted through OAuth (src/lib/oauth.ts) are the same rows with
+// client_id set and a refresh token ("bgr_" plus 32 random bytes, stored as
+// refresh_token_hash). Refreshing rewrites that row in place, so the old access
+// and refresh tokens stop working together.
 
 export type ApiScope = "read" | "write";
 
-/** Every column the dashboard may see: everything except token_hash. */
+/** Every column the dashboard may see: everything except token_hash and refresh_token_hash. */
 export interface ApiTokenRecord {
   id: string;
   name: string;
@@ -31,6 +36,8 @@ export interface VerifiedToken {
 }
 
 export const TOKEN_PREFIX = "bg_";
+/** OAuth refresh tokens: a different prefix, so one can never pass for an access token. */
+export const REFRESH_TOKEN_PREFIX = "bgr_";
 /** Characters of the token kept for display ("bg_" plus five). */
 export const DISPLAY_PREFIX_LENGTH = 8;
 /** At most this many tokens per user may be live (not revoked, not expired) at once. */
@@ -41,6 +48,7 @@ export const LAST_USED_THROTTLE_MS = 5 * 60 * 1000;
 const PUBLIC_COLUMNS = "id, name, prefix, scopes, client_id, created_at, last_used_at, expires_at, revoked_at";
 // "bg_" + base64url of 32 bytes (43 characters, no padding).
 const TOKEN_SHAPE = /^bg_[A-Za-z0-9_-]{43}$/;
+const REFRESH_TOKEN_SHAPE = /^bgr_[A-Za-z0-9_-]{43}$/;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** `write` implies `read`. */
@@ -79,24 +87,32 @@ function toRecord(row: Record<string, unknown>): ApiTokenRecord {
   };
 }
 
-/**
- * Creates a token for `userId` and returns its plaintext. This is the only
- * time the plaintext exists outside the caller's hands: the row keeps its hash.
- */
-export async function mintApiToken(
+const newSecret = (prefix: string) => prefix + randomBytes(32).toString("base64url");
+
+function expiryFrom(now: Date, days: number | null): string | null {
+  if (days !== null && !(Number.isInteger(days) && days > 0)) {
+    throw new Error("expiresInDays must be a positive whole number of days");
+  }
+  return days === null ? null : new Date(now.getTime() + days * DAY_MS).toISOString();
+}
+
+async function insertToken(
   userId: string,
-  opts: { name: string; scopes: ApiScope[]; expiresInDays?: number | null }
+  opts: {
+    name: string;
+    scopes: ApiScope[];
+    expiresInDays: number | null;
+    clientId: string | null;
+    refreshToken: string | null;
+  }
 ): Promise<{ token: string; record: ApiTokenRecord }> {
   const name = opts.name.trim();
   if (!name) throw new Error("Token name is required");
   const scopes = normalizeScopes(opts.scopes);
-  const days = opts.expiresInDays ?? null;
-  if (days !== null && !(Number.isInteger(days) && days > 0)) {
-    throw new Error("expiresInDays must be a positive whole number of days");
-  }
-
-  const token = TOKEN_PREFIX + randomBytes(32).toString("base64url");
   const now = new Date();
+  const expiresAt = expiryFrom(now, opts.expiresInDays);
+
+  const token = newSecret(TOKEN_PREFIX);
   const { data, error } = await db()
     .from("api_tokens")
     .insert({
@@ -106,13 +122,130 @@ export async function mintApiToken(
       prefix: token.slice(0, DISPLAY_PREFIX_LENGTH),
       token_hash: hashToken(token),
       scopes,
+      client_id: opts.clientId,
+      refresh_token_hash: opts.refreshToken === null ? null : hashToken(opts.refreshToken),
       created_at: now.toISOString(),
-      expires_at: days === null ? null : new Date(now.getTime() + days * DAY_MS).toISOString(),
+      expires_at: expiresAt,
     })
     .select(PUBLIC_COLUMNS)
     .single();
   if (error || !data) throw new Error(`Couldn't save the token: ${error?.message ?? "no row returned"}`);
   return { token, record: toRecord(data) };
+}
+
+/**
+ * Creates a token for `userId` and returns its plaintext. This is the only
+ * time the plaintext exists outside the caller's hands: the row keeps its hash.
+ */
+export async function mintApiToken(
+  userId: string,
+  opts: { name: string; scopes: ApiScope[]; expiresInDays?: number | null }
+): Promise<{ token: string; record: ApiTokenRecord }> {
+  return insertToken(userId, {
+    name: opts.name,
+    scopes: opts.scopes,
+    expiresInDays: opts.expiresInDays ?? null,
+    clientId: null,
+    refreshToken: null,
+  });
+}
+
+/**
+ * OAuth: a token for `userId` tagged with the client that obtained it, plus a
+ * refresh token. Both plaintexts are returned once; the row keeps their hashes.
+ */
+export async function mintOAuthToken(
+  userId: string,
+  opts: { clientId: string; name: string; scopes: ApiScope[]; expiresInDays: number }
+): Promise<{ token: string; refreshToken: string; record: ApiTokenRecord }> {
+  if (!opts.clientId) throw new Error("clientId is required");
+  const refreshToken = newSecret(REFRESH_TOKEN_PREFIX);
+  const { token, record } = await insertToken(userId, {
+    name: opts.name,
+    scopes: opts.scopes,
+    expiresInDays: opts.expiresInDays,
+    clientId: opts.clientId,
+    refreshToken,
+  });
+  return { token, refreshToken, record };
+}
+
+/** The token row a refresh token belongs to, as far as the refresh grant needs it. */
+export interface RefreshGrant {
+  tokenId: string;
+  userId: string;
+  clientId: string | null;
+  scopes: ApiScope[];
+}
+
+/**
+ * The grant behind a presented refresh token, or null when it is unknown (or
+ * already rotated away), revoked, or belongs to a user who is no longer
+ * allowed. An expired access token can still be refreshed: that is what
+ * refreshing is for. Throws only when the database can't be asked.
+ */
+export async function findRefreshGrant(refreshToken: string): Promise<RefreshGrant | null> {
+  if (!REFRESH_TOKEN_SHAPE.test(refreshToken)) return null; // not one of ours: no lookup
+  const { data: row, error } = await db()
+    .from("api_tokens")
+    .select("id, user_id, client_id, scopes, revoked_at")
+    .eq("refresh_token_hash", hashToken(refreshToken))
+    .maybeSingle();
+  if (error) throw new Error(`Refresh token lookup failed: ${error.message}`);
+  if (!row || row.revoked_at) return null;
+
+  const { data: user, error: userError } = await db()
+    .from("users")
+    .select("is_allowed")
+    .eq("id", row.user_id)
+    .maybeSingle();
+  if (userError) throw new Error(`Token owner lookup failed: ${userError.message}`);
+  if (!user?.is_allowed) return null;
+
+  const scopes = Array.isArray(row.scopes) ? row.scopes.filter((s: unknown) => s === "read" || s === "write") : [];
+  return {
+    tokenId: String(row.id),
+    userId: String(row.user_id),
+    clientId: (row.client_id as string | null | undefined) ?? null,
+    scopes,
+  };
+}
+
+/**
+ * Refresh-token rotation: writes a new access token and a new refresh token
+ * onto the grant's row (with `scopes`, which may only narrow, and a fresh
+ * expiry), so the presented pair stops working. The write is conditional on
+ * the row still holding `refreshToken`, so of two concurrent refreshes with the
+ * same token only one wins; the other gets null.
+ */
+export async function rotateOAuthToken(
+  grant: RefreshGrant,
+  refreshToken: string,
+  opts: { scopes: ApiScope[]; expiresInDays: number }
+): Promise<{ token: string; refreshToken: string; record: ApiTokenRecord } | null> {
+  const scopes = normalizeScopes(opts.scopes);
+  if (!scopes.every((s) => grant.scopes.includes(s))) throw new Error("A refresh can't widen a token's scopes");
+  const now = new Date();
+  const token = newSecret(TOKEN_PREFIX);
+  const nextRefreshToken = newSecret(REFRESH_TOKEN_PREFIX);
+  const { data, error } = await db()
+    .from("api_tokens")
+    .update({
+      token_hash: hashToken(token),
+      prefix: token.slice(0, DISPLAY_PREFIX_LENGTH),
+      refresh_token_hash: hashToken(nextRefreshToken),
+      scopes,
+      expires_at: expiryFrom(now, opts.expiresInDays),
+      last_used_at: now.toISOString(),
+    })
+    .eq("id", grant.tokenId)
+    .eq("refresh_token_hash", hashToken(refreshToken))
+    .is("revoked_at", null)
+    .select(PUBLIC_COLUMNS)
+    .maybeSingle();
+  if (error) throw new Error(`Couldn't rotate the token: ${error.message}`);
+  if (!data) return null;
+  return { token, refreshToken: nextRefreshToken, record: toRecord(data) };
 }
 
 /**

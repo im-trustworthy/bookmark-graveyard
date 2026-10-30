@@ -58,8 +58,28 @@ describe("GATE_PASSWORD set: the wall is on", () => {
   });
 
   it("redirects / to /gate without a cookie", () => {
-    const res = proxy(request("/?error=auth_failed"));
+    const res = proxy(request("/"));
     expect([307, 308]).toContain(res.status);
+    expect(res.headers.get("location")).toBe("http://localhost:3000/gate");
+  });
+
+  // The blocked GET's path and query ride along, so /api/gate can return there.
+  it.each([
+    ["/?error=auth_failed", "/?error=auth_failed"],
+    ["/api/auth/login?next=%2Foauth%2Fauthorize%3Fx%3D1", "/api/auth/login?next=%2Foauth%2Fauthorize%3Fx%3D1"],
+    ["/api/tokens", "/api/tokens"],
+  ])("carries %s to /gate as next", (path, next) => {
+    const res = proxy(request(path));
+    expect([307, 308]).toContain(res.status);
+    const target = new URL(res.headers.get("location")!);
+    expect(target.origin).toBe("http://localhost:3000");
+    expect(target.pathname).toBe("/gate");
+    expect([...target.searchParams.keys()]).toEqual(["next"]);
+    expect(target.searchParams.get("next")).toBe(next);
+  });
+
+  it("carries no next for a blocked POST", () => {
+    const res = proxy(new NextRequest("http://localhost:3000/api/tokens", { method: "POST" }));
     expect(res.headers.get("location")).toBe("http://localhost:3000/gate");
   });
 
@@ -80,6 +100,18 @@ describe("GATE_PASSWORD set: the wall is on", () => {
     expect(passesThrough(proxy(request(path)))).toBe(true);
   });
 
+  // OAuth for web chat assistants: the machine endpoints are called server to
+  // server, and the browser steps require the X sign-in (and a signed consent).
+  it.each([
+    "/oauth/token",
+    "/oauth/register",
+    "/oauth/authorize?response_type=code&client_id=abc",
+    "/oauth/authorize/consent?client_id=abc",
+    "/api/oauth/decision",
+  ])("passes the OAuth route %s through without a cookie", (path) => {
+    expect(passesThrough(proxy(request(path)))).toBe(true);
+  });
+
   // ...and nothing that merely looks like them.
   it.each([
     "/api/mcp/extra",
@@ -92,10 +124,17 @@ describe("GATE_PASSWORD set: the wall is on", () => {
     "/api/episodes/a/b/audio",
     "/api/tokens",
     "/api/tokens/ep-1",
+    "/oauth",
+    "/oauthx/token",
+    "/api/oauth/decision/extra",
+    "/api/oauth/other",
+    "/api/auth/login",
   ])("still redirects %s to /gate without a cookie", (path) => {
     const res = proxy(request(path));
     expect([307, 308]).toContain(res.status);
-    expect(res.headers.get("location")).toBe("http://localhost:3000/gate");
+    const target = new URL(res.headers.get("location")!);
+    expect(`${target.origin}${target.pathname}`).toBe("http://localhost:3000/gate");
+    expect(target.searchParams.get("next")).toBe(path);
   });
 
   it("passes / through with the cookie /api/gate mints", () => {
@@ -118,14 +157,20 @@ describe("GATE_PASSWORD set: the wall is on", () => {
 describe("matcher", () => {
   // The proxy never runs for paths with a dot, so the OAuth metadata routes under
   // /.well-known/ need no OPEN_PATHS entry to stay reachable on a gated instance.
-  it.each(["/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server", "/_next/static/x"])(
+  it.each([
+    "/.well-known/oauth-protected-resource",
+    "/.well-known/oauth-protected-resource/api/mcp",
+    "/.well-known/oauth-authorization-server",
+    "/.well-known/openid-configuration",
+    "/_next/static/x",
+  ])(
     "skips %s",
     (url) => {
       expect(unstable_doesMiddlewareMatch({ config, url })).toBe(false);
     }
   );
 
-  it.each(["/", "/api/mcp", "/api/episodes/ep-1/audio", "/api/tokens"])("runs for %s", (url) => {
+  it.each(["/", "/api/mcp", "/api/episodes/ep-1/audio", "/api/tokens", "/oauth/token", "/oauth/authorize"])("runs for %s", (url) => {
     expect(unstable_doesMiddlewareMatch({ config, url })).toBe(true);
   });
 });
