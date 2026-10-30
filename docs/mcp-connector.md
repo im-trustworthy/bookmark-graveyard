@@ -604,6 +604,43 @@ Where the code differs from the design above, the code wins. The differences:
   client keeps one connection.
 - **`is_allowed` is rewritten at each X sign-in**, so removing someone from `ALLOWED_X_USER_IDS` does
   not cut off their tokens until that flag changes. The design's wording glosses over that.
+- **Client ID Metadata Documents (added 2026-10-30).** Besides registering, a client may send the
+  https URL of a JSON document about itself as its `client_id`
+  ([draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/),
+  which the MCP authorization spec adopts; claude.ai calls it "Claude's published identity"). The
+  server metadata says `client_id_metadata_document_supported: true`.
+  - *The URL.* `https` only, already in the URL parser's canonical form (which rules out dot segments,
+    a spelled-out default port, an upper-case host and a missing path, since the document's
+    `client_id` must match it character for character), no fragment or user name, at most 2,000
+    characters, and not a reserved name or special-use IP literal.
+  - *The fetch* (`src/lib/ssrf.ts`, the approach of `ingest.ts`): every address the host resolves to
+    must be public, by a list stricter than ingest's that covers all of RFC 6890 plus multicast and
+    the IPv6 transition prefixes; one GET with `Accept: application/json`, `redirect: "manual"` and
+    Next's cache off; only a 200 counts, so a redirect is refused, not followed; at most 5 KB read
+    (the draft's recommended limit) and 5 seconds in all, DNS included.
+  - *The document* is untrusted. Its `client_id` must equal the URL exactly; it may not carry
+    `client_secret` or `client_secret_expires_at`; it must have a string `client_name`; and the rest
+    goes through the same `parseClientMetadata` as a registration: 1 to 10 redirect URIs under the
+    usual rules, `token_endpoint_auth_method` absent or `none`, only the code flow and refresh, the
+    name cleaned and cut to 100 characters.
+  - *Cache.* A valid document is kept in memory for five minutes (at most 500 of them), so the
+    authorize route, the consent page and the decision fetch it once between them. A failure or an
+    invalid document is never cached. Five minutes is both the upper and lower bound the draft lets a
+    server set, so `Cache-Control` on the document is not consulted.
+  - *Storage: a row per approved client, not URL ids beside the rows.* `oauth_codes.client_id`
+    references `oauth_clients`, so when the user approves, the decision route upserts an
+    `oauth_clients` row keyed by the URL with the document's name and redirect URIs. Everything after
+    that is unchanged: the code, the token endpoint (which reads that row and never fetches), "connect
+    again replaces the earlier connection" (`revokeClientTokens` by `client_id`), and pruning and
+    eviction. The authorization request never reads that row: it always goes by the document, so a
+    redirect URI the client drops stops working at the next sign-in. Rows are written only on an
+    approval by a signed-in, allowed user, so they can't be flooded; no migration was needed.
+  - *Display.* The consent page names the client with the host that published the document
+    ("Connect Claude (claude.ai)?"), says the name is self-published, and warns when the redirect is a
+    program on this computer, which any program can claim to be. The token is named the same way in
+    the Assistants panel.
+  - *Not supported:* `private_key_jwt` and other client authentication (public clients only), and
+    fetching `logo_uri` or any other URL in the document.
 - **The open decisions went the way the proposals suggested.** OAuth shipped with the endpoint
   (above); tokens default to no expiry, with an optional 90-day choice; `sync_first` is an input of
   `generate_brief`; cron ticking of stale jobs is an item in [ROADMAP.md](../ROADMAP.md); and the
@@ -644,9 +681,16 @@ Accepted, with the reason:
 - **The gated "unlisted" mode exposes the product name.** The OAuth metadata and the consent and
   error pages stay reachable behind the password gate and name Bookmark Graveyard. The gate is an
   extra layer for keeping an instance unlisted, never the lock; sign-in plus the allowlist is.
-- **Any client can call itself "Claude".** Dynamic registration takes the name the client gives. The
-  consent page shows the real destination, the redirect URI's host, next to the name, and asks the
-  user to approve only apps they added themselves.
+- **Any client can call itself "Claude".** Dynamic registration takes the name the client gives, and
+  a client metadata document says whatever its publisher wrote. The consent page shows what can be
+  checked next to the name: the host that published the document, if any, and the real destination,
+  the redirect URI's host, with a warning when that is a program on this computer. It asks the user to
+  approve only apps they added themselves.
+- **The metadata fetch can be pointed at any public https URL, unauthenticated.** That is how the
+  mechanism works: anyone can send `/oauth/authorize` a `client_id` URL. The guard keeps it off
+  private and special-use addresses, one GET of at most 5 KB in 5 seconds per request, and the
+  response never reaches the requester except as one of our fixed sentences. A DNS-rebinding host can
+  slip between the address check and the fetch, as for article fetching (see ROADMAP.md).
 - **Access tokens last 30 days.** Shorter ones would send users back through sign-in more often with
   clients that handle refresh badly, for a modest gain: revocation is immediate either way, because
   every request looks the token up.

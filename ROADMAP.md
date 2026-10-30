@@ -74,7 +74,10 @@ Non-blocking for personal use; worth doing before a public multi-user deploy.
   `fetch()` re-resolves a moment later, leaving a small rebinding window. Fully
   closing it needs pinning the vetted IP and connecting via a custom dispatcher
   (documented in `src/lib/ingest.ts`). Low risk on serverless; matters more on a
-  VM/container with internal network reach.
+  VM/container with internal network reach. The OAuth server's fetch of a client
+  metadata document (`src/lib/ssrf.ts`, added 2026-10-30) has the same window,
+  left open on purpose for the same reason; its special-use address list is
+  stricter than ingest's `isPrivateHost`, which could switch to it.
 - **Multi-draft resume.** Only the newest draft surfaces for resume; older
   orphaned drafts are invisible until the newer one resolves.
 - **Assistant connector: done in the 2026-10-30 security review.** Three items listed here when the

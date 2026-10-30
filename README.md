@@ -272,8 +272,8 @@ Both connect by signing in, so you do not need a token.
 - **[claude.ai](https://claude.ai).** Look for **Connectors** in the settings (it has been under
   Customize), choose to add a custom connector, give it a name and paste the connector address.
   [Anthropic's help article](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp)
-  has the current steps. Choose to sign in, and if it asks which OAuth client to use, pick automatic
-  registration (not Claude's published identity). Then approve on the page that opens.
+  has the current steps. Choose to sign in; if it asks which OAuth client to use, either Claude's
+  published identity or automatic registration works. Then approve on the page that opens.
 - **[ChatGPT](https://chatgpt.com).** Open [chatgpt.com/plugins](https://chatgpt.com/plugins), click
   **+**, then **Add custom MCP server**. Paste the connector address, choose to sign in, accept the
   warning and create it. Some plans and workspaces do not allow custom servers, and the menu has

@@ -18,6 +18,7 @@
 
 import { describe, expect, it } from "vitest";
 import { isPrivateHost } from "../ingest";
+import { isReservedHostname, isSpecialUseAddress } from "../ssrf";
 
 describe("isPrivateHost — IPv6 literals", () => {
   it.each([
@@ -108,4 +109,98 @@ describe("isPrivateHost — pre-existing IPv4 + hostname rules (must stay intact
   ])("treats %s as public", (host) => {
     expect(isPrivateHost(host)).toBe(false);
   });
+});
+
+// The stricter guard in ssrf.ts, for fetching an OAuth client's metadata
+// document: every special-use block of RFC 6890 and its updates, not only the
+// private and loopback ones. Pure functions; no DNS here.
+describe("isSpecialUseAddress", () => {
+  it.each([
+    "0.1.2.3",
+    "10.1.2.3",
+    "100.64.0.1", // shared address space
+    "100.127.255.255",
+    "127.0.0.1",
+    "169.254.169.254", // cloud metadata
+    "172.16.0.1",
+    "192.0.0.8",
+    "192.0.2.1", // documentation
+    "192.88.99.1",
+    "192.168.1.1",
+    "198.18.0.1", // benchmarking
+    "198.19.255.255",
+    "198.51.100.7",
+    "203.0.113.9",
+    "224.0.0.1", // multicast
+    "239.255.255.250",
+    "240.0.0.1", // reserved
+    "255.255.255.255",
+    "::",
+    "::1",
+    "[::1]",
+    "::7f00:1", // IPv4-compatible
+    "::ffff:127.0.0.1",
+    "::ffff:a00:1",
+    "::ffff:169.254.169.254",
+    "64:ff9b::a00:1", // NAT64
+    "100::1",
+    "2001::1", // Teredo
+    "2001:db8::1",
+    "2002:a00:1::1", // 6to4
+    "fc00::1",
+    "fd12:3456::1",
+    "fe80::1",
+    "fe80::1%en0",
+    "fec0::1",
+    "ff02::1",
+  ])("treats %s as special-use", (address) => {
+    expect(isSpecialUseAddress(address)).toBe(true);
+  });
+
+  it.each([
+    "8.8.8.8",
+    "151.101.1.1",
+    "100.63.255.255", // just below shared address space
+    "100.128.0.0", // just above it
+    "198.17.255.255",
+    "198.20.0.0",
+    "223.255.255.255",
+    "2606:4700::1111",
+    "2001:4860:4860::8888",
+    "2a00:1450:4001::1",
+    "::ffff:8.8.8.8",
+  ])("treats %s as public", (address) => {
+    expect(isSpecialUseAddress(address)).toBe(false);
+  });
+
+  it("is false for anything that isn't an IP address", () => {
+    expect(isSpecialUseAddress("example.com")).toBe(false);
+    expect(isSpecialUseAddress("")).toBe(false);
+  });
+});
+
+describe("isReservedHostname", () => {
+  it.each([
+    "localhost",
+    "LOCALHOST",
+    "localhost.",
+    "app.localhost",
+    "printer.local",
+    "printer.local.",
+    "metadata.google.internal",
+    "router.home.arpa",
+    "intranet", // a single label may be completed with an internal search domain
+    "127.0.0.1",
+    "[::1]",
+    "[fd00::1]",
+  ])("treats %s as reserved", (host) => {
+    expect(isReservedHostname(host)).toBe(true);
+  });
+
+  it.each(["claude.ai", "client.example.com", "8.8.8.8", "[2606:4700::1111]", "local.example.com"])(
+    "treats %s as possibly public (DNS decides)",
+    (host) => {
+      expect(isReservedHostname(host)).toBe(false);
+    }
+  );
 });

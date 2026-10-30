@@ -6,13 +6,11 @@ import {
   declaresOversizedBody,
   MAX_CLIENTS,
   MAX_EVICTIONS_PER_REGISTRATION,
-  MAX_REDIRECT_URIS,
   newClientId,
   OAUTH_BODY_MAX,
   oauthError,
+  parseClientMetadata,
   preflight,
-  redirectUriProblem,
-  sanitizeClientName,
 } from "@/lib/oauth";
 import type { OAuthErrorCode } from "@/lib/oauth";
 import { db } from "@/lib/supabase";
@@ -31,79 +29,9 @@ import { db } from "@/lib/supabase";
 
 const METHODS = "POST, OPTIONS";
 const HEADERS = { ...corsHeaders(METHODS), "Cache-Control": "no-store", Pragma: "no-cache" };
-const GRANT_TYPES = ["authorization_code", "refresh_token"];
-
-interface Registration {
-  client_name: string;
-  redirect_uris: string[];
-  grant_types: string[];
-  response_types: string[];
-}
 
 const fail = (error: OAuthErrorCode, description: string, status = 400) =>
   oauthError(error, description, status, HEADERS);
-
-const isStringArray = (value: unknown): value is string[] =>
-  Array.isArray(value) && value.every((item) => typeof item === "string");
-
-/** The registration to store, or the RFC 7591 error to answer with. */
-function parseRegistration(raw: unknown): Registration | { error: OAuthErrorCode; description: string } {
-  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-    return { error: "invalid_client_metadata", description: "Expected a JSON object with redirect_uris" };
-  }
-  const body = raw as Record<string, unknown>;
-
-  const uris = body.redirect_uris;
-  if (!Array.isArray(uris) || uris.length < 1 || uris.length > MAX_REDIRECT_URIS) {
-    return {
-      error: "invalid_redirect_uri",
-      description: `redirect_uris must be a list of 1 to ${MAX_REDIRECT_URIS} absolute URLs`,
-    };
-  }
-  for (const uri of uris) {
-    const problem = redirectUriProblem(uri);
-    if (problem) return { error: "invalid_redirect_uri", description: problem };
-  }
-
-  const method = body.token_endpoint_auth_method;
-  if (method !== undefined && method !== null && method !== "none") {
-    return {
-      error: "invalid_client_metadata",
-      description: 'token_endpoint_auth_method must be "none": this server only registers public clients (use PKCE)',
-    };
-  }
-
-  let grantTypes = GRANT_TYPES;
-  if (body.grant_types !== undefined && body.grant_types !== null) {
-    if (!isStringArray(body.grant_types) || body.grant_types.some((g) => !GRANT_TYPES.includes(g))) {
-      return {
-        error: "invalid_client_metadata",
-        description: 'grant_types may only contain "authorization_code" and "refresh_token"',
-      };
-    }
-    grantTypes = [...new Set(body.grant_types)];
-  }
-
-  if (body.response_types !== undefined && body.response_types !== null) {
-    if (!isStringArray(body.response_types) || body.response_types.some((r) => r !== "code")) {
-      return { error: "invalid_client_metadata", description: 'response_types may only contain "code"' };
-    }
-  }
-
-  if (body.scope !== undefined && body.scope !== null && typeof body.scope !== "string") {
-    return { error: "invalid_client_metadata", description: "scope must be a space-separated string" };
-  }
-  if (body.client_name !== undefined && body.client_name !== null && typeof body.client_name !== "string") {
-    return { error: "invalid_client_metadata", description: "client_name must be a string" };
-  }
-
-  return {
-    client_name: sanitizeClientName(body.client_name),
-    redirect_uris: [...new Set(uris as string[])],
-    grant_types: grantTypes,
-    response_types: ["code"],
-  };
-}
 
 /**
  * Makes room for one more registration: prunes, then evicts while the table is
@@ -142,7 +70,7 @@ export async function POST(req: NextRequest) {
   } catch {
     return fail("invalid_client_metadata", "Expected a JSON object with redirect_uris");
   }
-  const registration = parseRegistration(raw);
+  const registration = parseClientMetadata(raw);
   if ("error" in registration) return fail(registration.error, registration.description);
 
   try {
