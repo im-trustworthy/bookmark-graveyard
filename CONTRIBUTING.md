@@ -3,7 +3,7 @@
 Thanks for helping. Small fixes, bug reports and docs improvements are all welcome. For anything
 big, open an issue first so we can agree on the shape before you spend a weekend on it.
 
-Be kind. Assume good faith, keep feedback about the code, and welcome newcomers.
+Everyone taking part is expected to follow our [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Run it locally
 
