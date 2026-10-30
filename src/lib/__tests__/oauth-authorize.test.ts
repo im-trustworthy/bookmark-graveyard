@@ -68,6 +68,7 @@ function validRequest(overrides: Partial<AuthorizeRequest> = {}): AuthorizeReque
   return {
     clientId: CLIENT_ID,
     clientName: "Claude",
+    clientHost: null,
     redirectUri: REDIRECT,
     scopes: ["read"],
     state: "st-123",

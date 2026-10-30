@@ -15,6 +15,7 @@ import type { ApiScope } from "@/lib/api-tokens";
 import {
   ACCESS_TOKEN_DAYS,
   ACCESS_TOKEN_SECONDS,
+  clientLabel,
   corsHeaders,
   declaresOversizedBody,
   getClient,
@@ -199,7 +200,7 @@ async function exchangeCode(params: URLSearchParams): Promise<Response> {
   );
   const { token, refreshToken, record } = await mintOAuthToken(userId, {
     clientId,
-    name: client.client_name,
+    name: clientLabel(client),
     scopes,
     expiresInDays: ACCESS_TOKEN_DAYS,
   });
