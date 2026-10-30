@@ -59,9 +59,14 @@ export function proxy(req: NextRequest) {
   if (OPEN_PATHS.some((re) => re.test(pathname))) return NextResponse.next();
   if (hasValidGateCookie(req)) return NextResponse.next();
 
+  // A blocked GET remembers where it was going (path and query only, so it is
+  // same-origin by construction), and /api/gate returns there once the password
+  // is right. That keeps a flow such as OAuth sign-in alive on a gated instance.
+  const blocked = pathname + req.nextUrl.search;
   const url = req.nextUrl.clone();
   url.pathname = "/gate";
   url.search = "";
+  if (req.method === "GET" && blocked !== "/") url.searchParams.set("next", blocked);
   return NextResponse.redirect(url);
 }
 
