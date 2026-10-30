@@ -19,6 +19,7 @@ sign in.
 - [Grok model blend](#grok-model-blend)
 - [Voice provider interface](#voice-provider-interface)
 - [Capacity and pruning](#capacity-and-pruning)
+- [Connector (MCP)](#connector-mcp)
 - [Security measures](#security-measures)
 - [Scheduled jobs](#scheduled-jobs)
 - [Cost analysis](#cost-analysis)
@@ -43,6 +44,7 @@ Browser (dashboard.tsx, a client component)
    |  fetch, same-origin, bb_session cookie (HMAC-signed)
    v
 Next.js API routes  (src/app/api/**)
+   |<-- AI assistants (MCP clients): POST /api/mcp, bearer token only, never a cookie
    |
    |--> X API (api.x.com)              OAuth 2.0 PKCE login + bookmark reads
    |--> Supabase (Postgres + Storage)  service-role key only, RLS deny-all
@@ -65,9 +67,9 @@ Repository map:
 
 | Path | What lives there |
 | --- | --- |
-| `src/app/` | Pages, the dashboard (`dashboard.tsx`), the Voices panel (`voice-settings.tsx`), API routes under `api/` |
-| `src/lib/` | All the logic: `x.ts` (X API), `sync.ts`, `ingest.ts`, `brain.ts` (Grok prompts), `grok.ts`, `tts.ts`, `voice/` (providers), `capacity.ts`, `limits.ts`, `crypto.ts`, `session.ts` |
-| `src/proxy.ts` | The optional site-wide password gate |
+| `src/app/` | Pages, the dashboard (`dashboard.tsx`), the Voices and Assistants panels (`voice-settings.tsx`, `assistant-settings.tsx`), API routes under `api/`, OAuth sign-in for assistants under `oauth/` and `.well-known/` |
+| `src/lib/` | All the logic: `x.ts` (X API), `sync.ts`, `ingest.ts`, `brain.ts` (Grok prompts), `grok.ts`, `tts.ts`, `voice/` (providers), `capacity.ts`, `limits.ts`, `crypto.ts`, `session.ts`, and for assistants `mcp/` (the tools), `api-tokens.ts`, `oauth.ts`, `jobs.ts` (background briefs) and `digest.ts` (the four brief stages) |
+| `src/proxy.ts` | The optional site-wide password gate, which leaves the assistant endpoints open |
 | `supabase/migrations/` | The database schema, the source of truth |
 | `scripts/` | `setup.mjs` (`npm run setup`), `community-notes-sync.mjs`, plus two maintenance scripts |
 | `.github/workflows/` | The daily Community Notes job |
@@ -201,7 +203,9 @@ batch happens inside a request designed to finish well under the 300-second ceil
 Audio rendering is the slowest and most timeout-prone step, since it makes one TTS call per line of
 dialogue. So it is the one broken into the smallest chunks (12 lines) with the most granular
 client-visible progress. This staged design is what makes long briefs safe to generate from a
-regular HTTP request instead of needing a background job queue.
+regular HTTP request instead of needing a background job queue. The one exception is a brief an AI
+assistant starts, which a small server-side runner drives through the same four stages; see
+[Connector (MCP)](#connector-mcp).
 
 ## Data model
 
@@ -219,10 +223,16 @@ browser has no direct database access. Only the server's service-role client tou
 | `community_notes` | Matched notes from X's public dataset (note id, tweet id, text, classification, status) |
 | `episodes` | Generated briefs: title, format, filters used, storage paths, script, status (`draft`, `ready`, `failed`), `render_cursor`, `duration_seconds`, `audio_pruned_at`, and the pinned voice provider and host voices (`voice`) |
 | `user_voice_settings` | Per-user voice provider, encrypted key (null means use the instance key), two host voices |
-| `usage_events` | One row per spend-incurring action, for the rolling 24-hour caps |
+| `usage_events` | One row per spend-incurring action, and per assistant tool call (`mcp_call`), for the rolling 24-hour caps |
 | `record_usage()` | Postgres function that counts and inserts atomically, under a per-user-and-kind advisory lock |
 | `storage_usage_bytes()`, `database_size_bytes()` | Service-role-only functions that measure capacity |
-| Storage bucket `episodes` | The markdown and MP3 files themselves. Private, served to the browser via 24-hour signed URLs |
+| `api_tokens` | Assistant tokens: name, display prefix, SHA-256 `token_hash`, scopes, and for sign-in tokens a `client_id` and `refresh_token_hash`, plus `last_used_at`, `expires_at` and `revoked_at` |
+| `brief_jobs` | One row per assistant-started brief: validated params, status (`queued`, `running`, `done`, `failed`), stage, `episode_id`, progress counters, `heartbeat_at`, and the `token_id` that started it (no foreign key) |
+| `claim_brief_job()` | Postgres function that is the job runner's lease: claims a queued job, or takes over a stale one, in one statement |
+| `oauth_clients` | Assistants that registered themselves for sign-in: name and redirect URIs, public clients only |
+| `oauth_codes` | Authorization codes: hashed, five minutes, single use, with the PKCE challenge and the token each produced |
+| `prune_oauth_clients()` | Postgres function that deletes stale unused registrations and returns how many remain |
+| Storage bucket `episodes` | The markdown and MP3 files themselves. Private, served to the browser via 24-hour signed URLs, and to assistants through stable links that mint a fresh one-hour URL on each visit |
 
 ## Grok model blend
 
@@ -308,6 +318,186 @@ Four optional env vars tune it:
 A mistyped value throws instead of silently falling back to the free-tier default, which would prune
 a larger instance's audio.
 
+## Connector (MCP)
+
+An AI assistant (Grok, Claude, ChatGPT, Cursor, or any agent with an
+[MCP](https://modelcontextprotocol.io) client) can search the library, read briefs and start new ones
+through one HTTP endpoint. [docs/mcp-connector.md](docs/mcp-connector.md) is the original design and
+the reasoning behind it. Where it and the code differ, the code is right, and the list at the end of
+that file says where. For setup, see the [README](README.md#works-with-your-ai-assistant) and
+[SETUP.md](SETUP.md#connecting-an-assistant-mcp).
+
+### Endpoint
+
+`POST /api/mcp` (`src/app/api/mcp/route.ts`) is served by
+[`mcp-handler`](https://github.com/vercel-labs/mcp-handler) 2.x on the
+[MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk) 2.x, both pinned to exact
+versions because they are young. It is stateless Streamable HTTP: every request stands alone, with
+no session and no Redis. It speaks the 2026-07-28 revision of the protocol natively and falls back
+for 2025-era clients. `maxDuration` is 300 seconds, though tool calls are short; the long work runs in
+background jobs (below).
+
+- **Bearer only, never cookies.** The route accepts `Authorization: Bearer <token>` and nothing else.
+  It does not read the session cookie, so a page open in your browser cannot make it act for you and
+  there is no CSRF surface. Every request looks the token up (`verifyApiToken`), so a revoked or
+  expired token, or one whose owner is no longer allowed (`users.is_allowed`), stops working at once.
+- **The 401 challenge.** A missing or unknown token gets a 401 with an RFC 9728 `WWW-Authenticate`
+  header naming the protected resource metadata. Its address is built from `APP_URL`, never from the
+  request's `Host` or `X-Forwarded-*` headers, because clients compare it with the address they
+  connected to. An authenticated `GET` or `DELETE` answers 405, as a stateless server does.
+- **Content is not instructions.** The server's `instructions` and every tool description tell the
+  model that bookmark text, summaries and briefs were written by other people and are information to
+  report, never directions to follow. The server cannot control what a client's model does with
+  them, and it never acts on tool output itself.
+
+### Tokens
+
+`src/lib/api-tokens.ts` and the `api_tokens` table.
+
+- A token is `bg_` plus 32 random bytes in base64url. The table keeps only its SHA-256 hex
+  (`token_hash`, unique) and the first eight characters (`prefix`) for display. The token is 256 bits
+  of randomness, so a fast hash is right: there is nothing to brute-force. The plaintext is returned
+  once, by the create call, and never logged or put in an error message.
+- **Scopes.** `read` covers search, listing, reading and status checks and the episode links.
+  `write` adds `generate_brief` and `hide_bookmark`, and implies `read`. A token may expire (the
+  panel offers 90 days) and is revoked by setting `revoked_at`. `last_used_at` is rewritten at most
+  every five minutes, so a chatty client does not turn every call into a write. A person can hold 25
+  active tokens, checked when one is created in the panel.
+- **Management is cookie-only.** `GET` and `POST /api/tokens` and `DELETE /api/tokens/[id]` accept the
+  session cookie and never a bearer token, so a leaked token cannot mint, list or revoke tokens. The
+  Assistants panel on the dashboard (`src/app/assistant-settings.tsx`) is their only client. It shows
+  the connector URL, the token list, the create form and the one-time reveal.
+- `getUserIdFromRequest` in `src/lib/auth.ts` is the helper for routes an assistant may share with
+  the browser: the session cookie first, then a bearer token with the needed scope. The MCP route
+  skips it and uses the bearer alone.
+
+### OAuth sign-in
+
+Web chat products (claude.ai, ChatGPT, grok.com connectors) cannot be given a static header, so the
+app is also a small OAuth 2.1 authorization server for its own tokens
+(`src/lib/oauth.ts`, `src/app/oauth/**`, `src/app/.well-known/**`).
+
+- **Discovery.** RFC 9728 protected resource metadata and RFC 8414 server metadata, plus the same
+  server document at `/.well-known/openid-configuration` and the resource document at its
+  path-insertion address, since clients try different ones. Everything is built from `APP_URL`.
+- **Registration.** Dynamic client registration (RFC 7591) at `/oauth/register`, for public clients
+  only: no secret is issued, and the only token endpoint auth method is `none`. It is open to anyone,
+  so each registration first prunes stale ones (older than 30 days with no token and no code, in
+  `prune_oauth_clients()`), and past 1,000 clients it answers 503. Redirect URIs must be
+  `https`, `http` on a loopback host, or an app scheme such as `cursor://`. They match exactly,
+  except that a loopback URI may use any port.
+- **Authorization.** `GET /oauth/authorize` is a route handler, so it can answer with real status
+  codes. A bad client or an unregistered redirect URI gets an error page and never a redirect; any
+  other error goes back to the client; a missing X session goes to sign-in and returns. Otherwise it
+  redirects to the consent page, `/oauth/authorize/consent`, which checks everything again. PKCE with
+  `S256` is required.
+- **Consent.** The page shows which client is asking, the scopes, the account and where you will
+  land. Its form posts one hidden field to `/api/oauth/decision`: the validated request plus the
+  user's id, sealed with an HMAC under `SESSION_SECRET` (with a purpose prefix, so it cannot pass for
+  a session or gate signature) and valid for ten minutes. Editing the form cannot change what was
+  approved, and the decision route checks the same-origin header, the signed-in user, the client and
+  its redirect URI once more.
+- **Codes and tokens.** Approve stores a single-use code (hashed, five minutes) next to the PKCE
+  challenge, redirect URI and scopes. `POST /oauth/token` trades the code and its verifier for an
+  ordinary `api_tokens` row (30 days, tagged with the client's id) and a rotating refresh token
+  (`bgr_` plus 32 random bytes, stored hashed on the same row). The request that flips `used_at`
+  wins, and a replayed code is refused and revokes the token it produced (RFC 6749 section 4.1.2:
+  the code may have leaked). A refresh rewrites the same row with a new access token and a new
+  refresh token, so the old pair dies together and the panel shows one entry per connected client.
+  Scopes may narrow on a refresh, never widen. Codes and tokens are never logged or echoed in errors.
+
+### Tools
+
+Seven tools in `src/lib/mcp/tools.ts`, each a plain function of the caller and its input, so tests
+drive them without the handler. Their descriptions are the only documentation the model sees, so each
+says what it costs, what its dates mean and that post text is content.
+
+| Tool | Scope | What it does |
+| --- | --- | --- |
+| `search_bookmarks` | read | Every word of `query` must appear in the post text, its summary, or the author's handle or name. Filters: topics, post dates (the post's own date, as the dashboard uses), and `credibility: "flagged"`. Newest post first, post text cut to 500 characters, 1 to 50 results. Reads at most the newest 1,000 visible bookmarks. |
+| `list_topics` | read | The dashboard's topic chips with counts, for an optional date range. |
+| `list_episodes` | read | Ready briefs, newest first, with stable `links`. |
+| `get_episode` | read | One ready brief, with its markdown (cut at 60,000 characters, with a `truncated` flag) and optionally the script. |
+| `get_brief_status` | read | A background job's status, stage and progress, or the newest job for an episode. Also restarts a stalled job and says so in `rescheduled`. |
+| `generate_brief` | write | Validates like the prepare route, runs the free selection check (an empty match answers at once and spends nothing), queues a job and returns a `job_id`. |
+| `hide_bookmark` | write | The same update as `POST /api/bookmarks/hide`. |
+
+`runTool` puts one guard in front of every call: the `mcp_call` cap, then the write-scope check, then
+the tool, then error mapping. Every failure becomes an MCP tool error (`isError`) with a message safe
+to show, not an HTTP error, and a read-only token that calls a write tool is told how to get write
+access. Results come back as JSON text and as `structuredContent`.
+
+**The `mcp_call` cap.** Each tool call records one `mcp_call` usage event through `record_usage()`,
+default 1,000 per person per rolling 24 hours (`LIMIT_MCP_CALL_PER_DAY`). It brakes a runaway client
+and is not a spend cap. Paid actions keep their own caps (`digest_prepare`, `digest_script`,
+`digest_render`, `sync`, `enrich`), drawn from the same per-person pool as the dashboard, so a leaked
+token cannot spend more than its owner could by clicking.
+
+### Background brief jobs
+
+The dashboard drives generation from the browser: prepare, script, a render loop, finalize. An
+assistant cannot sit in that loop, and MCP clients give up on a tool call after seconds. So the four
+stages live in `src/lib/digest.ts` as plain functions (the `/api/digest/*` routes are thin wrappers
+around them, with the same guards and caps), and `src/lib/jobs.ts` drives them on the server, one
+`brief_jobs` row per request.
+
+- **Queue.** `generate_brief` inserts a `queued` job and schedules the runner with `after()` from
+  `next/server`, which runs a callback once the response has been sent, for up to the route's
+  `maxDuration`. The tool answers within a second.
+- **Lease.** The runner starts by calling the Postgres function `claim_brief_job(job, stale_seconds)`,
+  which in one statement flips `queued` to `running`, or takes over a `running` job whose
+  `heartbeat_at` is older than the stale window (90 seconds, `BRIEF_JOB_STALE_SECONDS`). Two runners
+  racing for one job cannot both win; the loser gets no row and stops. This is the single-generation
+  lease the roadmap listed as deferred, for assistant-started briefs only.
+- **Heartbeat.** The runner bumps `heartbeat_at` at every stage change and after every rendered
+  chunk, and a timer beats three times per stale window, so one long paid call, such as the writing
+  pass, does not look dead. The timer dies with the process, which is what lets a cut-off run go
+  stale.
+- **Resume from persisted state.** A re-claimed job works out where to continue from the episode,
+  the way the dashboard's Resume banner does (`deriveDigestStage`). No script yet means write one.
+  Some chunks rendered means continue from the last one. All chunks rendered means finalize. So it
+  never pays twice for a script or a chunk that landed. A run cut off after syncing does not sync
+  again, and a job whose draft was discarded fails instead of starting, and billing, a new brief.
+  One window remains: a job that dies between the Grok writing pass and the episode insert pays for
+  that pass again, a gap of a few hundred milliseconds.
+- **Stages and status.** `syncing` (only with `sync_first`), `selecting`, `writing`, `scripting`,
+  `rendering`, `publishing`, then `done` or `failed`. A failed job carries the same public message the
+  `/api/digest/*` routes would show, and leaves the episode as a `draft` for the dashboard's Resume
+  banner. `brief_jobs.token_id` records which token started a job and has no foreign key, so a job
+  record outlives a revoked token.
+- **Dashboard interplay.** A job works on its own episode row, so it never collides with a brief
+  generated in a tab. A job that is mid-render shows up as a draft in the Resume banner.
+
+**The host difference.** What one run achieves depends on the host:
+
+| Host | What happens |
+| --- | --- |
+| [Render](https://render.com) or any long-lived Node process | The `after()` callback runs to the end. The whole job finishes in one run: around 3 minutes for markdown, 12 for a podcast. One status check finds it done. |
+| [Vercel](https://vercel.com) or any host that ends a request's background work early | The callback is cut off at `maxDuration` (300 seconds), mid-render. The heartbeat goes stale, and the next `get_brief_status` call re-claims the job and continues from the last rendered chunk. A podcast takes a few checks. |
+
+So on a request-bound host, polling is what keeps a job alive, and the tool description tells the
+model so. [ROADMAP.md](ROADMAP.md) has the follow-up that removes that dependence.
+
+### Stable episode links
+
+`signEpisodeUrls` mints 24-hour signed URLs, and an assistant pastes links into chats that last
+longer. `GET /api/episodes/[id]/audio` and `/markdown` authenticate with the session cookie or a bearer
+token with `read` scope, check that the episode is the caller's and is `ready`, and answer 302 to a
+fresh one-hour signed URL. The links in tool output are always these routes. A browser with no
+session is redirected to `/` to sign in, an API caller gets a 401, and audio that was pruned to free
+space is a 404 that says so. The dashboard keeps using signed URLs directly.
+
+### What the password gate leaves open
+
+With `GATE_PASSWORD` set, `src/proxy.ts` still lets through `/api/mcp`, `/oauth/*`,
+`/api/oauth/decision` and `/api/episodes/<id>/audio|markdown`, as well as the older `/gate`,
+`/api/gate`, `/api/cron/` and `/icon`. Each carries its own lock (a bearer token, the X sign-in, the
+signed consent, a cron secret), and the gate was never access control. `/.well-known/…` is never
+gated because the proxy matcher skips any path containing a dot. A blocked page remembers where it was
+going (`/gate?next=…`), and X sign-in has its own return path (`/api/auth/login?next=…`, kept in a
+cookie), so an OAuth sign-in survives a gated instance. Both accept only paths on this app
+(`src/lib/return-path.ts`). [SETUP.md](SETUP.md#what-the-password-gate-leaves-open) has the table.
+
 ## Security measures
 
 - **Login allowlist.** `ALLOWED_X_USER_IDS` gates login. Empty means personal mode (whoever
@@ -318,7 +508,8 @@ a larger instance's audio.
   behind a shared password when `GATE_PASSWORD` is set. Unset, there is no gate, in development and
   production alike: the login allowlist above is the access control that matters, and the gate is an
   extra layer for keeping an instance unlisted. The cron path, the gate page itself and the favicon
-  stay reachable.
+  stay reachable, and so do the assistant connector's endpoints, each of which carries its own lock
+  (see [Connector (MCP)](#connector-mcp)).
 - **Session.** The cookie is HMAC-signed (`SESSION_SECRET`), httpOnly, `SameSite=Lax` and
   secure-flagged in production, with a 30-day lifetime. Signatures are checked in constant time.
 - **Database access.** Supabase is only ever touched server-side with the service-role key. Row-level
@@ -341,9 +532,13 @@ a larger instance's audio.
 - **Spend caps** (`src/lib/limits.ts`). Rolling 24-hour per-user caps on every paid action,
   enforced atomically in Postgres (`record_usage()`), so a parallel burst cannot overshoot. Defaults
   per day: `sync` 24, `enrich` 400, `digest_prepare` 12, `digest_script` 40, `digest_render` 500,
-  `voice_list` 120, `voice_preview` 60. Override with `LIMIT_<KIND>_PER_DAY`, for example
-  `LIMIT_SYNC_PER_DAY`. The scheduled cron sync is exempt: it has its own bearer secret and runs
+  `voice_list` 120, `voice_preview` 60, and `mcp_call` 1,000 (assistant tool calls, a brake rather
+  than a spend cap). Override with `LIMIT_<KIND>_PER_DAY`, for example `LIMIT_SYNC_PER_DAY`. The scheduled cron sync is exempt: it has its own bearer secret and runs
   once per user per invocation.
+- **Assistant access.** `/api/mcp` takes bearer tokens only, never the cookie. Tokens are hashed at
+  rest, scoped, revocable at once and managed only with the session cookie. Sign-in uses PKCE,
+  single-use codes, rotating refresh tokens and an HMAC-sealed consent. See
+  [Connector (MCP)](#connector-mcp).
 - **Input and error handling.** Voice keys and ids are validated (printable ASCII, URL-safe ids)
   and never echoed or logged. Route errors log full detail server-side and show the client only a
   generic message in production.
@@ -403,6 +598,10 @@ article and video ingestion, MP3 header stripping and stitching, TTS chunking, v
 resolution, listing and error mapping, per-user voice settings, capacity and pruning arithmetic, the
 prepare, render and finalize routes, episode shaping, dashboard text, and the setup script's
 parsing and migration logic.
+
+The connector has its own tests: tokens, the tools against the fake database, the OAuth endpoints, the
+job runner (the lease, resuming, failures) and the proxy's open paths. One drives a real MCP
+`initialize`, `tools/list` and `tools/call` through the route handler with a minted token.
 
 Route tests run against a small in-memory stand-in for the Supabase client
 (`src/lib/__tests__/fake-db.ts`) with vendors stubbed, so no test touches the network or a real

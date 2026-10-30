@@ -1,6 +1,6 @@
 # MCP connector: design
 
-Status: proposal (2026-10-29), not built. Decisions still open are listed at the end.
+Status: Built (2026-10-30); this document is the design, the code is the reference.
 
 Bookmark Graveyard gets a Model Context Protocol (MCP) server so an AI assistant can
 search your bookmarks, list and read your briefs, and start a new one. Grok is the first
@@ -33,6 +33,7 @@ tokens, a background job runner for briefs, and the MCP endpoint itself.
 - [Docs](#docs)
 - [Delivery plan](#delivery-plan)
 - [Open decisions](#open-decisions)
+- [What changed in implementation](#what-changed-in-implementation)
 
 ## Goals and non-goals
 
@@ -561,3 +562,45 @@ maintainer needed for S0 (signed in to the target clients) and for trying the fi
    only when a routine stops polling.
 5. **Panel name.** "Assistants" is the proposal. "Connect an AI", "Integrations" and
    "API access" were considered; the first says what the user gets.
+
+## What changed in implementation
+
+Where the code differs from the design above, the code wins. The differences:
+
+- **The OAuth server shipped in the same release** as the endpoint, so phase 2 is done, not a
+  follow-up. Beyond the sketch above: open registration is capped at 1,000 clients (a 503 past it)
+  and pruned by a `prune_oauth_clients()` function; `oauth_codes` records the `token_id` each code
+  produced; `api_tokens` gained a `refresh_token_hash` column; access tokens last 30 days and are
+  renewed through a rotating `bgr_` refresh token; and the metadata is also served at
+  `/.well-known/openid-configuration` and at the path-insertion address
+  `/.well-known/oauth-protected-resource/api/mcp`.
+- **`brief_jobs.token_id` has no foreign key.** The schema above shows one. The migration stands on
+  its own, and a job record outlives a revoked token.
+- **A replayed authorization code revokes its token.** If a code that already produced a token is
+  presented again, that token is revoked (RFC 6749 section 4.1.2: the code may have leaked).
+- **The password gate carries a return path.** A blocked GET goes to `/gate?next=<path and query>`
+  and `/api/gate` sends the browser back there. X sign-in has its own, `/api/auth/login?next=…`, kept
+  in the `bb_next` cookie. Both accept only paths on the app (`src/lib/return-path.ts`). The gate
+  also leaves `/oauth/*` and `/api/oauth/decision` open, not only the paths listed under "Password
+  gate".
+- **The consent page lives at `/oauth/authorize/consent`**, behind a route-handler authorize step.
+  `GET /oauth/authorize` validates the request and redirects, because a page cannot answer with a 400
+  or a 302. The consent form posts to `/api/oauth/decision`, and what the user approved travels as a
+  signed blob (HMAC, ten minutes) instead of server state.
+- **`resourceUrl` is pinned to `APP_URL`** on `withMcpAuth`, so the 401 challenge's `resource_metadata`
+  never comes from the request's host or a forwarded header. The OAuth documents are built from
+  `APP_URL` the same way.
+- **Tools read at most the newest 1,000 visible bookmarks.** The design did not mention a cap on
+  `search_bookmarks` and `list_topics`; `loadBookmarkRows` limits the query to 1,000.
+  `get_brief_status` also returns `rescheduled`, and its `links` appear only once the job is done.
+- **The runner also beats on a timer.** Besides a heartbeat at each stage and chunk, a timer beats
+  three times per stale window, so one long paid call does not look dead. The window is
+  configurable with `BRIEF_JOB_STALE_SECONDS` (default 90).
+- **Token limits.** A person may hold 25 active tokens, checked when one is made in the panel; a
+  sign-in is never refused for it.
+- **`is_allowed` is rewritten at each X sign-in**, so removing someone from `ALLOWED_X_USER_IDS` does
+  not cut off their tokens until that flag changes. The design's wording glosses over that.
+- **The open decisions went the way the proposals suggested.** OAuth shipped with the endpoint
+  (above); tokens default to no expiry, with an optional 90-day choice; `sync_first` is an input of
+  `generate_brief`; cron ticking of stale jobs is an item in [ROADMAP.md](../ROADMAP.md); and the
+  panel is called Assistants.

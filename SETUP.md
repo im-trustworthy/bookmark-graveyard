@@ -195,6 +195,185 @@ reading notes on arbitrary posts). A daily GitHub Actions job does the matching:
 
 Until this job runs, everything works — posts just won't carry Community-Notes flags yet.
 
+## Connecting an assistant (MCP)
+
+Reference for the AI assistant connector. The short version, with the steps for each assistant, is in
+the [README](README.md#works-with-your-ai-assistant). How it works inside is in
+[ARCHITECTURE.md](ARCHITECTURE.md#connector-mcp), and the original design is in
+[docs/mcp-connector.md](docs/mcp-connector.md).
+
+### The connector URL
+
+The connector lives at `<APP_URL>/api/mcp`, for example `https://your-app.onrender.com/api/mcp`.
+It speaks [MCP](https://modelcontextprotocol.io) over Streamable HTTP and accepts only
+`Authorization: Bearer <token>`. It never reads the session cookie. There is nothing to switch on:
+every instance has it. The dashboard's **Assistants** panel shows the address of the page you opened
+it from, with a Copy button, so open the dashboard at your public address.
+
+**`APP_URL` must be the exact public URL the assistant uses.** The OAuth documents under
+`/.well-known/` and the `WWW-Authenticate` challenge on a 401 are built from `APP_URL`, never from the
+request's `Host` header, and assistants compare them with the address they were given. Match `http`
+against `https`, any `www.`, any port, and a custom domain against the host's own address (such as
+`onrender.com`). A trailing slash is ignored. The connector reads `APP_URL` when the server starts,
+so restart or redeploy after changing it, then reconnect the assistant.
+
+### Making a token
+
+1. On the dashboard, find the **Assistants** panel (below Voices) and click **Set up**. The button
+   reads **Manage** once you have a token.
+2. Under **Create a token**, enter a name (up to 60 characters), choose **Read only** or **Read and
+   write**, optionally tick **Expires in 90 days**, and click **Create token**.
+3. Copy the token. It is `bg_` followed by 43 characters, and it is shown once. The server keeps a
+   SHA-256 hash and the first eight characters, which the panel shows so you can tell tokens apart.
+   If you lose one, revoke it and make another.
+
+**Read only** lets the assistant search, list topics and briefs, read briefs, check on a brief and open
+the episode links. **Read and write** also lets it start briefs and hide bookmarks. Starting a brief
+spends money (see [Costs](README.md#costs)). A person can hold 25 active tokens (not revoked, not
+expired) at once. The limit is checked when you create a token in the panel. A connection made by
+signing in is never refused for it, but it does count toward the total.
+
+To cut an assistant off, click **Revoke** next to its token and confirm. It stops working on its next
+request. Every request also checks that the token's owner is still allowed (`users.is_allowed`).
+That flag is rewritten when the person signs in with X, so removing someone from
+`ALLOWED_X_USER_IDS` does not cut their tokens off until it changes. To do it at once, set
+`is_allowed` to false on their `users` row in Supabase, or delete their `api_tokens` rows.
+
+### Signing in (OAuth)
+
+For assistants that cannot take a pasted token, the instance is also a small
+[OAuth 2.1](https://oauth.net/2.1/) authorization server for its own tokens. The flow:
+
+1. The assistant reads `/.well-known/oauth-protected-resource` and
+   `/.well-known/oauth-authorization-server`, then registers itself at `/oauth/register`. It gets no
+   secret, and PKCE with `S256` is required.
+2. It opens `/oauth/authorize` in your browser. If you are not signed in, you go through the X
+   sign-in first and come back.
+3. You see the consent page, `/oauth/authorize/consent`. It shows:
+   - "Connect *name*?" The name is whatever the assistant called itself when it registered, and
+     anyone can register under any name. Approve only requests you just started yourself.
+   - What it wants to do: search and read your bookmarks and briefs. If it asked for write access, it
+     adds starting briefs (which spends your daily allowance and credits) and hiding bookmarks. An
+     assistant that names no scope gets read only.
+   - The account you are signed in as (`@handle`), and the site you will be sent back to.
+   - **Approve** and **Deny** buttons, with a reminder that you can disconnect any time in the
+     Assistants panel.
+4. **Approve** sends the assistant a single-use code that works for five minutes. It trades the code
+   for a token that lasts 30 days, plus a refresh token it uses to renew itself. **Deny** sends it
+   back with an error.
+5. The connection appears in the Assistants panel under the assistant's name, tagged **Connected by
+   sign-in**. Revoke it there like any token.
+
+If the page says "This connection request can't be completed", the assistant sent something your
+instance rejects: an unknown client, or a return address it never registered. Go back to the
+assistant and add the connector again. The consent form is good for ten minutes, so if it times out,
+start again. An assistant may register return addresses that use `https`, `http` on localhost only,
+or an app scheme such as `cursor://`.
+
+### The `next` return path
+
+Two walls can stand between an assistant's request and the consent page. Each one remembers where
+you were going, and sends you back there:
+
+- **X sign-in.** `/api/auth/login?next=/some/path` keeps the path in a short-lived cookie
+  (`bb_next`, ten minutes), and the X callback sends you there instead of to the dashboard.
+- **The password gate.** With `GATE_PASSWORD` set, a blocked page redirects to
+  `/gate?next=<path and query>`, and the right password sends you back there instead of to the home
+  page.
+
+Both accept only a path on your own app, never another site. So a sign-in that starts at
+`/oauth/authorize` survives both walls: the password (if the gate is on), then X, then the consent
+page.
+
+### What the password gate leaves open
+
+With `GATE_PASSWORD` set, every page needs the gate cookie except the paths below. Each one carries
+its own lock.
+
+| Path | Why it is open |
+| --- | --- |
+| `/api/mcp` | An assistant outside your browser cannot pass the gate. The endpoint needs a valid bearer token. |
+| `/oauth/token`, `/oauth/register` | Machine endpoints that assistants call directly. A token request needs a valid code or refresh token. Registration is open by design (see [ROADMAP.md](ROADMAP.md)). |
+| `/oauth/authorize`, `/oauth/authorize/consent` | The browser steps of sign-in. They require the X sign-in themselves. |
+| `/api/oauth/decision` | The consent form's post. It needs your session cookie and a signed consent that belongs to you. |
+| `/.well-known/…` | Public discovery documents. The gate's matcher skips any path that contains a dot, so these are never gated. |
+| `/api/episodes/<id>/audio`, `/api/episodes/<id>/markdown` | The stable links an assistant shares. They need your session cookie or a read token, and send a browser without one to the sign-in page. |
+
+`/gate`, `/api/gate`, `/api/cron/` (which has its own `CRON_SECRET`) and the favicon were already
+open. Everything else stays behind the gate, including token management (`/api/tokens`).
+
+The gate is an extra wall for keeping an instance unlisted. It was never access control: X sign-in
+plus `ALLOWED_X_USER_IDS` is. Because these paths keep their own locks, leaving them open does not
+weaken that. A visitor without the password can learn that a connector exists, read the public
+discovery documents and register an OAuth client, and none of that exposes your data.
+
+### Trying it on your own computer
+
+Assistants call the connector from the internet, so `http://localhost:3000/api/mcp` works only for
+programs on your computer, such as Claude Code, Cursor or the
+[MCP Inspector](https://github.com/modelcontextprotocol/inspector) (`npx @modelcontextprotocol/inspector`).
+Web assistants cannot reach it, and Grok refuses `localhost` and private addresses outright. xAI's
+[tunneling guide](https://docs.x.ai/grok/connectors/custom-mcp-tunneling) explains why and shows how
+to expose your local server with [ngrok](https://ngrok.com) (`ngrok http 3000`) or a
+[Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)
+(`cloudflared tunnel --url http://localhost:3000`). Quick tunnels work with this connector, which
+uses Streamable HTTP. Then:
+
+1. Set `APP_URL` in `.env.local` to the tunnel's `https://…` address and restart the app.
+2. Add `<tunnel address>/api/auth/callback/x` to the callback URIs in your X app (step 2.4), because
+   X sign-in now comes back through the tunnel.
+3. Open the dashboard at the tunnel address, not `localhost`, so the session cookie, the panel's
+   connector URL and sign-in all agree. Create your token there.
+4. `npm run dev` blocks other hostnames from its development-only resources. If the dashboard does
+   not finish loading through the tunnel, add the tunnel's hostname to `allowedDevOrigins` in
+   `next.config.ts` ([Next.js docs](https://nextjs.org/docs/app/api-reference/config/next-config-js/allowedDevOrigins)),
+   or run `npm run build && npm start` instead.
+
+Free tunnel addresses usually change each time you restart the tunnel. When yours does, update
+`APP_URL` and the X callback, and add the connector to the assistant again.
+
+### Render, Vercel and background briefs
+
+A brief an assistant starts is written by a background runner on your server, not by a browser tab.
+How far one run gets depends on the host:
+
+| Host | What happens |
+| --- | --- |
+| [Render](https://render.com) or any always-on Node host | The runner finishes the whole brief in one go: about 3 minutes for markdown, about 12 for a podcast. The assistant's next status check finds it done. |
+| [Vercel](https://vercel.com) or any host that ends a request's background work early | The runner is cut off after the route's 300 seconds. The assistant's next status check notices, restarts the runner, and it carries on from the last piece that finished. A podcast takes a few checks. |
+
+On the second kind, a podcast finishes only while the assistant keeps checking in, and the assistant
+is told to. A markdown brief usually fits inside the limit. Briefs you start from the dashboard are
+not affected. If a run fails partway, the unfinished brief stays as a draft that the dashboard's
+**Resume** button can finish.
+
+### Optional settings
+
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `LIMIT_MCP_CALL_PER_DAY` | 1000 | Assistant tool calls allowed per person in any rolling 24 hours, across all their assistants. It is a brake on a runaway client, not a spend cap: paid actions keep their own limits. |
+| `BRIEF_JOB_STALE_SECONDS` | 90 | How long a running brief job may go without a heartbeat before the next status check takes it over. It matters only on hosts that end background work early. |
+
+Set them in `.env.local` or your host's environment settings, as the other optional values (see
+`.env.example`). A value that is not a positive number is ignored. Raise `BRIEF_JOB_STALE_SECONDS` if
+jobs get taken over while still working. A very low value risks paying for the same step twice.
+
+### Database changes
+
+The connector adds three migrations to `supabase/migrations/`:
+
+- `20261030032116_api_tokens.sql`: the `api_tokens` table.
+- `20261030033352_brief_jobs.sql`: the `brief_jobs` table and the `claim_brief_job()` function.
+- `20261030034215_oauth.sql`: the `oauth_clients` and `oauth_codes` tables, a refresh-token column
+  on `api_tokens`, and the `prune_oauth_clients()` function.
+
+On a fresh install, `npm run setup` (step 5) creates them with everything else. On an existing
+install, update the code and run `npm run setup` again with `SUPABASE_ACCESS_TOKEN` set: it applies
+only the pending migrations, after a y/N prompt (`--yes` skips the prompt). Without that token,
+setup cannot see what your project already has. Paste the three files, in order, into the Supabase
+SQL editor instead; they are safe to run twice. Until they are applied, the Assistants panel and
+`/api/mcp` return errors.
+
 ## Deploying (any host)
 
 Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environment variables:
@@ -202,8 +381,10 @@ Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environm
 too (the next section). Neither is required.
 
 The app ships with an optional site-wide password wall (`src/proxy.ts`). Set `GATE_PASSWORD` and
-every visitor gets a password prompt before anything — even the landing page — is served; leave it
-unset and there is no wall, locally or deployed. The real access control is X sign-in plus
+every visitor gets a password prompt before anything — even the landing page — is served, except a
+few endpoints that carry their own lock (see [What the password gate leaves
+open](#what-the-password-gate-leaves-open)); leave it unset and there is no wall, locally or
+deployed. The real access control is X sign-in plus
 `ALLOWED_X_USER_IDS`: **set that on any deployed instance**, or anyone who completes X sign-in can
 use it and your API keys. Your X user ID is shown next to **Log out** once you sign in.
 
@@ -240,7 +421,9 @@ Supabase project (step 5), so nothing runs there.
    random `CRON_SECRET` and, optionally, `GATE_PASSWORD`.
 2. Add the production callback URL to your X app (step 2.4).
 3. `vercel.json` already schedules a bookmark sync every Friday; generate briefs on demand
-   from the UI, then download or listen in the browser.
+   from the UI, then download or listen in the browser. A podcast an AI assistant starts finishes
+   only while the assistant keeps checking in; see [Render, Vercel and background
+   briefs](#render-vercel-and-background-briefs).
 
 ### Fully local, with no Supabase account
 
