@@ -77,15 +77,12 @@ Non-blocking for personal use; worth doing before a public multi-user deploy.
   VM/container with internal network reach.
 - **Multi-draft resume.** Only the newest draft surfaces for resume; older
   orphaned drafts are invisible until the newer one resolves.
-- **Refresh tokens have no expiry of their own** (assistant connector, 2026-10-30). A sign-in
-  connection that is never used again keeps a working refresh token until someone revokes it in the
-  Assistants panel. Expiring one after a long idle period would close that.
-- **The 25-active-token cap does not apply to sign-in tokens** (2026-10-30). It is checked when a
-  token is made in the panel. An approved sign-in is never refused for it, though it counts toward
-  the total.
-- **Client registration is open, with a 1,000-client ceiling** (2026-10-30). Anyone can register at
-  `/oauth/register`. Unused registrations are pruned after 30 days, so a flood could fill the table
-  and turn real assistants away with a 503 until the pruning catches up.
+- **Assistant connector: done in the 2026-10-30 security review.** Three items listed here when the
+  connector shipped are closed: a refresh token now stops working after 90 days without use, the
+  25-active-token cap applies to sign-in tokens too, and a flood of client registrations can no
+  longer lock real assistants out (unused ones go after an hour, and at the 1,000-client ceiling the
+  oldest client with no live token is evicted). What the review fixed and what it accepted is in
+  [docs/mcp-connector.md](docs/mcp-connector.md#security-review-2026-10-30).
 
 ---
 
@@ -161,8 +158,8 @@ feed route next to the episode link routes.
 
 **What we want:** a scheduled call that finds brief jobs an assistant started, and restarts any that
 are still `queued` or whose runner was cut off, so a podcast finishes without anyone polling.
-`maybeRescheduleBriefJob` in `src/lib/jobs.ts` already does this for one job when an assistant asks
-for its status. The cron route would run the same claim for every stale job.
+`maybeRescheduleBriefJob` in `src/lib/jobs.ts` already does this for one job when an assistant with a
+write token asks for its status. The cron route would run the same claim for every stale job.
 
 **Why not now:** it only matters on request-bound hosts such as Vercel, where background work is cut
 off after the route's 300 seconds, and only when the assistant stops polling. On Render the runner

@@ -34,6 +34,7 @@ tokens, a background job runner for briefs, and the MCP endpoint itself.
 - [Delivery plan](#delivery-plan)
 - [Open decisions](#open-decisions)
 - [What changed in implementation](#what-changed-in-implementation)
+- [Security review (2026-10-30)](#security-review-2026-10-30)
 
 ## Goals and non-goals
 
@@ -568,10 +569,11 @@ maintainer needed for S0 (signed in to the target clients) and for trying the fi
 Where the code differs from the design above, the code wins. The differences:
 
 - **The OAuth server shipped in the same release** as the endpoint, so phase 2 is done, not a
-  follow-up. Beyond the sketch above: open registration is capped at 1,000 clients (a 503 past it)
-  and pruned by a `prune_oauth_clients()` function; `oauth_codes` records the `token_id` each code
-  produced; `api_tokens` gained a `refresh_token_hash` column; access tokens last 30 days and are
-  renewed through a rotating `bgr_` refresh token; and the metadata is also served at
+  follow-up. Beyond the sketch above: open registration is held to 1,000 clients by pruning and
+  eviction (`prune_oauth_clients()`, `evict_oauth_client()`; see the security review below);
+  `oauth_codes` records the `token_id` each code produced; `api_tokens` gained `refresh_token_hash`
+  and `previous_refresh_token_hash` columns; access tokens last 30 days and are renewed through a
+  rotating `bgr_` refresh token; and the metadata is also served at
   `/.well-known/openid-configuration` and at the path-insertion address
   `/.well-known/oauth-protected-resource/api/mcp`.
 - **`brief_jobs.token_id` has no foreign key.** The schema above shows one. The migration stands on
@@ -593,14 +595,60 @@ Where the code differs from the design above, the code wins. The differences:
 - **Tools read at most the newest 1,000 visible bookmarks.** The design did not mention a cap on
   `search_bookmarks` and `list_topics`; `loadBookmarkRows` limits the query to 1,000.
   `get_brief_status` also returns `rescheduled`, and its `links` appear only once the job is done.
+  Only a caller with the write scope restarts a stalled job; a read-only one gets the report alone.
 - **The runner also beats on a timer.** Besides a heartbeat at each stage and chunk, a timer beats
   three times per stale window, so one long paid call does not look dead. The window is
   configurable with `BRIEF_JOB_STALE_SECONDS` (default 90).
-- **Token limits.** A person may hold 25 active tokens, checked when one is made in the panel; a
-  sign-in is never refused for it.
+- **Token limits.** A person may hold 25 active tokens, checked when one is made in the panel and
+  when a sign-in mints one. A sign-in first revokes that client's earlier tokens for the user, so one
+  client keeps one connection.
 - **`is_allowed` is rewritten at each X sign-in**, so removing someone from `ALLOWED_X_USER_IDS` does
   not cut off their tokens until that flag changes. The design's wording glosses over that.
 - **The open decisions went the way the proposals suggested.** OAuth shipped with the endpoint
   (above); tokens default to no expiry, with an optional 90-day choice; `sync_first` is an input of
   `generate_brief`; cron ticking of stale jobs is an item in [ROADMAP.md](../ROADMAP.md); and the
   panel is called Assistants.
+
+## Security review (2026-10-30)
+
+An adversarial review of the connector after it shipped. The schema changes are in one migration,
+`supabase/migrations/20261030042448_connector_hardening.sql`.
+
+Fixed:
+
+1. **No open redirect.** `GET /oauth/authorize` never redirects to a client: every invalid request
+   gets a 400 page in our own wording, with a "Return to *host*" link carrying the error only when the
+   client and redirect URI check out (RFC 9700 section 4.11).
+2. **A registration flood can't lock out sign-ups.** Unused registrations are pruned after an hour
+   and fully revoked ones after 30 days; at 1,000 clients the oldest client with no live token is
+   evicted, with 503 only when none can be; bodies declared over 64 KB get 413 before they are read.
+3. **Refresh tokens: reuse detection and idle expiry.** A rotated-away refresh token presented again
+   revokes the row, and a refresh after 90 days without use is refused.
+4. **Jobs stop when access ends.** The runner checks the token and `users.is_allowed` after claiming
+   and before every paid step, and a read-only caller of `get_brief_status` no longer restarts paid
+   work.
+5. **Fenced job lease.** Each claim stamps a `lease_id` that every runner write filters on, so a
+   runner that was taken over stops at its next write and overwrites nothing.
+6. **OAuth tokens respect the token cap.** A code exchange revokes the client's earlier tokens for
+   the user and is refused at 25 active tokens.
+7. **Issuer identification (RFC 9207).** Authorization responses carry `iss`, and the metadata says
+   so with `authorization_response_iss_parameter_supported`.
+8. **Tool output.** `list_topics`, `list_episodes` and `get_brief_status` carry the content warning,
+   and topic names and episode titles are cut to 120 characters in every tool's output.
+
+Accepted, with the reason:
+
+- **A replayed code racing its own exchange may not revoke.** If the replay arrives before the first
+  exchange has linked its token to the code, there is no token to revoke yet. The window is
+  milliseconds wide, and codes are single use and live five minutes.
+- **The gated "unlisted" mode exposes the product name.** The OAuth metadata and the consent and
+  error pages stay reachable behind the password gate and name Bookmark Graveyard. The gate is an
+  extra layer for keeping an instance unlisted, never the lock; sign-in plus the allowlist is.
+- **Any client can call itself "Claude".** Dynamic registration takes the name the client gives. The
+  consent page shows the real destination, the redirect URI's host, next to the name, and asks the
+  user to approve only apps they added themselves.
+- **Access tokens last 30 days.** Shorter ones would send users back through sign-in more often with
+  clients that handle refresh badly, for a modest gain: revocation is immediate either way, because
+  every request looks the token up.
+- **Reuse detection remembers one rotation.** Only the refresh token the latest rotation replaced is
+  recognized; one from two or more rotations ago is refused as unknown without revoking the row.

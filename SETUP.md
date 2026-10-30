@@ -228,10 +228,10 @@ so restart or redeploy after changing it, then reconnect the assistant.
    If you lose one, revoke it and make another.
 
 **Read only** lets the assistant search, list topics and briefs, read briefs, check on a brief and open
-the episode links. **Read and write** also lets it start briefs and hide bookmarks. Starting a brief
-spends money (see [Costs](README.md#costs)). A person can hold 25 active tokens (not revoked, not
-expired) at once. The limit is checked when you create a token in the panel. A connection made by
-signing in is never refused for it, but it does count toward the total.
+the episode links. **Read and write** also lets it start briefs and hide bookmarks, and restart a
+brief that stalled (see [Render, Vercel and background briefs](#render-vercel-and-background-briefs)). Starting a brief spends money (see
+[Costs](README.md#costs)). A person can hold 25 active tokens (not revoked, not expired) at once. The
+limit applies to tokens made in the panel and to connections made by signing in alike.
 
 To cut an assistant off, click **Revoke** next to its token and confirm. It stops working on its next
 request. Every request also checks that the token's owner is still allowed (`users.is_allowed`).
@@ -264,11 +264,20 @@ For assistants that cannot take a pasted token, the instance is also a small
 5. The connection appears in the Assistants panel under the assistant's name, tagged **Connected by
    sign-in**. Revoke it there like any token.
 
-If the page says "This connection request can't be completed", the assistant sent something your
-instance rejects: an unknown client, or a return address it never registered. Go back to the
-assistant and add the connector again. The consent form is good for ten minutes, so if it times out,
-start again. An assistant may register return addresses that use `https`, `http` on localhost only,
-or an app scheme such as `cursor://`.
+Connecting the same assistant again replaces its earlier connection rather than adding a second one,
+and a sign-in is refused while you already hold 25 active tokens: revoke one in the panel first. A
+connection that goes 90 days without being used (no tool call and no renewal) can no longer renew
+itself, so the assistant asks you to sign in again. If anyone presents a refresh token the assistant
+already traded in, the server takes it as stolen and revokes that connection.
+
+If the page says "This connection request can't be completed", your instance rejected what the
+assistant sent: an unknown client, a return address it never registered, or a request that is
+invalid in some other way, which the page names. The page never sends you anywhere by itself. When
+the assistant and its return address check out, it offers a **Return to** link that takes the error
+back to the assistant if you click it. Otherwise go back to the assistant and add the connector
+again. The consent form is good for ten minutes, so if it times out, start again. An assistant may
+register return addresses that use `https`, `http` on localhost only, or an app scheme such as
+`cursor://`. A registration that never gets as far as a sign-in is deleted after an hour.
 
 ### The `next` return path
 
@@ -293,7 +302,7 @@ its own lock.
 | Path | Why it is open |
 | --- | --- |
 | `/api/mcp` | An assistant outside your browser cannot pass the gate. The endpoint needs a valid bearer token. |
-| `/oauth/token`, `/oauth/register` | Machine endpoints that assistants call directly. A token request needs a valid code or refresh token. Registration is open by design (see [ROADMAP.md](ROADMAP.md)). |
+| `/oauth/token`, `/oauth/register` | Machine endpoints that assistants call directly. A token request needs a valid code or refresh token. Registration is open by design; unused registrations are deleted after an hour, so a flood of them can't lock real assistants out (see the security review in [docs/mcp-connector.md](docs/mcp-connector.md#security-review-2026-10-30)). |
 | `/oauth/authorize`, `/oauth/authorize/consent` | The browser steps of sign-in. They require the X sign-in themselves. |
 | `/api/oauth/decision` | The consent form's post. It needs your session cookie and a signed consent that belongs to you. |
 | `/.well-known/…` | Public discovery documents. The gate's matcher skips any path that contains a dot, so these are never gated. |
@@ -343,16 +352,19 @@ How far one run gets depends on the host:
 | [Vercel](https://vercel.com) or any host that ends a request's background work early | The runner is cut off after the route's 300 seconds. The assistant's next status check notices, restarts the runner, and it carries on from the last piece that finished. A podcast takes a few checks. |
 
 On the second kind, a podcast finishes only while the assistant keeps checking in, and the assistant
-is told to. A markdown brief usually fits inside the limit. Briefs you start from the dashboard are
-not affected. If a run fails partway, the unfinished brief stays as a draft that the dashboard's
-**Resume** button can finish.
+is told to. Only a check made with a **Read and write** token restarts a stalled brief, since
+restarting spends money; a read-only token just reports where it stands. A markdown brief usually
+fits inside the limit. Briefs you start from the dashboard are not affected. If a run fails partway,
+the unfinished brief stays as a draft that the dashboard's **Resume** button can finish. Revoking the
+token that started a brief, or taking its owner off the allowlist, stops the brief before its next
+paid step.
 
 ### Optional settings
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `LIMIT_MCP_CALL_PER_DAY` | 1000 | Assistant tool calls allowed per person in any rolling 24 hours, across all their assistants. It is a brake on a runaway client, not a spend cap: paid actions keep their own limits. |
-| `BRIEF_JOB_STALE_SECONDS` | 90 | How long a running brief job may go without a heartbeat before the next status check takes it over. It matters only on hosts that end background work early. |
+| `BRIEF_JOB_STALE_SECONDS` | 90 | How long a running brief job may go without a heartbeat before the next status check (with a write token) takes it over. It matters only on hosts that end background work early. |
 
 Set them in `.env.local` or your host's environment settings, as the other optional values (see
 `.env.example`). A value that is not a positive number is ignored. Raise `BRIEF_JOB_STALE_SECONDS` if
@@ -360,17 +372,21 @@ jobs get taken over while still working. A very low value risks paying for the s
 
 ### Database changes
 
-The connector adds three migrations to `supabase/migrations/`:
+The connector adds four migrations to `supabase/migrations/`:
 
 - `20261030032116_api_tokens.sql`: the `api_tokens` table.
 - `20261030033352_brief_jobs.sql`: the `brief_jobs` table and the `claim_brief_job()` function.
 - `20261030034215_oauth.sql`: the `oauth_clients` and `oauth_codes` tables, a refresh-token column
   on `api_tokens`, and the `prune_oauth_clients()` function.
+- `20261030042448_connector_hardening.sql`: the security review's changes. It replaces
+  `prune_oauth_clients()` and `claim_brief_job()`, adds `evict_oauth_client()`, and adds
+  `api_tokens.previous_refresh_token_hash` and `brief_jobs.lease_id`. The code needs it: apply it
+  before (or with) the deploy that ships it.
 
 On a fresh install, `npm run setup` (step 5) creates them with everything else. On an existing
 install, update the code and run `npm run setup` again with `SUPABASE_ACCESS_TOKEN` set: it applies
 only the pending migrations, after a y/N prompt (`--yes` skips the prompt). Without that token,
-setup cannot see what your project already has. Paste the three files, in order, into the Supabase
+setup cannot see what your project already has. Paste the four files, in order, into the Supabase
 SQL editor instead; they are safe to run twice. Until they are applied, the Assistants panel and
 `/api/mcp` return errors.
 
