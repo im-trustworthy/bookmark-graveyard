@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkAuthorizeRequest, issuer, loginUrl, oauthErrorPage, withParams } from "@/lib/oauth";
+import { checkAuthorizeRequest, issuer, loginUrl, oauthErrorPage } from "@/lib/oauth";
 import { getSessionUserId } from "@/lib/session";
 
 // The authorization endpoint (RFC 6749 §3.1), reached by the browser. It is a
@@ -7,12 +7,14 @@ import { getSessionUserId } from "@/lib/session";
 // with real status codes, which a page can't: 400 for the error page and 302
 // for redirects (a page's redirect() is a 307).
 //
-// 1. Unknown client, or a redirect_uri the client didn't register: 400 error
-//    page, never a redirect, since the target can't be trusted.
-// 2. Anything else wrong: 302 back to the client with error, error_description
-//    and state.
-// 3. Not signed in: 302 to the X sign-in, which comes back here afterwards.
-// 4. Otherwise: 302 to the consent page with the same query, which checks it
+// 1. Anything wrong with the request: 400 error page, never a redirect to the
+//    client. Anyone can register a client with any redirect URI, so an
+//    automatic error redirect would make this domain an open redirector
+//    (RFC 9700 §4.11). When the client and redirect_uri check out, the page
+//    offers a link back carrying error, error_description and state; the user
+//    decides whether to follow it.
+// 2. Not signed in: 302 to the X sign-in, which comes back here afterwards.
+// 3. Otherwise: 302 to the consent page with the same query, which checks it
 //    again and asks the user.
 
 export async function GET(req: NextRequest) {
@@ -24,15 +26,7 @@ export async function GET(req: NextRequest) {
     return oauthErrorPage("Something went wrong on our side. Try again in a minute.", 500);
   }
 
-  if (!check.ok && !check.redirect) return oauthErrorPage(check.message, 400);
-  if (!check.ok) {
-    const target = withParams(check.redirectUri, {
-      error: check.error,
-      error_description: check.description,
-      state: check.state,
-    });
-    return NextResponse.redirect(target, 302);
-  }
+  if (!check.ok) return oauthErrorPage(check.message, 400, check.returnTo);
 
   const query = req.nextUrl.search;
   if (!(await getSessionUserId())) return NextResponse.redirect(loginUrl(`/oauth/authorize${query}`), 302);
