@@ -534,20 +534,19 @@ Manual: `npx @modelcontextprotocol/inspector` against the dev server for an end-
 
 ## Delivery plan
 
-Fable plans and reviews; Opus and Sonnet subagents implement, one PR each, all gated on
-`npm test`, `tsc`, lint and build like the release work.
+Each step is one PR, gated on `npm test`, `tsc`, lint and build like the release work.
 
-| Step | What | Who | Size |
-| --- | --- | --- | --- |
-| S0 spike | A throwaway `/api/mcp` with one tool and a hard-coded bearer token, exposed with ngrok, added to grok.com Connectors, Claude Code, claude.ai and ChatGPT. Record which auth each accepts. Decides whether phase 2 blocks the Grok use case. | Fable with Allen signed in | half a day |
-| PR A | Lift stage bodies into `src/lib/digest.ts` and bookmark loading into `src/lib/bookmarks.ts`. No behavior change. | Sonnet | small |
-| PR B | `api_tokens` migration, `api-tokens.ts`, `auth.ts`, token routes, Assistants panel, proxy paths, docs stub. | Opus | medium |
-| PR C | `brief_jobs` migration and RPC, `jobs.ts`, runner, `after()` scheduling, stale re-claim. | Opus | medium |
-| PR D | `mcp-handler` route, the seven tools, episode link routes, inspector smoke, README, SETUP, ARCHITECTURE. | Sonnet | medium |
-| PR E | OAuth 2.1 authorization server, only if S0 says a target client needs it. | Opus | medium |
+| Step | What | Size |
+| --- | --- | --- |
+| S0 spike | A throwaway `/api/mcp` with one tool and a hard-coded bearer token, exposed with ngrok, added to grok.com Connectors, Claude Code, claude.ai and ChatGPT. Record which auth each accepts. Decides whether phase 2 blocks the Grok use case. | half a day |
+| PR A | Lift stage bodies into `src/lib/digest.ts` and bookmark loading into `src/lib/bookmarks.ts`. No behavior change. | small |
+| PR B | `api_tokens` migration, `api-tokens.ts`, `auth.ts`, token routes, Assistants panel, proxy paths, docs stub. | medium |
+| PR C | `brief_jobs` migration and RPC, `jobs.ts`, runner, `after()` scheduling, stale re-claim. | medium |
+| PR D | `mcp-handler` route, the seven tools, episode link routes, inspector smoke, README, SETUP, ARCHITECTURE. | medium |
+| PR E | OAuth 2.1 authorization server, only if S0 says a target client needs it. | medium |
 
-Wall-clock guess for S0 through D: two to three working days of agent time, with Allen
-needed for S0 (his Grok and Claude accounts) and for trying the finished panel.
+Wall-clock guess for S0 through D: two to three working days of agent time, with the
+maintainer needed for S0 (signed in to the target clients) and for trying the finished panel.
 
 ## Open decisions
 
