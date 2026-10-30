@@ -198,7 +198,8 @@ Until this job runs, everything works — posts just won't carry Community-Notes
 ## Connecting an assistant (MCP)
 
 Reference for the AI assistant connector. The short version, with the steps for each assistant, is in
-the [README](README.md#works-with-your-ai-assistant). How it works inside is in
+the [README](README.md#works-with-your-ai-assistant); the install guide written for AI agents, with
+settings for every client, is [docs/MCP.md](docs/MCP.md). How it works inside is in
 [ARCHITECTURE.md](ARCHITECTURE.md#connector-mcp), and the original design is in
 [docs/mcp-connector.md](docs/mcp-connector.md).
 

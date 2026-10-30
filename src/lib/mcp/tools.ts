@@ -527,7 +527,7 @@ export const TOOLS: ToolSpec[] = [
       "Choose posts with `from`/`to` (YYYY-MM-DD, inclusive, on the date the post was published) and `topics`, or hand-pick them with `tweet_ids`, which overrides both.",
       "`target_minutes` sets the podcast's length. `sync_first` pulls new bookmarks from X and analyzes them before choosing (slower, and spends sync allowance).",
       "Answers at once with a `job_id` while the brief is written in the background: call get_brief_status with it no more than once a minute until `status` is done or failed.",
-      "When nothing matches the filters it answers an error right away and spends nothing.",
+      "With sync_first false, a filter that matches nothing is refused right away: no job, nothing spent. With sync_first true the sync runs first, so X reads are spent before the job can report that nothing matched. A spent daily brief allowance shows up as a failed job, not as an immediate error.",
     ].join(" "),
     inputSchema: generateBriefInput,
     write: true,
