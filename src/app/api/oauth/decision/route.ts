@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import {
+  authorizationResponseUrl,
   getClient,
   issueAuthorizationCode,
   issuer,
@@ -7,7 +8,6 @@ import {
   oauthErrorPage,
   openConsent,
   redirectUriMatches,
-  withParams,
 } from "@/lib/oauth";
 import { getSessionUserId } from "@/lib/session";
 
@@ -17,7 +17,8 @@ import { getSessionUserId } from "@/lib/session";
 // fresh (ten minutes), for a client that still exists with that redirect URI
 // still registered. Approve stores a single-use code (hashed, five minutes) and
 // sends the browser back to the client with code and state; Deny sends back
-// access_denied. 303, so the browser follows with a GET.
+// access_denied. Both carry iss (RFC 9207). 303, so the browser follows with a
+// GET. These are the only redirects to a client, and both follow a click.
 
 const REDIRECT_HEADERS = { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer" };
 
@@ -57,7 +58,7 @@ export async function POST(req: NextRequest) {
       return oauthErrorPage("The app asking for access isn't registered here any more.", 400);
     }
     if (decision === "deny") {
-      target = withParams(grant.redirectUri, {
+      target = authorizationResponseUrl(grant.redirectUri, {
         error: "access_denied",
         error_description: "The user denied the request",
         state: grant.state,
@@ -66,7 +67,7 @@ export async function POST(req: NextRequest) {
       return oauthErrorPage("Your account can't use this Bookmark Graveyard.", 403);
     } else {
       const code = await issueAuthorizationCode(grant);
-      target = withParams(grant.redirectUri, { code, state: grant.state });
+      target = authorizationResponseUrl(grant.redirectUri, { code, state: grant.state });
     }
   } catch (err) {
     console.error("POST /api/oauth/decision:", err);
