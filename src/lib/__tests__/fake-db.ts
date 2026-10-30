@@ -7,10 +7,53 @@
 // function does); plus storage uploads and removals. Like PostgREST,
 // select("a, b") returns only those columns (select() or "*" returns all), so
 // a column missing from a query's select list reads as undefined in tests too.
+// An embedded resource, select("a, rel(b, c)"), reads the row's own `rel`
+// field (a test seeds the joined object or array inline) narrowed to b and c.
+// select(columns, { count: "exact", head: true }) answers the matching row
+// count, with no rows when `head` is set.
 // Tests read and seed `tables` directly.
 
 type Row = Record<string, unknown>;
-type Result = { data: unknown; error: { message: string } | null };
+type Result = { data: unknown; error: { message: string } | null; count?: number | null };
+/** One entry of a select list: a column, or an embedded resource with its own list. */
+type Column = { name: string; inner: Column[] | null };
+
+/** Parses a PostgREST select list, keeping `rel(a, b)` groups together. */
+function parseColumns(list: string): Column[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = "";
+  for (const ch of list) {
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    if (ch === "(") depth++;
+    if (ch === ")") depth--;
+    current += ch;
+  }
+  parts.push(current);
+  return parts
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => {
+      const open = part.indexOf("(");
+      if (open < 0 || !part.endsWith(")")) return { name: part, inner: null };
+      return { name: part.slice(0, open).trim(), inner: parseColumns(part.slice(open + 1, -1)) };
+    });
+}
+
+function projectRow(row: Row, columns: Column[]): Row {
+  return Object.fromEntries(
+    columns.map(({ name, inner }) => {
+      const value = row[name];
+      if (!inner || value === null || value === undefined) return [name, value];
+      if (Array.isArray(value)) return [name, value.map((v) => projectRow(v as Row, inner))];
+      return [name, projectRow(value as Row, inner)];
+    })
+  );
+}
 
 export interface FakeDb {
   tables: Record<string, Row[]>;
@@ -63,7 +106,9 @@ class FakeQuery implements PromiseLike<Result> {
   private patch: Row = {};
   private conflictKey?: string;
   private returning = false;
-  private columns: string[] | null = null; // null = every column
+  private columns: Column[] | null = null; // null = every column
+  private counting = false;
+  private head = false;
   private mode: "many" | "single" | "maybeSingle" = "many";
   private filters: ((row: Row) => boolean)[] = [];
   private sorts: { column: string; ascending: boolean; nullsFirst: boolean }[] = [];
@@ -74,9 +119,11 @@ class FakeQuery implements PromiseLike<Result> {
     private table: string
   ) {}
 
-  select(columns?: string) {
+  select(columns?: string, options: { count?: "exact"; head?: boolean } = {}) {
     if (this.op !== "select") this.returning = true;
-    this.columns = !columns || columns.trim() === "*" ? null : columns.split(",").map((c) => c.trim());
+    this.columns = !columns || columns.trim() === "*" ? null : parseColumns(columns);
+    this.counting = options.count === "exact";
+    this.head = options.head === true;
     return this;
   }
   insert(rows: Row | Row[]) {
@@ -147,6 +194,13 @@ class FakeQuery implements PromiseLike<Result> {
     let result: Row[];
     if (this.op === "select") {
       result = this.sorted(table.filter(matches));
+      // Like PostgREST's count=exact: every matching row, whatever the limit.
+      if (this.counting) {
+        const count = result.length;
+        if (this.head) return { data: null, error: null, count };
+        if (this.max !== null) result = result.slice(0, this.max);
+        return { ...this.shaped(result), count };
+      }
       if (this.max !== null) result = result.slice(0, this.max);
     } else if (this.op === "insert") {
       result = this.rows.map((row) => ({ id: `${this.table}-${table.length + 1}`, ...row }));
@@ -165,8 +219,13 @@ class FakeQuery implements PromiseLike<Result> {
       result = table.filter(matches);
       this.db.tables[this.table] = table.filter((row) => !matches(row));
     }
+    return this.shaped(result);
+  }
+
+  /** The rows as the caller asked for them: projected to the select list, as a list or a single row. */
+  private shaped(result: Row[]): Result {
     const columns = this.columns;
-    const project = (row: Row): Row => (columns ? Object.fromEntries(columns.map((c) => [c, row[c]])) : { ...row });
+    const project = (row: Row): Row => (columns ? projectRow(row, columns) : { ...row });
     if (this.mode === "many") {
       return { data: this.op === "select" || this.returning ? result.map(project) : null, error: null };
     }
