@@ -68,7 +68,8 @@ Non-blocking for personal use; worth doing before a public multi-user deploy.
 - **Single-generation lease.** Two tabs generating the same draft concurrently
   is currently *bounded* by the per-user render/script caps and the forward-only
   render cursor, but not fully interlocked. A short-lived per-episode lease
-  (heartbeat + `generating_until` timestamp) would make it exclusive.
+  (heartbeat + `generating_until` timestamp) would make it exclusive. Briefs an AI assistant starts
+  now have one (`claim_brief_job`); the dashboard's path still does not.
 - **SSRF DNS-rebinding TOCTOU.** `fetchArticle` resolves + checks the host, but
   `fetch()` re-resolves a moment later, leaving a small rebinding window. Fully
   closing it needs pinning the vetted IP and connecting via a custom dispatcher
@@ -76,6 +77,15 @@ Non-blocking for personal use; worth doing before a public multi-user deploy.
   VM/container with internal network reach.
 - **Multi-draft resume.** Only the newest draft surfaces for resume; older
   orphaned drafts are invisible until the newer one resolves.
+- **Refresh tokens have no expiry of their own** (assistant connector, 2026-10-30). A sign-in
+  connection that is never used again keeps a working refresh token until someone revokes it in the
+  Assistants panel. Expiring one after a long idle period would close that.
+- **The 25-active-token cap does not apply to sign-in tokens** (2026-10-30). It is checked when a
+  token is made in the panel. An approved sign-in is never refused for it, though it counts toward
+  the total.
+- **Client registration is open, with a 1,000-client ceiling** (2026-10-30). Anyone can register at
+  `/oauth/register`. Unused registrations are pruned after 30 days, so a flood could fill the table
+  and turn real assistants away with a 503 until the pruning catches up.
 
 ---
 
@@ -104,6 +114,67 @@ so stop at the first page with nothing new; a daily check then costs one page).
 (switch the filtered column; topic counts follow the same window), a toggle
 beside the pickers in `src/app/dashboard.tsx`, default to "saved", and a
 one-line hint per mode.
+
+---
+
+## Outbound "brief ready" webhook — BACKLOG (2026-10-30)
+
+**What we want:** when a brief finishes, the app POSTs a small JSON message (title, episode id, the
+stable audio and markdown links) to a URL the user sets, so an assistant or automation hears about it
+instead of polling. The first fit is a
+[Grok Bot routine](https://docs.x.ai/grok-bot/skills-routines-and-automations) with a webhook
+trigger, which accepts an HTTP POST carrying `Authorization: Bearer <key>` and starts a run. The hook
+point already exists: the job runner's `done` transition in `src/lib/jobs.ts`.
+
+**Why not now:** it needs a per-user place for the URL and secret (encrypted, like voice keys), a
+settings panel, a retry policy, and a way to show a failed delivery. The user picks the destination,
+so it must go through the same private-address checks as article fetching (`src/lib/ingest.ts`). It
+is also undecided whether briefs made on the dashboard should fire it, or only assistant-started
+ones. On Vercel the delivery would run inside the same `after()` window as the runner.
+
+**Unblock:** revisit when people running routines say polling is too clumsy. Design first: where the
+setting lives, the payload, and how the receiver can tell the call came from the app.
+
+---
+
+## Private podcast RSS feed — BACKLOG (2026-10-30)
+
+**What we want:** one feed address per user that a podcast app can subscribe to, so each finished
+podcast brief shows up on a phone like any other episode. It reuses the stable audio links from the
+assistant connector (`/api/episodes/[id]/audio`), which already outlive the 24-hour signed URLs.
+
+**Why not now:** a podcast app cannot sign in to X or send an `Authorization` header, so the feed and
+its audio links need a secret inside the URL itself, the way other private feeds work. That is a
+third kind of credential beside the session cookie and the assistant tokens. It needs its own table,
+a way to rotate or revoke it, and a rule that it can read audio and nothing else. Anyone who gets
+the address gets the episodes, so the docs would have to say so. The feed also needs each file's size
+and type from storage, and its route must stay open behind the password gate like the other
+self-locked paths. Markdown-only briefs have no audio, so they need a decision (leave them out, or
+publish a text item). Audio pruned to free space drops out of the feed.
+
+**Unblock:** settle the secret-in-the-URL design (a scoped feed token with rotation), then add the
+feed route next to the episode link routes.
+
+---
+
+## Cron ticking stale brief jobs — BACKLOG (2026-10-30)
+
+**What we want:** a scheduled call that finds brief jobs an assistant started, and restarts any that
+are still `queued` or whose runner was cut off, so a podcast finishes without anyone polling.
+`maybeRescheduleBriefJob` in `src/lib/jobs.ts` already does this for one job when an assistant asks
+for its status. The cron route would run the same claim for every stale job.
+
+**Why not now:** it only matters on request-bound hosts such as Vercel, where background work is cut
+off after the route's 300 seconds, and only when the assistant stops polling. On Render the runner
+finishes the job by itself. The schedules in `render.yaml` and `vercel.json` also run weekly, and
+this needs a check every minute or two. That is a different schedule, and some hosting plans do not
+allow it or charge for it. A tick on a request-bound host is cut off at `maxDuration` too, so it
+moves a job forward one slice at a time.
+
+**Unblock:** revisit when someone on Vercel has an assistant or routine that gives up before a
+podcast finishes. Build sketch: a second cron entry that calls a bearer-protected route (the
+`CRON_SECRET` pattern of `/api/cron/sync`), which lists `queued` and stale `running` jobs and calls
+the same claim and run for each.
 
 ---
 
