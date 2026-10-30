@@ -10,7 +10,9 @@
 --
 -- oauth_codes: authorization codes, five minutes, single use. Only the
 -- SHA-256 hex of a code is stored, next to the PKCE challenge, the redirect
--- URI and the scopes the user approved.
+-- URI and the scopes the user approved. token_id is the token the code was
+-- exchanged for: if the code is presented again, that token is revoked
+-- (RFC 6749 section 4.1.2).
 --
 -- api_tokens.refresh_token_hash: the SHA-256 hex of the current refresh token
 -- of a token minted through OAuth (NULL for dashboard tokens). Refreshing
@@ -36,6 +38,7 @@ create table if not exists public.oauth_codes (
   resource text,
   expires_at timestamptz not null,
   used_at timestamptz,
+  token_id uuid references public.api_tokens (id) on delete set null,
   created_at timestamptz not null default now()
 );
 

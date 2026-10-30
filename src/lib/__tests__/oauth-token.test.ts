@@ -157,13 +157,43 @@ describe("grant_type=authorization_code", () => {
     expect((await token(exchangeFields(code, verifier))).status).toBe(200);
   });
 
-  it("rejects a reused code with invalid_grant", async () => {
+  it("rejects a replayed code with invalid_grant and revokes the token it produced", async () => {
     const { code, verifier } = await newCode();
-    expect((await token(exchangeFields(code, verifier))).status).toBe(200);
+    const first = await read(await token(exchangeFields(code, verifier)));
+    expect(first.status).toBe(200);
+    const accessToken = first.json.access_token as string;
+    expect(fake.tables.oauth_codes[0].token_id).toBe(tokens()[0].id);
+    expect(await verifyApiToken(accessToken)).not.toBeNull();
+
+    vi.setSystemTime(T0.getTime() + MINUTE);
+    const errorSpy = vi.mocked(console.error);
+    errorSpy.mockClear();
     const { status, json } = await read(await token(exchangeFields(code, verifier)));
     expect(status).toBe(400);
     expect(json.error).toBe("invalid_grant");
     expect(tokens()).toHaveLength(1);
+    expect(tokens()[0].revoked_at).toBe(new Date(T0.getTime() + MINUTE).toISOString());
+    expect(await verifyApiToken(accessToken)).toBeNull();
+
+    // One log line, naming the token, never the code or verifier.
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    const logged = errorSpy.mock.calls[0].map(String).join(" ");
+    expect(logged).toContain(String(tokens()[0].id));
+    expect(logged).not.toContain(code);
+    expect(logged).not.toContain(verifier);
+  });
+
+  it("revokes on replay even when the replay is otherwise wrong, and keeps the first revocation time", async () => {
+    const { code, verifier } = await newCode();
+    const first = await read(await token(exchangeFields(code, verifier)));
+    await token(exchangeFields(code, pkcePair().verifier, { client_id: OTHER_CLIENT_ID }));
+    const revokedAt = tokens()[0].revoked_at;
+    expect(revokedAt).toBe(T0.toISOString());
+    expect(await verifyApiToken(first.json.access_token as string)).toBeNull();
+
+    vi.setSystemTime(T0.getTime() + MINUTE);
+    expect((await read(await token(exchangeFields(code, verifier)))).json.error).toBe("invalid_grant");
+    expect(tokens()[0].revoked_at).toBe(revokedAt);
   });
 
   it("lets only one of two concurrent exchanges of the same code win", async () => {
