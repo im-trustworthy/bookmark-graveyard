@@ -102,7 +102,7 @@ Repository map:
 - **Images.** Described and read by Grok vision. Legible text (tables, code) is transcribed
   verbatim, not just summarized.
 - **Video and GIFs.** Transcribed by the configured voice provider (Grok STT or ElevenLabs Scribe)
-  from the lowest-bitrate MP4 variant, capped at 25 minutes and 60 MB. Falls back to a thumbnail
+  from the lowest-bitrate MP4 variant, capped at 60 minutes and 160 MB. Falls back to a thumbnail
   description if transcription fails, is skipped, or the voice provider is misconfigured.
 - Runs 3-way concurrent, capped per request so it fits inside the serverless timeout budget (see
   [Pipeline](#pipeline)).

@@ -114,3 +114,48 @@ describe("ingestPending video transcription", () => {
     ]);
   });
 });
+
+describe("ingestPending video limits", () => {
+  const minutes = (n: number) => n * 60_000;
+  const setDuration = (ms: number) => {
+    (fake.tables.bookmarks[0].media as { duration_ms: number }[])[0].duration_ms = ms;
+  };
+
+  it("transcribes videos up to an hour long", async () => {
+    setDuration(minutes(59));
+    state.provider = stubProvider(async () => "an hour of talk");
+
+    await ingestPending("user-1");
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fake.tables.bookmark_sources).toEqual([
+      expect.objectContaining({ kind: "video", title: "transcript", content: "an hour of talk" }),
+    ]);
+  });
+
+  it("skips the download for videos over an hour and falls back to the thumbnail", async () => {
+    setDuration(minutes(61));
+    const provider = stubProvider(async () => "never used");
+    state.provider = provider;
+
+    await ingestPending("user-1");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(provider.transcribe).not.toHaveBeenCalled();
+    expect(fake.tables.bookmark_sources).toEqual([
+      expect.objectContaining({ kind: "video", title: "thumbnail description (no transcript)" }),
+    ]);
+  });
+
+  it("falls back to the thumbnail when the download exceeds 160 MB", async () => {
+    const provider = stubProvider(async () => "never used");
+    state.provider = provider;
+    fetchMock.mockImplementation(
+      async () => ({ ok: true, arrayBuffer: async () => ({ byteLength: 161 * 1024 * 1024 }) }) as unknown as Response
+    );
+
+    await ingestPending("user-1");
+    expect(provider.transcribe).not.toHaveBeenCalled();
+    expect(fake.tables.bookmark_sources).toEqual([
+      expect.objectContaining({ kind: "video", title: "thumbnail description (no transcript)" }),
+    ]);
+  });
+});

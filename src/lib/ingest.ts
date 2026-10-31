@@ -10,10 +10,12 @@ import type { VoiceProvider } from "./voice";
 import type { ReferencedTweet } from "./x";
 
 const ARTICLE_CHAR_CAP = 8000;
-const TRANSCRIPT_CHAR_CAP = 8000;
+const TRANSCRIPT_CHAR_CAP = 50_000; // about an hour of speech
 const MAX_ARTICLES_PER_POST = 3;
-const MAX_VIDEO_BYTES = 60 * 1024 * 1024;
-const MAX_VIDEO_MINUTES = 25;
+// An hour at X's lowest bitrate (~290 kbps) is about 130 MB. The whole file is
+// buffered in memory, so the byte cap is what protects the host, not the provider.
+const MAX_VIDEO_BYTES = 160 * 1024 * 1024;
+const MAX_VIDEO_MINUTES = 60;
 const ARTICLE_FETCH_TIMEOUT_MS = 15_000;
 const MAX_ARTICLE_REDIRECTS = 5;
 
@@ -329,7 +331,8 @@ async function transcribeVideo(media: XMedia, stt: VoiceProvider | null): Promis
   // to the thumbnail without fetching the video for nothing.
   if (!stt) throw new Error("No voice provider for transcription");
 
-  const videoRes = await fetch(variant.url, { signal: AbortSignal.timeout(60_000) });
+  // 160 MB in two minutes needs ~11 Mbit/s, well under what X's CDN delivers.
+  const videoRes = await fetch(variant.url, { signal: AbortSignal.timeout(120_000) });
   if (!videoRes.ok) throw new Error(`Video fetch ${videoRes.status}`);
   const bytes = await videoRes.arrayBuffer();
   if (bytes.byteLength > MAX_VIDEO_BYTES) throw new Error("Video too large");
