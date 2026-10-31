@@ -89,7 +89,9 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
             .slice(0, 1200) || undefined,
           sources: (sourcesByTweet.get(b.tweet_id) ?? [])
             .filter((s) => s.content)
-            .map((s) => `[${s.kind}] ${s.title ?? ""} ${s.content!.slice(0, 800)}`),
+            // Transcripts get more room than articles or image descriptions: a
+            // one-line summary of an hour-long talk needs more than its first minute.
+            .map((s) => `[${s.kind}] ${s.title ?? ""} ${s.content!.slice(0, s.kind === "video" ? 12_000 : 800)}`),
         }))
       )
     );
@@ -219,7 +221,7 @@ function buildDossier(
     if (s.kind === "article") {
       lines.push(`Linked article "${s.title ?? s.url}" (${s.url}): ${s.content.slice(0, 4000)}`);
     } else if (s.kind === "video") {
-      lines.push(`Video ${s.title ?? "transcript"}: ${s.content.slice(0, 3000)}`);
+      lines.push(`Video ${s.title ?? "transcript"}: ${s.content.slice(0, 6000)}`);
     } else {
       lines.push(`Image content: ${s.content.slice(0, 1200)}`);
     }
