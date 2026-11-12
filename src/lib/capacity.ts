@@ -1,4 +1,5 @@
 import "server-only";
+import { EPISODE_STATUS } from "./state/episode";
 import { db } from "./supabase";
 
 // How full this instance's Supabase project is, and pruning of old podcast
@@ -175,7 +176,7 @@ async function pruneCandidates(keepRecent: number, userId?: string): Promise<Aud
   let query = db()
     .from("episodes")
     .select("id, user_id, title, created_at, audio_path, duration_seconds")
-    .eq("status", "ready")
+    .eq("status", EPISODE_STATUS.ready)
     .not("audio_path", "is", null)
     .order("created_at", { ascending: true });
   if (userId) query = query.eq("user_id", userId);

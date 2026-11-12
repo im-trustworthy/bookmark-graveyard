@@ -1,5 +1,8 @@
 import "server-only";
 import { db } from "./supabase";
+import { hasAnalysisAttempts } from "./analysis-attempts";
+import { bookmarkStage } from "./state/pipeline";
+import type { BookmarkStage } from "./state/pipeline";
 
 // How a user's bookmarks are loaded and narrowed, shared by GET /api/bookmarks and anything else that
 // browses the library. The helpers compose: load once, narrow by date, count the topic chips over that
@@ -24,6 +27,10 @@ export interface BookmarkRow {
   tweet_created_at: string | null;
   first_seen_at: string;
   public_metrics: Record<string, unknown> | null;
+  /** When the post's sources were fetched; null until then. Loaded by loadBookmarkRows. */
+  ingested_at?: string | null;
+  /** Failed analysis attempts, loaded only where the column exists. */
+  analysis_attempts?: number | null;
   // Supabase returns the joined analysis as an object or a one-element array depending on the
   // relationship shape, and null when there is none.
   bookmark_analysis: BookmarkAnalysis | BookmarkAnalysis[] | null;
@@ -39,7 +46,8 @@ export class BookmarkQueryError extends Error {
 
 const MAX_ROWS = 1000;
 
-const ROW_COLUMNS = "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics";
+const ROW_COLUMNS =
+  "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, ingested_at";
 const ANALYSIS_COLUMNS = "topics, summary, content_type, credibility";
 
 /**
@@ -48,21 +56,36 @@ const ANALYSIS_COLUMNS = "topics, summary, content_type, credibility";
  */
 export async function loadBookmarkRows(userId: string, opts: { withClaims?: boolean } = {}): Promise<BookmarkRow[]> {
   const analysis = opts.withClaims ? `${ANALYSIS_COLUMNS}, claims` : ANALYSIS_COLUMNS;
+  const columns = (await hasAnalysisAttempts()) ? `${ROW_COLUMNS}, analysis_attempts` : ROW_COLUMNS;
   const { data, error } = await db()
     .from("bookmarks")
-    .select(`${ROW_COLUMNS}, bookmark_analysis(${analysis})`)
+    .select(`${columns}, bookmark_analysis(${analysis})`)
     .eq("user_id", userId)
     .eq("hidden", false)
     .order("tweet_created_at", { ascending: false, nullsFirst: false })
     .limit(MAX_ROWS);
   if (error) throw new BookmarkQueryError(error.message);
-  return (data ?? []) as BookmarkRow[];
+  return (data ?? []) as unknown as BookmarkRow[];
 }
 
 /** Normalizes the joined analysis to a single row, or null when the post hasn't been analyzed. */
 export function analysisOf(row: Pick<BookmarkRow, "bookmark_analysis">): BookmarkAnalysis | null {
   const a = row.bookmark_analysis;
   return Array.isArray(a) ? (a[0] ?? null) : a;
+}
+
+/** Where the post stands in the pipeline (state/pipeline.ts), from the columns loadBookmarkRows reads. */
+export function stageOf(row: Pick<BookmarkRow, "bookmark_analysis" | "ingested_at" | "analysis_attempts">): BookmarkStage {
+  return bookmarkStage({
+    ingested_at: row.ingested_at ?? null,
+    analysed: analysisOf(row) !== null,
+    analysis_attempts: row.analysis_attempts,
+  });
+}
+
+/** True when the analysis pass gave up on the post: it has no topics or summary and won't get them unasked. */
+export function isAnalysisFailed(row: Pick<BookmarkRow, "bookmark_analysis" | "ingested_at" | "analysis_attempts">): boolean {
+  return stageOf(row) === "analysis_failed";
 }
 
 /**

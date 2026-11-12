@@ -11,7 +11,8 @@ import { ensureRoomFor } from "./capacity";
 import { signEpisodeUrls } from "./episodes";
 import { checkUsage } from "./limits";
 import { mp3DurationSeconds, stripMp3Headers } from "./mp3";
-import { estimateDurationSeconds, LINES_PER_CALL, renderPodcast } from "./tts";
+import { EPISODE_STATUS, LINES_PER_CALL, scriptLengthOf } from "./state/episode";
+import { estimateDurationSeconds, renderPodcast } from "./tts";
 import { isTtsReady } from "./voice";
 import type { VoiceConfig } from "./voice";
 import { getVoiceProviderForUser, pinnedVoiceFrom, resolveVoiceConfigForUser } from "./voice/user";
@@ -185,7 +186,7 @@ export async function prepareBrief(userId: string, params: PrepareRequest): Prom
       user_id: userId,
       title,
       format,
-      status: markdownOnly ? "ready" : "draft",
+      status: markdownOnly ? EPISODE_STATUS.ready : EPISODE_STATUS.draft,
       date_from: params.from ?? null,
       date_to: params.to ?? null,
       topics: params.topics ?? [],
@@ -214,7 +215,14 @@ export async function prepareBrief(userId: string, params: PrepareRequest): Prom
 // Stage 2 (audio): turn the prepared markdown into the two-host script
 // ---------------------------------------------------------------------------
 
-/** Writes the two-host script for a draft episode and saves it. `targetMinutes` is clamped to 5-30, default 20. */
+/**
+ * Writes the two-host script for a draft episode and saves it. `targetMinutes` is clamped to 5-30, default 20.
+ *
+ * Idempotent and write-once: a draft that already has its script answers with that script's length and
+ * spends nothing, and the save only lands on a draft that still has no script. Audio chunks are matched
+ * to the script by line index alone, so a second script written under chunks of the first (a stale
+ * Resume banner, a second tab, a replayed request) would publish mismatched audio, and bill twice.
+ */
 export async function scriptBrief(
   userId: string,
   episodeId: string,
@@ -222,7 +230,7 @@ export async function scriptBrief(
 ): Promise<{ totalLines: number }> {
   const { data: episode } = await db()
     .from("episodes")
-    .select("id, markdown_path, status")
+    .select("id, markdown_path, status, script")
     .eq("user_id", userId)
     .eq("id", episodeId)
     .single();
@@ -230,7 +238,10 @@ export async function scriptBrief(
   // Only an unfinished draft is resumable — a 'ready' episode's script is
   // never cleared, so without this a replayed/late call would silently
   // re-run (and re-bill) script generation against a finished brief.
-  if (episode.status !== "draft") throw new DigestStageError(409, "Episode is not resumable", "episode not draft");
+  if (episode.status !== EPISODE_STATUS.draft) throw notResumable();
+
+  const existing = scriptLengthOf(episode.script);
+  if (existing > 0) return { totalLines: existing };
 
   const { data: mdFile, error: dlErr } = await db().storage.from("episodes").download(episode.markdown_path);
   if (dlErr || !mdFile) throw new Error(`Markdown download failed: ${dlErr?.message}`);
@@ -242,10 +253,36 @@ export async function scriptBrief(
   const script = await writePodcastScript(markdown, Math.min(Math.max(targetMinutes ?? 20, 5), 30));
   if (script.length === 0) throw new Error("Script generation returned no lines");
 
-  const { error } = await db().from("episodes").update({ script }).eq("user_id", userId).eq("id", episodeId);
+  // Compare-and-set: the filters are evaluated against the live row, so of two writers that both read
+  // "no script yet" exactly one lands. The loser keeps the winner's script rather than overwriting it.
+  const { data: written, error } = await db()
+    .from("episodes")
+    .update({ script })
+    .eq("user_id", userId)
+    .eq("id", episodeId)
+    .eq("status", EPISODE_STATUS.draft)
+    .is("script", null)
+    .select("id")
+    .maybeSingle();
   if (error) throw new Error(error.message);
+  if (written) return { totalLines: script.length };
 
-  return { totalLines: script.length };
+  const { data: current, error: readErr } = await db()
+    .from("episodes")
+    .select("status, script")
+    .eq("user_id", userId)
+    .eq("id", episodeId)
+    .maybeSingle();
+  if (readErr) throw new Error(`Episode lookup failed: ${readErr.message}`);
+  if (!current) throw new DigestStageError(404, "Episode not found");
+  const winner = scriptLengthOf(current.script);
+  if (winner > 0) return { totalLines: winner };
+  throw notResumable();
+}
+
+/** The refusal each stage gives an episode that is no longer an unfinished draft. */
+function notResumable(): DigestStageError {
+  return new DigestStageError(409, "Episode is not resumable", "episode not draft");
 }
 
 // ---------------------------------------------------------------------------
@@ -273,7 +310,7 @@ export async function renderChunk(
   // Only an unfinished draft is resumable — a 'ready' episode's script is
   // never cleared, so without this a replayed/late call would silently
   // re-render (and re-bill) audio against a finished brief.
-  if (episode.status !== "draft") throw new DigestStageError(409, "Episode is not resumable", "episode not draft");
+  if (episode.status !== EPISODE_STATUS.draft) throw notResumable();
 
   const start = Math.max(0, cursor);
 
@@ -318,12 +355,15 @@ export async function renderChunk(
   // Guarded update: only ever advances render_cursor, never regresses it.
   // The `lt` filter is evaluated against the live row at execution time, so
   // this stays a correct monotonic high-water mark even if two chunk
-  // uploads for the same episode race (e.g. two tabs both resuming).
+  // uploads for the same episode race (e.g. two tabs both resuming). The
+  // status filter keeps a render that lands after its episode was published
+  // (or while it is being discarded) from writing to anything but a draft.
   const { error: cursorErr } = await db()
     .from("episodes")
     .update({ render_cursor: nextCursor })
     .eq("user_id", userId)
     .eq("id", episodeId)
+    .eq("status", EPISODE_STATUS.draft)
     .lt("render_cursor", nextCursor);
   if (cursorErr) throw new Error(`Cursor update failed: ${cursorErr.message}`);
 
@@ -336,7 +376,7 @@ export async function renderChunk(
 
 // A complete render is chunk starts 0, LINES_PER_CALL, 2*LINES_PER_CALL, ...
 // with no gaps, and the last chunk must reach the end of the script — mirrors
-// the "renderedThroughEnd" rule in deriveDigestStage (src/lib/episodes.ts).
+// the "renderedThroughEnd" rule in deriveDigestStage (src/lib/state/episode.ts).
 function hasCompleteCoverage(sortedStarts: number[], scriptLength: number): boolean {
   if (sortedStarts.length === 0) return false;
   for (let i = 0; i < sortedStarts.length; i++) {
@@ -346,8 +386,9 @@ function hasCompleteCoverage(sortedStarts: number[], scriptLength: number): bool
 }
 
 /**
- * Stitches the rendered chunks into brief.mp3 and marks the episode `ready`. Idempotent: an episode that
- * is already `ready` is returned as is. Throws CapacityError when storage has no room for the audio.
+ * Stitches the rendered chunks into brief.mp3 and marks the episode `ready`, then removes the chunks.
+ * Idempotent: an episode that is already `ready`, or that a concurrent finalize publishes while this one
+ * runs, is returned as is. Throws CapacityError when storage has no room for the audio.
  */
 export async function finalizeBrief(userId: string, episodeId: string): Promise<{ episode: SignedEpisode }> {
   const { data: episode } = await db()
@@ -361,9 +402,9 @@ export async function finalizeBrief(userId: string, episodeId: string): Promise<
   // Already published: hand back the existing episode rather than
   // re-stitching. Idempotent so a replayed/racing finalize call (e.g. a
   // second tab) is a no-op instead of an error.
-  if (episode.status === "ready") return { episode: await signEpisodeUrls(episode) };
+  if (episode.status === EPISODE_STATUS.ready) return { episode: await signEpisodeUrls(episode) };
   // Only an unfinished draft is otherwise resumable.
-  if (episode.status !== "draft") throw new DigestStageError(409, "Episode is not resumable", "episode not draft");
+  if (episode.status !== EPISODE_STATUS.draft) throw notResumable();
 
   const script = (episode.script ?? []) as ScriptLine[];
 
@@ -374,7 +415,13 @@ export async function finalizeBrief(userId: string, episodeId: string): Promise<
     sortBy: { column: "name", order: "asc" },
   });
   if (listErr) throw new Error(listErr.message);
-  if (!chunkFiles || chunkFiles.length === 0) throw new DigestStageError(400, "No rendered audio chunks found");
+  if (!chunkFiles || chunkFiles.length === 0) {
+    // A finalize that ran alongside this one may have published and removed the chunks since this call
+    // read the episode: hand the finished brief back rather than answering 400 for it.
+    const finished = await readyEpisode(userId, episodeId);
+    if (finished) return { episode: await signEpisodeUrls(finished) };
+    throw new DigestStageError(400, "No rendered audio chunks found");
+  }
 
   // Verify coverage before doing any concatenation/publishing work: a
   // replayed finalize, a client that skipped ahead, or an interrupted
@@ -399,7 +446,13 @@ export async function finalizeBrief(userId: string, episodeId: string): Promise<
   const buffers: Buffer[] = [];
   for (const file of chunkFiles) {
     const { data, error } = await storage.download(`${base}/chunks/${file.name}`);
-    if (error || !data) throw new Error(`Chunk download failed: ${error?.message}`);
+    if (error || !data) {
+      // A finalize that ran alongside this one removes the chunks once it has published, so a missing
+      // chunk may just mean the brief is done: hand that back rather than failing a finished brief.
+      const finished = await readyEpisode(userId, episodeId);
+      if (finished) return { episode: await signEpisodeUrls(finished) };
+      throw new Error(`Chunk download failed: ${error?.message}`);
+    }
     buffers.push(Buffer.from(await data.arrayBuffer()));
   }
   const audio = stripMp3Headers(Buffer.concat(buffers));
@@ -416,8 +469,9 @@ export async function finalizeBrief(userId: string, episodeId: string): Promise<
   });
   if (upErr) throw new Error(`Audio upload failed: ${upErr.message}`);
 
-  await storage.remove(chunkFiles.map((f) => `${base}/chunks/${f.name}`));
-
+  // Publish before cleaning up: until this update lands the chunks are the only copy of the rendered
+  // audio a retry can stitch from. Filtered on draft so that of two finalizes (or a finalize and a
+  // discard) exactly one decides the row's fate.
   const { data: updated, error } = await db()
     .from("episodes")
     .update({
@@ -425,13 +479,61 @@ export async function finalizeBrief(userId: string, episodeId: string): Promise<
       // Real length from the frames we just stitched; the word-count estimate is
       // only a fallback if the parser somehow finds no frames.
       duration_seconds: Math.round(mp3DurationSeconds(audio)) || estimateDurationSeconds(script),
-      status: "ready",
+      status: EPISODE_STATUS.ready,
     })
     .eq("user_id", userId)
     .eq("id", episodeId)
+    .eq("status", EPISODE_STATUS.draft)
     .select()
-    .single();
+    .maybeSingle();
   if (error) throw new Error(error.message);
 
+  if (!updated) {
+    const { data: current, error: readErr } = await db()
+      .from("episodes")
+      .select("*")
+      .eq("user_id", userId)
+      .eq("id", episodeId)
+      .maybeSingle();
+    if (readErr) throw new Error(`Episode lookup failed: ${readErr.message}`);
+    // Another finalize published first. Its brief.mp3 is at this same path, so the audio is left alone.
+    if (current?.status === EPISODE_STATUS.ready) return { episode: await signEpisodeUrls(current) };
+    if (!current) {
+      // Discarded while this one stitched: the upload belongs to no episode now.
+      await removeBestEffort([audioPath], "orphaned audio");
+      throw new DigestStageError(404, "Episode not found");
+    }
+    throw notResumable();
+  }
+
+  // A crash between the update above and this removal leaves chunk files beside a published brief.
+  // They are harmless to correctness: nothing reads the chunks of a ready episode, so they only take space.
+  await removeBestEffort(
+    chunkFiles.map((f) => `${base}/chunks/${f.name}`),
+    "chunk cleanup"
+  );
+
   return { episode: await signEpisodeUrls(updated) };
+}
+
+/** The episode if it is `ready` now, else null: how finalize recognises that a concurrent finalize won. */
+async function readyEpisode(userId: string, episodeId: string) {
+  const { data } = await db()
+    .from("episodes")
+    .select("*")
+    .eq("user_id", userId)
+    .eq("id", episodeId)
+    .eq("status", EPISODE_STATUS.ready)
+    .maybeSingle();
+  return data;
+}
+
+/** Removes storage objects whose loss only costs space: a failure is logged, never thrown. */
+async function removeBestEffort(paths: string[], what: string): Promise<void> {
+  try {
+    const { error } = await db().storage.from("episodes").remove(paths);
+    if (error) console.error(`finalizeBrief: ${what} failed:`, error);
+  } catch (err) {
+    console.error(`finalizeBrief: ${what} failed:`, err);
+  }
 }

@@ -1,5 +1,7 @@
 import "server-only";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { isUserAllowed } from "./allowlist";
+import { BEARER_USABLE_STATUSES, isExpired, REFRESHABLE_STATUSES, tokenStatusIn } from "./state/token";
 import { db } from "./supabase";
 
 // Personal access tokens: how an AI assistant (through the MCP connector)
@@ -15,6 +17,10 @@ import { db } from "./supabase";
 // and refresh tokens stop working together, and keeps the replaced refresh
 // token's hash as previous_refresh_token_hash: presenting that one again means
 // it leaked, and revokes the row.
+//
+// What state a row is in (active, expired, revoked) and which states each
+// reader accepts are defined in src/lib/state/token.ts; every revocation goes
+// through revokeTokenRows below.
 
 export type ApiScope = "read" | "write";
 
@@ -70,10 +76,8 @@ export function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
 
-/** Whether a token row is past its expiry at `now` (no expiry: never). */
-export function isExpired(expiresAt: string | null | undefined, now = Date.now()): boolean {
-  return !!expiresAt && Date.parse(expiresAt) <= now;
-}
+// Defined with the rest of the token lifecycle; re-exported for the modules that import it here.
+export { isExpired };
 
 function toRecord(row: Record<string, unknown>): ApiTokenRecord {
   return {
@@ -193,19 +197,12 @@ export async function findRefreshGrant(refreshToken: string): Promise<RefreshGra
   if (!REFRESH_TOKEN_SHAPE.test(refreshToken)) return null; // not one of ours: no lookup
   const { data: row, error } = await db()
     .from("api_tokens")
-    .select("id, user_id, client_id, scopes, revoked_at, last_used_at, created_at")
+    .select("id, user_id, client_id, scopes, expires_at, revoked_at, last_used_at, created_at")
     .eq("refresh_token_hash", hashToken(refreshToken))
     .maybeSingle();
   if (error) throw new Error(`Refresh token lookup failed: ${error.message}`);
-  if (!row || row.revoked_at) return null;
-
-  const { data: user, error: userError } = await db()
-    .from("users")
-    .select("is_allowed")
-    .eq("id", row.user_id)
-    .maybeSingle();
-  if (userError) throw new Error(`Token owner lookup failed: ${userError.message}`);
-  if (!user?.is_allowed) return null;
+  if (!row || !tokenStatusIn(REFRESHABLE_STATUSES, row)) return null;
+  if (!(await isUserAllowed(row.user_id, { errorPrefix: "Token owner lookup failed" }))) return null;
 
   const scopes = Array.isArray(row.scopes) ? row.scopes.filter((s: unknown) => s === "read" || s === "write") : [];
   return {
@@ -215,6 +212,30 @@ export async function findRefreshGrant(refreshToken: string): Promise<RefreshGra
     scopes,
     lastUsedAt: String(row.last_used_at ?? row.created_at),
   };
+}
+
+/** Which rows a revocation applies to: one token by id, or one client's tokens for one user. */
+export type RevokeMatch = { id: string; user_id?: string } | { user_id: string; client_id: string };
+
+/**
+ * The one revocation write: sets revoked_at on the rows matching `match` that
+ * aren't revoked yet, so revoking is terminal and a second revoke keeps the
+ * first time. Returns the ids it revoked, or the database's error for the
+ * caller to word in its own message.
+ */
+export async function revokeTokenRows(
+  match: RevokeMatch
+): Promise<{ revokedIds: string[]; error: { message: string } | null }> {
+  // An empty match would revoke every token in the table: refuse it outright.
+  const filters = Object.entries(match).filter(([, value]) => value !== undefined);
+  if (filters.length === 0 || filters.some(([, value]) => typeof value !== "string" || !value)) {
+    throw new Error("revokeTokenRows needs a non-empty id, or a user and a client");
+  }
+  let query = db().from("api_tokens").update({ revoked_at: new Date().toISOString() });
+  for (const [column, value] of filters) query = query.eq(column, value);
+  const { data, error } = await query.is("revoked_at", null).select("id");
+  if (error) return { revokedIds: [], error };
+  return { revokedIds: Array.isArray(data) ? data.map((row: { id: unknown }) => String(row.id)) : [], error: null };
 }
 
 /**
@@ -236,11 +257,7 @@ export async function revokeReusedRefreshToken(refreshToken: string): Promise<st
   if (error) throw new Error(`Refresh token reuse lookup failed: ${error.message}`);
   if (!row) return null;
   if (!row.revoked_at) {
-    const { error: revokeError } = await db()
-      .from("api_tokens")
-      .update({ revoked_at: new Date().toISOString() })
-      .eq("id", row.id)
-      .is("revoked_at", null);
+    const { error: revokeError } = await revokeTokenRows({ id: row.id });
     if (revokeError) throw new Error(`Couldn't revoke token ${row.id} after refresh token reuse: ${revokeError.message}`);
   }
   return String(row.id);
@@ -252,15 +269,9 @@ export async function revokeReusedRefreshToken(refreshToken: string): Promise<st
  * has lost or dropped the tokens it had. Returns how many it revoked.
  */
 export async function revokeClientTokens(userId: string, clientId: string): Promise<number> {
-  const { data, error } = await db()
-    .from("api_tokens")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("user_id", userId)
-    .eq("client_id", clientId)
-    .is("revoked_at", null)
-    .select("id");
+  const { revokedIds, error } = await revokeTokenRows({ user_id: userId, client_id: clientId });
   if (error) throw new Error(`Couldn't revoke the client's earlier tokens: ${error.message}`);
-  return Array.isArray(data) ? data.length : 0;
+  return revokedIds.length;
 }
 
 /**
@@ -294,6 +305,7 @@ export async function rotateOAuthToken(
     })
     .eq("id", grant.tokenId)
     .eq("refresh_token_hash", hashToken(refreshToken))
+    // REFRESHABLE_STATUSES in SQL: any state but revoked, whatever the expiry.
     .is("revoked_at", null)
     .select(PUBLIC_COLUMNS)
     .maybeSingle();
@@ -315,16 +327,10 @@ export async function verifyApiToken(token: string): Promise<VerifiedToken | nul
     .eq("token_hash", hashToken(token))
     .maybeSingle();
   if (error) throw new Error(`Token lookup failed: ${error.message}`);
-  if (!row || row.revoked_at || isExpired(row.expires_at)) return null;
+  if (!row || !tokenStatusIn(BEARER_USABLE_STATUSES, row)) return null;
 
   // Checked on every call, so removing someone from the allowlist cuts off their tokens too.
-  const { data: user, error: userError } = await db()
-    .from("users")
-    .select("is_allowed")
-    .eq("id", row.user_id)
-    .maybeSingle();
-  if (userError) throw new Error(`Token owner lookup failed: ${userError.message}`);
-  if (!user?.is_allowed) return null;
+  if (!(await isUserAllowed(row.user_id, { errorPrefix: "Token owner lookup failed" }))) return null;
 
   const now = Date.now();
   const lastUsed = row.last_used_at ? Date.parse(row.last_used_at) : NaN;
@@ -352,16 +358,26 @@ export async function listApiTokens(userId: string): Promise<ApiTokenRecord[]> {
   return ((data ?? []) as Record<string, unknown>[]).map(toRecord);
 }
 
-/** How many of the user's tokens still work (not revoked, not expired). */
-export async function countActiveApiTokens(userId: string): Promise<number> {
+/**
+ * How many of the user's tokens still work (not revoked, not expired). With
+ * `exceptClientId`, that client's tokens are left out: the count as it will
+ * stand once a new connection replaces them.
+ */
+export async function countActiveApiTokens(userId: string, opts: { exceptClientId?: string } = {}): Promise<number> {
   const { data, error } = await db()
     .from("api_tokens")
-    .select("id, expires_at")
+    .select("id, client_id, expires_at, revoked_at")
     .eq("user_id", userId)
     .is("revoked_at", null);
   if (error) throw new Error(`Couldn't count tokens: ${error.message}`);
   const now = Date.now();
-  return ((data ?? []) as { expires_at: string | null }[]).filter((row) => !isExpired(row.expires_at, now)).length;
+  type Row = { client_id: string | null; expires_at: string | null; revoked_at: string | null };
+  // Left out here rather than with a SQL "<>", which would also drop dashboard tokens (client_id null).
+  return ((data ?? []) as Row[]).filter(
+    (row) =>
+      tokenStatusIn(BEARER_USABLE_STATUSES, row, now) &&
+      (opts.exceptClientId === undefined || row.client_id !== opts.exceptClientId)
+  ).length;
 }
 
 /**
@@ -369,13 +385,7 @@ export async function countActiveApiTokens(userId: string): Promise<number> {
  * token: someone else's, already revoked, or never existed.
  */
 export async function revokeApiToken(userId: string, tokenId: string): Promise<boolean> {
-  const { data, error } = await db()
-    .from("api_tokens")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("id", tokenId)
-    .eq("user_id", userId)
-    .is("revoked_at", null)
-    .select("id");
+  const { revokedIds, error } = await revokeTokenRows({ id: tokenId, user_id: userId });
   if (error) throw new Error(`Couldn't revoke the token: ${error.message}`);
-  return Array.isArray(data) && data.length > 0;
+  return revokedIds.length > 0;
 }

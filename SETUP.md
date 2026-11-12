@@ -400,6 +400,19 @@ setup cannot see what your project already has. Paste the four files, in order, 
 SQL editor instead; they are safe to run twice. Until they are applied, the Assistants panel and
 `/api/mcp` return errors.
 
+Two more migrations follow them:
+
+- `20261112032409_analysis_attempts.sql`: adds `bookmarks.analysis_attempts`, which counts the
+  analysis passes that failed because of a post's own content, so the app can stop retrying a post it
+  keeps failing on.
+- `20261112032426_brief_job_stage_check.sql`: limits `brief_jobs.stage` to the stages the code
+  knows.
+
+`npm run setup` applies them with the rest. The app runs without them: until the first is applied,
+analysis counts nothing and gives up on nothing, and a failed batch stays pending, as it did before
+the column existed. The app notices the column on its own once it exists, with no restart. If you
+paste them by hand, they are safe to run twice.
+
 ## Deploying (any host)
 
 Bookmark Graveyard runs on any host that supports Node.js 22+ and takes environment variables:

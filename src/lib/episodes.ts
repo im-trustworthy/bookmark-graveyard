@@ -1,5 +1,6 @@
 import { db } from "./supabase";
-import { LINES_PER_CALL } from "./tts";
+import { deriveDigestStage, EPISODE_STATUS, scriptLengthOf } from "./state/episode";
+import type { DigestStageResult } from "./state/episode";
 
 export async function signEpisodeUrls(episode: {
   markdown_path: string | null;
@@ -66,55 +67,26 @@ export async function deleteEpisodeFolder(
   if (error) console.error("deleteEpisodeFolder: storage removal failed:", error);
 }
 
-export type DigestStage = "needs_script" | "rendering" | "needs_finalize" | "ready" | "none";
-
-export interface DigestStageResult {
-  stage: DigestStage;
-  totalLines: number;
-  nextCursor: number;
-}
+// The stage vocabulary and the pure resume rule live in src/lib/state/episode.ts; re-exported so existing
+// imports keep working.
+export { deriveDigestStage } from "./state/episode";
+export type { DigestStage, DigestStageResult } from "./state/episode";
 
 /**
- * Pure resume state machine — no I/O, so the cursor math is unit-testable in
- * isolation. Given an episode's persisted status/script and the chunk-file
- * start indices already in storage, decides which stage to resume from and
- * where.
- *
- * `nextCursor` is always "where /api/digest/render should resume from, or
- * totalLines if there's nothing left to render" — that lets a client drive
- * both the 'rendering' and 'needs_finalize' cases through the same
- * `while (cursor < totalLines)` loop without branching on stage.
- *
- * Resume-point rule: the LAST chunk's start index (not start+length). Chunk
- * uploads use upsert:true, and a chunk that was mid-upload when generation
- * was interrupted may be partial, so re-rendering it is always safe and
- * correct — whereas trusting it and skipping past it risks baking a
- * truncated segment into the final MP3. Once the highest chunk on record
- * covers through the end of the script, rendering is done (a render call
- * only ever returns success after its upload confirms), so resume goes
- * straight to 'needs_finalize' instead of redundantly redoing that chunk.
+ * Where a brief stands and where it resumes, from its row plus the chunk files in storage. The one
+ * place that decides when storage is worth listing: only for an unfinished episode with a script to
+ * check chunk progress against (and a folder to look in). The status route and the job runner both
+ * resume from this, so the Resume banner and a background run always agree.
  */
-export function deriveDigestStage(input: {
+export async function resumePointFor(episode: {
   status: string;
-  scriptLength: number;
-  chunkStarts: number[];
-}): DigestStageResult {
-  const { status, scriptLength, chunkStarts } = input;
-
-  if (status === "ready") {
-    return { stage: "ready", totalLines: scriptLength, nextCursor: scriptLength };
-  }
-  if (scriptLength === 0) {
-    return { stage: "needs_script", totalLines: 0, nextCursor: 0 };
-  }
-  if (chunkStarts.length === 0) {
-    return { stage: "rendering", totalLines: scriptLength, nextCursor: 0 };
-  }
-
-  const lastStart = Math.max(...chunkStarts);
-  const renderedThroughEnd = lastStart + LINES_PER_CALL >= scriptLength;
-  if (renderedThroughEnd) {
-    return { stage: "needs_finalize", totalLines: scriptLength, nextCursor: scriptLength };
-  }
-  return { stage: "rendering", totalLines: scriptLength, nextCursor: lastStart };
+  script: unknown;
+  markdown_path: string | null;
+}): Promise<DigestStageResult> {
+  const scriptLength = scriptLengthOf(episode.script);
+  const chunkStarts =
+    episode.status !== EPISODE_STATUS.ready && scriptLength > 0 && episode.markdown_path
+      ? await listChunkStarts(episodeBasePath(episode.markdown_path))
+      : [];
+  return deriveDigestStage({ status: episode.status, scriptLength, chunkStarts });
 }

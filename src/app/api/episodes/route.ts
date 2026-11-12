@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
 import { signEpisodeUrls } from "@/lib/episodes";
+import { EPISODE_STATUS } from "@/lib/state/episode";
 
 export async function GET() {
   const userId = await getSessionUserId();
@@ -11,7 +12,7 @@ export async function GET() {
     .from("episodes")
     .select()
     .eq("user_id", userId)
-    .eq("status", "ready") // hide drafts abandoned mid-generation
+    .eq("status", EPISODE_STATUS.ready) // hide drafts abandoned mid-generation
     .order("created_at", { ascending: false })
     .limit(50);
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });

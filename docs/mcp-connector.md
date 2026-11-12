@@ -204,7 +204,10 @@ the author handle or name. Ordered newest post first.
 
 Output: `{ items: [...], total_matches, returned }` where each item is
 `{ tweet_id, url, author_handle, author_name, posted_at, saved_at, text (≤ 500 chars),
-summary, claims, topics, content_type, credibility }`. `url` comes from `postUrl`.
+summary, claims, topics, content_type, credibility, stage }`. `url` comes from `postUrl`.
+`stage` is one of `synced`, `ingested`, `analysed`, `analysis_failed`: only `analysed` posts
+have topics and a summary, and `analysis_failed` means the app gave up analysing the post, so
+it has none and will not get them unasked; the user can retry it from the dashboard.
 `saved_at` is `first_seen_at`, with the caveat (also in the tool description) that X does
 not expose when a post was bookmarked.
 
@@ -247,12 +250,20 @@ is 3 for markdown and 12 for a podcast; `poll_hint` tells the model to call
 
 Input: `job_id`, or `episode_id` for the newest job that produced it.
 
-Output: `{ job_id, status: "queued" | "running" | "done" | "failed", stage, progress:
-{ rendered_lines, total_lines }, episode_id, title, links, error, started_at,
-finished_at }`. `stage` is one of `syncing`, `selecting`, `writing`, `scripting`,
-`rendering`, `publishing`, `done`, `failed`. When the job is `queued`, or `running` with a
-heartbeat older than 90 seconds, this call re-schedules the runner before answering (see
-jobs below), so polling is also what keeps a job alive on request-bound hosts.
+Output: `{ job_id, status: "queued" | "running" | "done" | "failed", stage, stage_label,
+progress: { rendered_lines, total_lines }, episode_id, episode_status, title, links, error,
+started_at, finished_at, stalled, next_action, note, rescheduled }`. `stage` is one of
+`queued`, `syncing`, `selecting`, `writing`, `scripting`, `rendering`, `publishing`, `done`,
+`failed`, and `stage_label` says it in words. `episode_status` is `draft`, `ready` or `null`.
+`links` appear whenever the brief is ready, including for a failed job whose draft the user
+finished later. `stalled` is true when a queued or running job has gone quiet longer than the
+stale window. `next_action` tells the agent what to do: `wait` (poll again in a minute),
+`use_write_token` (the job stalled and only a write-access poll restarts it), `read_episode`
+(the brief is ready), `resume_in_dashboard` (it failed but its draft is saved) or
+`start_again` (it failed before saving a draft). `note`, when not null, is a sentence to pass
+on. When the job is `queued`, or `running` with a heartbeat older than 90 seconds, a call
+made with a write token re-schedules the runner before answering (see jobs below, and
+`rescheduled`), so polling is also what keeps a job alive on request-bound hosts.
 
 ### hide_bookmark (write)
 
@@ -594,8 +605,9 @@ Where the code differs from the design above, the code wins. The differences:
   `APP_URL` the same way.
 - **Tools read at most the newest 1,000 visible bookmarks.** The design did not mention a cap on
   `search_bookmarks` and `list_topics`; `loadBookmarkRows` limits the query to 1,000.
-  `get_brief_status` also returns `rescheduled`, and its `links` appear only once the job is done.
-  Only a caller with the write scope restarts a stalled job; a read-only one gets the report alone.
+  `get_brief_status` also returns `rescheduled`, and its `links` appear whenever the brief is ready,
+  so also for a failed job whose draft was finished later. Only a caller with the write scope
+  restarts a stalled job; a read-only one gets the report alone.
 - **The runner also beats on a timer.** Besides a heartbeat at each stage and chunk, a timer beats
   three times per stale window, so one long paid call does not look dead. The window is
   configurable with `BRIEF_JOB_STALE_SECONDS` (default 90).
