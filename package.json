@@ -20,7 +20,8 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
-    "setup": "node scripts/setup.mjs"
+    "setup": "node scripts/setup.mjs",
+    "sweep": "node scripts/privacy-sweep.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "2.4.0",

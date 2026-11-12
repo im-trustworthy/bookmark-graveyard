@@ -32,9 +32,22 @@ token or a bookmark is in its lifecycle is defined in `src/lib/state/`; see its
 npm test             # unit tests (Vitest)
 npx tsc --noEmit     # type check
 npm run lint         # ESLint
+npm run sweep        # privacy sweep: personal data and keys in files and history
 ```
 
-All three should pass.
+All four should pass. CI runs the same checks.
+
+The privacy sweep looks for API keys, personal email addresses, phone numbers, Supabase project ids,
+paths on your computer, committed `.env` files and to-do markers. It reads every commit, not only the
+latest files, because a line you added and then deleted is still public once pushed. To run it
+before every push, turn on the hook once:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+To also block strings that are private to you but look ordinary (your name, your domain), put
+them one per line in `.git/info/privacy-patterns`. Git never commits that file.
 
 ## Pull request expectations
 

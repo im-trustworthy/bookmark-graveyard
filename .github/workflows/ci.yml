@@ -14,11 +14,22 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the privacy sweep reads every commit
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
+
+      # A pull request is checked on its own commits; main on all of its history.
+      - name: Privacy sweep
+        run: |
+          if [ -n "$PR_BASE" ]; then npm run sweep -- "$PR_HEAD" --since "$PR_BASE"; else npm run sweep; fi
+        env:
+          PRIVACY_SWEEP_PATTERNS: ${{ secrets.PRIVACY_SWEEP_PATTERNS }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
 
       - name: Install
         run: npm ci
