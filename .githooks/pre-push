@@ -1,0 +1,4 @@
+#!/bin/sh
+# Blocks a push that would publish personal data or credentials (scripts/privacy-sweep.mjs).
+# Turn it on once per clone: git config core.hooksPath .githooks
+exec node scripts/privacy-sweep.mjs --pre-push "$1"
