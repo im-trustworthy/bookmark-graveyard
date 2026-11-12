@@ -2,6 +2,8 @@ import "server-only";
 import { db } from "./supabase";
 import { grokJson, grokText, FAST_MODEL, SMART_MODEL } from "./grok";
 import type { ReferencedTweet } from "./x";
+import { hasAnalysisAttempts } from "./analysis-attempts";
+import { MAX_ANALYSIS_ATTEMPTS, analysisBatchSize } from "./state/pipeline";
 
 // ---------------------------------------------------------------------------
 // Enrichment: topics, summary, claims, news-vs-evergreen, credibility
@@ -17,38 +19,94 @@ interface EnrichmentResult {
   }[];
 }
 
+/** An ingested post waiting for analysis, as the analysis pass loads it. */
+interface AnalysisCandidate {
+  tweet_id: string;
+  author_handle: string | null;
+  text: string;
+  tweet_created_at: string | null;
+  referenced: ReferencedTweet[] | null;
+  /** Missing where the column does not exist yet. */
+  analysis_attempts?: number | null;
+  bookmark_analysis: unknown;
+}
+
 /**
- * Enriches bookmarks that have no analysis row yet, up to `limit` per call so
- * HTTP requests stay short — the client loops until `remaining` hits zero.
+ * Whether a failed analysis call says something about the posts it carried, so each of them is charged
+ * an attempt: the answer was not JSON (grokJson's SyntaxError), or the provider refused the request
+ * itself (HTTP 400, 413 or 422 on the SDK's error). Anything else (no response, a timeout, 401, 403,
+ * 429, 5xx) is the provider's or the configuration's doing, and charging the posts for it would give up
+ * on good ones during an outage.
+ */
+export function chargesAnalysisAttempt(err: unknown): boolean {
+  if (err instanceof SyntaxError) return true;
+  const status = typeof err === "object" && err !== null ? (err as { status?: unknown }).status : undefined;
+  return status === 400 || status === 413 || status === 422;
+}
+
+/**
+ * Enriches bookmarks that have no analysis row yet, up to `limit` posts and
+ * `maxCalls` model calls per call so HTTP requests stay short — the client
+ * loops until `remaining` hits zero.
  * Uses the FAST model; includes ingested source material so topics/summaries
  * reflect the article/media substance, not just the post text.
+ *
+ * Where bookmarks.analysis_attempts exists, a post the model leaves out of its
+ * answer, or whose batch fails on its content (chargesAnalysisAttempt), is
+ * charged an attempt and retried in a smaller batch; at MAX_ANALYSIS_ATTEMPTS it
+ * is given up and no longer counts as remaining. `missed` is how many posts this
+ * call charged. Without the column nothing is counted and every failure stays
+ * pending, as it always did.
  */
 export async function enrichNewBookmarks(
   userId: string,
-  limit = Infinity
-): Promise<{ enriched: number; remaining: number }> {
-  const { data: pending } = await db()
+  limit = Infinity,
+  maxCalls = Infinity
+): Promise<{ enriched: number; remaining: number; missed: number }> {
+  const counting = await hasAnalysisAttempts();
+  const { data: pending, error: pendingError } = await db()
     .from("bookmarks")
-    .select("tweet_id, author_handle, text, tweet_created_at, referenced, bookmark_analysis(tweet_id)")
+    .select(
+      `tweet_id, author_handle, text, tweet_created_at, referenced, ${counting ? "analysis_attempts, " : ""}bookmark_analysis(tweet_id)`
+    )
     .eq("user_id", userId)
     .not("ingested_at", "is", null); // analyze only after sources are ingested
-  const allTodo = (pending ?? []).filter((b) => {
+  if (pendingError) throw new Error(`Loading bookmarks to analyse failed: ${pendingError.message}`);
+  const attemptsOf = (b: AnalysisCandidate) => (counting ? (b.analysis_attempts ?? 0) : 0);
+  const allTodo = ((pending ?? []) as unknown as AnalysisCandidate[]).filter((b) => {
     const a = b.bookmark_analysis;
-    return !a || (Array.isArray(a) && a.length === 0);
+    const unanalysed = !a || (Array.isArray(a) && a.length === 0);
+    return unanalysed && attemptsOf(b) < MAX_ANALYSIS_ATTEMPTS;
   });
-  const todo = allTodo.slice(0, limit);
-  if (todo.length === 0) return { enriched: 0, remaining: 0 };
+  // Fewest attempts first (a stable sort, so order is otherwise the query's), so fresh posts are never
+  // held up behind retries by `limit` or `maxCalls`.
+  const todo = [...allTodo].sort((a, b) => attemptsOf(a) - attemptsOf(b)).slice(0, limit);
+  if (todo.length === 0) return { enriched: 0, remaining: 0, missed: 0 };
+
+  // Posts are batched with others that failed as often as they did, and retried posts go in smaller
+  // batches, so a post the model keeps failing on ends up alone instead of failing its neighbours.
+  const byAttempts = new Map<number, AnalysisCandidate[]>();
+  for (const b of todo) byAttempts.set(attemptsOf(b), [...(byAttempts.get(attemptsOf(b)) ?? []), b]);
+  const allBatches: AnalysisCandidate[][] = [];
+  for (const [attempts, group] of [...byAttempts].sort(([a], [b]) => a - b)) {
+    const size = analysisBatchSize(attempts);
+    for (let i = 0; i < group.length; i += size) allBatches.push(group.slice(i, i + size));
+  }
+  // One batch is one model call. Batches past `maxCalls` are not attempted here: nothing is charged for
+  // them, they stay in `remaining`, and the next chunk takes them.
+  const batches = allBatches.slice(0, maxCalls);
+  const attempted = batches.flat();
 
   const { data: topicRows } = await db().from("topics").select("name").eq("user_id", userId);
   let taxonomy = (topicRows ?? []).map((t) => t.name);
 
-  const sourcesByTweet = await loadSources(userId, todo.map((b) => b.tweet_id));
+  const sourcesByTweet = await loadSources(userId, attempted.map((b) => b.tweet_id));
 
   // Community Notes flags for these tweets (populated by the nightly public-dataset job)
   const { data: notes } = await db()
     .from("community_notes")
     .select("tweet_id, classification, status")
-    .in("tweet_id", todo.map((b) => b.tweet_id));
+    .in("tweet_id", attempted.map((b) => b.tweet_id));
   const credibilityFor = (tweetId: string): "none" | "disputed" | "misleading" => {
     const tweetNotes = (notes ?? []).filter((n) => n.tweet_id === tweetId);
     if (tweetNotes.length === 0) return "none";
@@ -60,11 +118,10 @@ export async function enrichNewBookmarks(
     return misleading ? "misleading" : "disputed";
   };
 
-  const batches: (typeof todo)[] = [];
-  for (let i = 0; i < todo.length; i += 20) batches.push(todo.slice(i, i + 20));
-
   let enriched = 0;
-  const processBatch = async (batch: typeof todo) => {
+  const analysed = new Set<string>();
+  const charged: AnalysisCandidate[] = [];
+  const processBatch = async (batch: AnalysisCandidate[]) => {
     const result = await grokJson<EnrichmentResult>(
       FAST_MODEL,
       `You analyze a user's bookmarked X (Twitter) posts for a personal digest app.
@@ -99,6 +156,8 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
     const valid = (result.items ?? []).filter((item) =>
       batch.some((b) => b.tweet_id === item.tweet_id)
     );
+    // The model answered and left these out: that is about the posts, so each is charged.
+    if (counting) charged.push(...batch.filter((b) => !valid.some((item) => item.tweet_id === b.tweet_id)));
     if (valid.length === 0) return;
 
     const { error } = await db()
@@ -118,6 +177,7 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
       );
     if (error) throw new Error(`Analysis upsert failed: ${error.message}`);
     enriched += valid.length;
+    for (const item of valid) analysed.add(item.tweet_id);
 
     const newTopics = [...new Set(valid.flatMap((v) => v.topics ?? []))].filter(
       (t) => !taxonomy.includes(t)
@@ -130,7 +190,8 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
     }
   };
 
-  // Concurrency pool of 3 Grok calls; a failed batch stays pending for the next pass.
+  // Concurrency pool of 3 Grok calls; a failed batch stays pending for the next pass,
+  // charged an attempt per post only when the failure is about its content.
   const queue = [...batches];
   await Promise.all(
     Array.from({ length: Math.min(3, queue.length) }, async () => {
@@ -139,12 +200,52 @@ Respond with JSON: {"items":[{"tweet_id","topics","summary","claims","content_ty
           await processBatch(batch);
         } catch (err) {
           console.error("Enrichment batch failed:", err);
+          if (counting && chargesAnalysisAttempt(err)) charged.push(...batch);
         }
       }
     })
   );
 
-  return { enriched, remaining: allTodo.length - enriched };
+  if (!counting) return { enriched, remaining: allTodo.length - enriched, missed: 0 };
+
+  // The new counts are the ones read at the start plus one: there is no atomic increment here, and two
+  // overlapping passes under-counting by one only costs one extra retry. One update per new value (at most
+  // MAX_ANALYSIS_ATTEMPTS of them) plus one reset keeps this to a handful of statements.
+  const byNextCount = new Map<number, string[]>();
+  for (const b of charged) {
+    const next = attemptsOf(b) + 1;
+    byNextCount.set(next, [...(byNextCount.get(next) ?? []), b.tweet_id]);
+  }
+  // A post that now has its analysis starts from 0, so it can never be analysed and given up at once.
+  const reset = attempted.filter((b) => analysed.has(b.tweet_id) && attemptsOf(b) > 0).map((b) => b.tweet_id);
+  if (reset.length > 0) byNextCount.set(0, reset);
+  for (const [count, ids] of byNextCount) {
+    const { error } = await db()
+      .from("bookmarks")
+      .update({ analysis_attempts: count })
+      .eq("user_id", userId)
+      .in("tweet_id", ids);
+    if (error) throw new Error(`Recording analysis attempts failed: ${error.message}`);
+  }
+
+  const givenUp = charged.filter((b) => attemptsOf(b) + 1 >= MAX_ANALYSIS_ATTEMPTS).length;
+  return { enriched, remaining: allTodo.length - enriched - givenUp, missed: charged.length };
+}
+
+/**
+ * Puts the user's given-up posts, and any with a failed attempt on record, back in the analysis
+ * backlog with a clean count. Returns how many it reset; 0 where the column does not exist.
+ */
+export async function resetFailedAnalysis(userId: string): Promise<number> {
+  if (!(await hasAnalysisAttempts())) return 0;
+  const { data, error } = await db()
+    .from("bookmarks")
+    .update({ analysis_attempts: 0 })
+    .eq("user_id", userId)
+    .gt("analysis_attempts", 0)
+    .select("tweet_id");
+  if (error) throw new Error(`Resetting failed analysis failed: ${error.message}`);
+  return data?.length ?? 0;
 }
 
 // ---------------------------------------------------------------------------

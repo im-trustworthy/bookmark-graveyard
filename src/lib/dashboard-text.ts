@@ -31,6 +31,33 @@ export function describeSync(body: SyncSummary, from: string, to: string, analyz
   return `${parts.join(", ")}.`;
 }
 
+const posts = (n: number) => (n === 1 ? "1 post" : `${n} posts`);
+
+/** The notice next to Retry, for posts the app gave up analyzing. */
+export function describeAnalysisFailed(count: number): string {
+  return `${posts(count)} couldn't be analyzed.`;
+}
+
+/**
+ * Closing message for a Retry, given how many posts it analyzed and how many given-up posts it
+ * started with. It names no count of posts still given up: a retry can also analyze posts that
+ * were merely pending, so that number is only known after the next list load, and the notice
+ * line reports it.
+ */
+export function describeRetry(analyzed: number, retried: number): string {
+  if (analyzed > 0) return `Analyzed ${analyzed} more ${analyzed === 1 ? "post" : "posts"}.`;
+  return retried === 1 ? "That post still couldn't be analyzed." : "Those posts still couldn't be analyzed.";
+}
+
+/**
+ * How a Retry ends, shaped as the sync flow's closing event: it succeeded only if it analyzed at
+ * least one post. One that got nowhere is a failure, so it is drawn as an error line, not in the
+ * success style above a notice that says the same thing.
+ */
+export function retryOutcome(analyzed: number, retried: number): { type: "succeed" | "fail"; message: string } {
+  return { type: analyzed > 0 ? "succeed" : "fail", message: describeRetry(analyzed, retried) };
+}
+
 /** "Sep 14 to Oct 5", adding years only when the range crosses a year boundary. */
 export function formatRange(from: string, to: string): string {
   if (!DATE_RE.test(from) || !DATE_RE.test(to)) return "in the selected range";

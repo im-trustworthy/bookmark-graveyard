@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { GREETINGS, describeSync, formatRange, pickGreeting } from "../dashboard-text";
+import {
+  GREETINGS,
+  describeAnalysisFailed,
+  describeRetry,
+  describeSync,
+  formatRange,
+  pickGreeting,
+  retryOutcome,
+} from "../dashboard-text";
 
 describe("describeSync", () => {
   it("reports a no-op check without mentioning the date range", () => {
@@ -58,5 +66,38 @@ describe("pickGreeting", () => {
 
   it("always returns a known greeting with the real random source", () => {
     for (let i = 0; i < 50; i++) expect(GREETINGS).toContain(pickGreeting());
+  });
+});
+
+describe("describeAnalysisFailed", () => {
+  it("counts the given-up posts, singular and plural", () => {
+    expect(describeAnalysisFailed(1)).toBe("1 post couldn't be analyzed.");
+    expect(describeAnalysisFailed(2)).toBe("2 posts couldn't be analyzed.");
+    expect(describeAnalysisFailed(17)).toBe("17 posts couldn't be analyzed.");
+  });
+});
+
+describe("describeRetry", () => {
+  it("names how many it analyzed, and nothing about what is still given up", () => {
+    expect(describeRetry(1, 1)).toBe("Analyzed 1 more post.");
+    expect(describeRetry(1, 4)).toBe("Analyzed 1 more post.");
+    expect(describeRetry(3, 2)).toBe("Analyzed 3 more posts.");
+  });
+
+  it("says so when none could be analyzed, by how many it started with", () => {
+    expect(describeRetry(0, 1)).toBe("That post still couldn't be analyzed.");
+    expect(describeRetry(0, 4)).toBe("Those posts still couldn't be analyzed.");
+  });
+});
+
+describe("retryOutcome", () => {
+  it("succeeds once at least one post was analyzed", () => {
+    expect(retryOutcome(1, 1)).toEqual({ type: "succeed", message: "Analyzed 1 more post." });
+    expect(retryOutcome(3, 2)).toEqual({ type: "succeed", message: "Analyzed 3 more posts." });
+  });
+
+  it("fails when nothing could be analyzed", () => {
+    expect(retryOutcome(0, 1)).toEqual({ type: "fail", message: "That post still couldn't be analyzed." });
+    expect(retryOutcome(0, 4)).toEqual({ type: "fail", message: "Those posts still couldn't be analyzed." });
   });
 });

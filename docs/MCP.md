@@ -182,7 +182,8 @@ Open **Connect apps**, or ask the Bot to add an MCP server by its address. Give 
 > Call `get_brief_status` with the returned `job_id` once a minute until `status` is `done` or
 > `failed`. When done, call `get_episode` with the `episode_id` and post the title, five bullets
 > from the brief, and the `links.audio` and `links.markdown` addresses. If it failed, post the
-> `error` and say the draft can be resumed from the dashboard.
+> `error`, and if `next_action` is `resume_in_dashboard`, say the draft can be resumed from the
+> dashboard.
 
 ### [Grok Build](https://docs.x.ai/build/features/mcp-servers)
 
@@ -261,13 +262,17 @@ user's newest 1,000 visible bookmarks. Every result is JSON, returned both as te
 
 | Tool | Access | Arguments | Returns |
 | --- | --- | --- | --- |
-| `search_bookmarks` | read | `query` (words that must all appear in text, summary, author), `topics[]`, `from`, `to`, `credibility` (`any` or `flagged`), `limit` (1–50, default 20) | `items[]` with `tweet_id`, `url`, `author_handle`, `author_name`, `posted_at`, `saved_at`, `text` (≤500 chars), `summary`, `claims[]`, `topics[]`, `content_type`, `credibility`; `total_matches`, `returned` |
+| `search_bookmarks` | read | `query` (words that must all appear in text, summary, author), `topics[]`, `from`, `to`, `credibility` (`any` or `flagged`), `limit` (1–50, default 20) | `items[]` with `tweet_id`, `url`, `author_handle`, `author_name`, `posted_at`, `saved_at`, `text` (≤500 chars), `summary`, `claims[]`, `topics[]`, `content_type`, `credibility`, `stage`; `total_matches`, `returned` |
 | `list_topics` | read | `from`, `to` | `topics[]` of `{name, count}`, most common first; `library` (visible bookmarks), `total` |
 | `list_episodes` | read | `limit` (1–50, default 10) | `episodes[]`: `id`, `title`, `format`, `status`, `created_at`, `duration_seconds`, `bookmark_count`, `topics[]`, `date_from`, `date_to`, `links.markdown`, `links.audio` |
 | `get_episode` | read | `episode_id`, `include_markdown` (default true), `include_script` (default false) | The episode plus `markdown` (≤60,000 chars; `truncated` says if cut) and `script[]` of `{speaker, line}` |
 | `generate_brief` | **write** | `format` (`markdown` or `podcast`), `from`, `to`, `topics[]`, `tweet_ids[]` (overrides the filters), `target_minutes` (5–30, default 20), `sync_first` (default false) | `job_id`, `status: "queued"`, `estimated_minutes` (3 or 12), `poll_hint` |
-| `get_brief_status` | read | exactly one of `job_id` or `episode_id` | `job_id`, `status` (`queued`, `running`, `done`, `failed`), `stage`, `progress.{rendered_lines,total_lines}`, `episode_id`, `title`, `links`, `error`, `started_at`, `finished_at`, `rescheduled` |
+| `get_brief_status` | read | exactly one of `job_id` or `episode_id` | `job_id`, `status` (`queued`, `running`, `done`, `failed`), `stage` and `stage_label`, `progress.{rendered_lines,total_lines}`, `episode_id`, `episode_status`, `title`, `links`, `error`, `started_at`, `finished_at`, `stalled`, `next_action`, `note`, `rescheduled` |
 | `hide_bookmark` | **write** | `tweet_id` | `{ok: true}` |
+
+A search item's `stage` is `synced`, `ingested`, `analysed` or `analysis_failed`. Only `analysed` posts
+have topics and a summary. `analysis_failed` means the app gave up analysing the post, so it has no
+topics or summary and will not get them on its own; the user can retry it from the dashboard.
 
 Everything except `generate_brief` is free: it reads what the app already stored. `generate_brief`
 spends one of the user's daily brief generations and their xAI credits (plus voice credits for a
@@ -283,7 +288,24 @@ nothing matched. A spent daily brief allowance does not refuse the call: the job
   call `get_brief_status` no more than once a minute until `status` is `done` or `failed`. On
   `done`, call `get_episode` for the text and hand the user `links.markdown` and `links.audio`; the
   links are stable, and open after the user signs in to their instance. On `failed`, report
-  `error`; the user can resume the draft from the dashboard.
+  `error` and follow `next_action`: usually the user can resume the saved draft from the dashboard.
+- **Reading a status.** `stage` is one of `queued`, `syncing`, `selecting`, `writing`, `scripting`,
+  `rendering`, `publishing`, `done` or `failed`; `stage_label` says it in words to pass on to the
+  user. `episode_status` is `draft`, `ready` or `null`. `stalled` is true when a queued or running job
+  has gone quiet for too long. `note`, when not null, is a sentence worth passing on. Do what
+  `next_action` says:
+
+  | `next_action` | What to do |
+  | --- | --- |
+  | `wait` | Poll again in a minute. |
+  | `use_write_token` | The job stalled and only a poll with a write token restarts it. Ask the user for one. |
+  | `read_episode` | The brief is ready: give the user `links`, or read it with `get_episode`. |
+  | `resume_in_dashboard` | The job failed but its draft is saved: the user can finish it from the dashboard. |
+  | `start_again` | The job failed before saving a draft. Start a new brief if the user still wants one. |
+
+  `links` appear whenever the brief is ready, including for a failed job whose draft the user
+  finished later (`next_action` is then `read_episode` and `note` says so). `links.audio` is `null`
+  for a markdown-only brief or when the audio was removed to free space.
 - **Stalled jobs.** On hosts that cut background work short (Vercel and similar), each
   `get_brief_status` call made with a write token picks a stalled job back up (`rescheduled: true`).
   A read-only token only reports, so a long podcast on such a host needs read and write access.

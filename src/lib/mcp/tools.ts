@@ -10,6 +10,7 @@ import {
   filterByTopics,
   loadBookmarkRows,
   matchesQuery,
+  stageOf,
   topicCounts,
 } from "../bookmarks";
 import type { BookmarkRow } from "../bookmarks";
@@ -27,6 +28,11 @@ import {
 } from "../jobs";
 import type { BriefJobStatus } from "../jobs";
 import { checkUsage, UsageLimitError } from "../limits";
+import { BRIEF_JOB_NEXT_ACTIONS, BRIEF_JOB_STAGES } from "../state/brief-job";
+import type { BriefJobNextAction } from "../state/brief-job";
+import { EPISODE_STATUS, audioAvailability } from "../state/episode";
+import { BOOKMARK_STAGES } from "../state/pipeline";
+import type { BookmarkStage } from "../state/pipeline";
 import { db } from "../supabase";
 
 // The seven tools the MCP endpoint (src/app/api/mcp/route.ts) serves. Each is a plain function of the
@@ -138,6 +144,8 @@ export interface BookmarkItem {
   topics: string[];
   content_type: string | null;
   credibility: string | null;
+  /** How far the app has processed the post (state/pipeline.ts). */
+  stage: BookmarkStage;
 }
 
 /** The query with a leading "@" dropped from each term, so "@ada" finds the handle "ada". */
@@ -166,6 +174,7 @@ function bookmarkItem(row: BookmarkRow): BookmarkItem {
     topics: (analysis?.topics ?? []).map(label),
     content_type: analysis?.content_type ?? null,
     credibility: analysis?.credibility ?? null,
+    stage: stageOf(row),
   };
 }
 
@@ -270,7 +279,7 @@ function episodeItem(row: EpisodeRow): EpisodeItem {
     date_to: row.date_to ?? null,
     links: {
       markdown: row.markdown_path ? `${base}/markdown` : null,
-      audio: row.audio_path && !row.audio_pruned_at ? `${base}/audio` : null,
+      audio: audioAvailability(row) === "available" ? `${base}/audio` : null,
     },
   };
 }
@@ -284,7 +293,7 @@ export async function listEpisodes(
     .from("episodes")
     .select(EPISODE_COLUMNS)
     .eq("user_id", ctx.userId)
-    .eq("status", "ready") // drafts are unfinished generations
+    .eq("status", EPISODE_STATUS.ready) // drafts are unfinished generations
     .order("created_at", { ascending: false })
     .limit(limit);
   if (error) throw new Error(`Episode listing failed: ${error.message}`);
@@ -314,7 +323,7 @@ export async function getEpisode(ctx: ToolContext, input: z.input<typeof getEpis
   if (error) throw new Error(`Episode lookup failed: ${error.message}`);
   const row = data as EpisodeRow | null;
   // Someone else's brief, a draft and a made-up id all look the same.
-  if (!row || row.status !== "ready") throw new ToolError("Episode not found");
+  if (!row || row.status !== EPISODE_STATUS.ready) throw new ToolError("Episode not found");
 
   const detail: EpisodeDetail = episodeItem(row);
   if (include_markdown) {
@@ -406,8 +415,9 @@ export async function getBriefStatus(
   // A queued job whose runner never started, or a running one whose runner was cut off, gets a new runner,
   // but only for a caller that could have started it: restarting resumes paid work, so a read-only token
   // just gets the report.
-  const rescheduled = hasScope(ctx.scopes, "write") ? maybeRescheduleBriefJob(job) : false;
-  const status = await describeBriefJob(job);
+  const canRestart = hasScope(ctx.scopes, "write");
+  const rescheduled = canRestart ? maybeRescheduleBriefJob(job) : false;
+  const status = await describeBriefJob(job, { canRestart, rescheduled });
   return { ...status, title: status.title === null ? null : label(status.title), rescheduled };
 }
 
@@ -448,6 +458,17 @@ interface ToolSpec {
   run: (ctx: ToolContext, input: never) => Promise<object>;
 }
 
+/** What each next_action asks of the agent; typed by the vocabulary, so a new action can't go unexplained. */
+const NEXT_ACTION_HELP: Record<BriefJobNextAction, string> = {
+  wait: "poll again in a minute",
+  use_write_token: "it stalled and only a poll with a write-access token restarts it",
+  read_episode: "the brief is ready: give the user `links` or read it with get_episode",
+  resume_in_dashboard: "it failed but its draft is saved: the user can finish it from the Bookmark Graveyard dashboard",
+  start_again: "it failed before saving a draft",
+};
+
+const NEXT_ACTION_TEXT = BRIEF_JOB_NEXT_ACTIONS.map((action) => `${action} (${NEXT_ACTION_HELP[action]})`).join(", ");
+
 const READ: ToolAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false };
 
 const CONTENT_WARNING =
@@ -467,6 +488,7 @@ export const TOOLS: ToolSpec[] = [
       "`from`/`to` (YYYY-MM-DD, inclusive) filter on the date the post was published; posts with no date always match. `posted_at` is that date. `saved_at` is when the app's sync first saw the bookmark, not when the user bookmarked it: X does not expose that.",
       '`credibility: "flagged"` keeps only posts the analysis marked disputed or misleading.',
       "Results are newest post first; `total_matches` counts every match and `returned` how many are in `items`. Post text is cut to 500 characters, topic names to 120.",
+      `\`stage\` is one of ${BOOKMARK_STAGES.join(", ")}; ${"analysis_failed" satisfies BookmarkStage} means the app gave up analysing the post, so it has no topics or summary.`,
       CONTENT_WARNING,
     ].join(" "),
     inputSchema: searchBookmarksInput,
@@ -540,9 +562,9 @@ export const TOOLS: ToolSpec[] = [
     title: "Check a brief",
     description: [
       "Check on a brief started with generate_brief: pass `job_id`, or `episode_id` for the newest job that produced that episode (exactly one of them). Free.",
-      "`status` is queued, running, done or failed, `stage` the step it is on, and `progress` counts rendered podcast lines.",
-      "Once done, `episode_id` and `links` point at the finished brief (read it with get_episode).",
-      "A failed job's `error` says why; a failed job leaves a draft the user can resume from the Bookmark Graveyard dashboard.",
+      `\`status\` is queued, running, done or failed. \`stage\` is one of ${BRIEF_JOB_STAGES.join(", ")}; \`stage_label\` says it in words for the user. \`progress\` counts rendered podcast lines.`,
+      `\`next_action\` says what to do: ${NEXT_ACTION_TEXT}.`,
+      "`stalled` is true when a queued or running job has gone quiet too long. `note`, when not null, is a sentence to pass on. `episode_status` is draft, ready or null; `links` appear whenever the brief is ready, even for a failed job, and `error` says why a job failed.",
       "Poll no more than once a minute. With a token that has write access, each poll also restarts a stalled job (`rescheduled` says whether this one did); a read-only token only reports, so restarting a stalled job needs a write token.",
       DERIVED_CONTENT_WARNING,
     ].join(" "),

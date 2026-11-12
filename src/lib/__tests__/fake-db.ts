@@ -1,8 +1,9 @@
 // In-memory stand-in for the supabase-js client, covering only the calls this
-// app makes: from(table) with select/insert/upsert/update/delete, eq/is/lt and
+// app makes: from(table) with select/insert/upsert/update/delete, eq/in/is/lt/gt/gte and
 // not(column, "is", value) filters, order/limit (applied to selects, nulls
 // placed as Postgres does), then
-// maybeSingle()/single() or a plain await; rpc() into Postgres functions the
+// maybeSingle()/single() (which, as the real client does, answer PGRST116 for
+// several rows, and for none when single) or a plain await; rpc() into Postgres functions the
 // test registers in `functions` (an unregistered one errors, as a missing
 // function does); plus storage uploads and removals. Like PostgREST,
 // select("a, b") returns only those columns (select() or "*" returns all), so
@@ -14,9 +15,12 @@
 // Tests read and seed `tables` directly.
 
 type Row = Record<string, unknown>;
-type Result = { data: unknown; error: { message: string } | null; count?: number | null };
+type Result = { data: unknown; error: { message: string; code?: string } | null; count?: number | null };
 /** One entry of a select list: a column, or an embedded resource with its own list. */
 type Column = { name: string; inner: Column[] | null };
+
+/** What PostgREST answers (code PGRST116) when single() finds zero or several rows, or maybeSingle() several. */
+const SINGLE_ROW_MESSAGE = "JSON object requested, multiple (or no) rows returned";
 
 /** Parses a PostgREST select list, keeping `rel(a, b)` groups together. */
 function parseColumns(list: string): Column[] {
@@ -105,6 +109,7 @@ class FakeQuery implements PromiseLike<Result> {
   private rows: Row[] = [];
   private patch: Row = {};
   private conflictKey?: string;
+  private ignoreDuplicates = false;
   private returning = false;
   private columns: Column[] | null = null; // null = every column
   private counting = false;
@@ -131,10 +136,11 @@ class FakeQuery implements PromiseLike<Result> {
     this.rows = [rows].flat();
     return this;
   }
-  upsert(rows: Row | Row[], options?: { onConflict?: string }) {
+  upsert(rows: Row | Row[], options?: { onConflict?: string; ignoreDuplicates?: boolean }) {
     this.op = "upsert";
     this.rows = [rows].flat();
     this.conflictKey = options?.onConflict;
+    this.ignoreDuplicates = options?.ignoreDuplicates === true;
     return this;
   }
   update(patch: Row) {
@@ -150,12 +156,24 @@ class FakeQuery implements PromiseLike<Result> {
     this.filters.push((row) => row[column] === value);
     return this;
   }
+  in(column: string, values: unknown[]) {
+    this.filters.push((row) => values.includes(row[column]));
+    return this;
+  }
   is(column: string, value: unknown) {
     this.filters.push((row) => (row[column] ?? null) === value);
     return this;
   }
   lt(column: string, value: number) {
     this.filters.push((row) => (row[column] as number) < value);
+    return this;
+  }
+  gt(column: string, value: number) {
+    this.filters.push((row) => (row[column] as number) > value);
+    return this;
+  }
+  gte(column: string, value: number) {
+    this.filters.push((row) => (row[column] as number) >= value);
     return this;
   }
   not(column: string, operator: "is", value: unknown) {
@@ -205,6 +223,15 @@ class FakeQuery implements PromiseLike<Result> {
     } else if (this.op === "insert") {
       result = this.rows.map((row) => ({ id: `${this.table}-${table.length + 1}`, ...row }));
       table.push(...result);
+    } else if (this.op === "upsert" && this.ignoreDuplicates) {
+      // ignoreDuplicates: a row whose (possibly composite, comma-separated)
+      // conflict key already exists is left alone and not returned.
+      const keys = (this.conflictKey ?? "").split(",").map((k) => k.trim()).filter(Boolean);
+      result = [];
+      for (const row of this.rows) {
+        const clash = keys.length > 0 && table.some((e) => keys.every((k) => e[k] === row[k]));
+        if (!clash) result.push(table[table.push({ ...row }) - 1]);
+      }
     } else if (this.op === "upsert") {
       result = this.rows.map((row) => {
         const key = this.conflictKey;
@@ -229,8 +256,10 @@ class FakeQuery implements PromiseLike<Result> {
     if (this.mode === "many") {
       return { data: this.op === "select" || this.returning ? result.map(project) : null, error: null };
     }
-    if (this.mode === "single" && result.length !== 1) {
-      return { data: null, error: { message: `expected 1 row, got ${result.length}` } };
+    // As the real client: single() wants exactly one row, maybeSingle() at most one, and anything else is
+    // PGRST116 rather than quietly the first row.
+    if ((this.mode === "single" && result.length !== 1) || (this.mode === "maybeSingle" && result.length > 1)) {
+      return { data: null, error: { message: SINGLE_ROW_MESSAGE, code: "PGRST116" } };
     }
     return { data: result[0] ? project(result[0]) : null, error: null };
   }

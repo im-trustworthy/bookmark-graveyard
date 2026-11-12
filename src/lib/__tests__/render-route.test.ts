@@ -71,6 +71,31 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("POST /api/digest/render cursor", () => {
+  it("advances render_cursor on a draft", async () => {
+    fake = createFakeDb({ episodes: [episode(null)], user_voice_settings: [userSettings("grok", "xai-user-key")] });
+    state.db = fake;
+    stubTts(["xai-user-key"]);
+
+    expect((await render()).status).toBe(200);
+    expect(fake.tables.episodes[0].render_cursor).toBe(2);
+  });
+
+  it("leaves the cursor of an episode published while the chunk rendered alone", async () => {
+    fake = createFakeDb({ episodes: [episode(null)], user_voice_settings: [userSettings("grok", "xai-user-key")] });
+    state.db = fake;
+    stubTts(["xai-user-key"]);
+    const tts = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (...args) => {
+      fake.tables.episodes[0].status = "ready"; // a concurrent finalize won
+      return tts(...args);
+    });
+
+    expect((await render()).status).toBe(200);
+    expect(fake.tables.episodes[0]).toMatchObject({ status: "ready", render_cursor: 0 });
+  });
+});
+
 describe("POST /api/digest/render voices", () => {
   it("finishes a pinned episode in its pinned voices after the user switched provider", async () => {
     vi.stubEnv("XAI_API_KEY", "xai-instance-key");

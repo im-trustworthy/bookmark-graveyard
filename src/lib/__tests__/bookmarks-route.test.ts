@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NextRequest } from "next/server";
 
 // GET /api/bookmarks is the contract the dashboard reads, and src/lib/bookmarks.ts now does its work, so
-// this pins the response (rows, topic chips, library, total) and the exact query. The supabase client is
+// this pins the response (rows, topic chips, library, total, analysisFailed) and the exact query. The supabase client is
 // a recording stub: PostgREST filtering isn't under test, the rows it would return are fixtures.
 type Call = [method: string, ...args: unknown[]];
 const state = vi.hoisted(() => ({
@@ -11,7 +11,10 @@ const state = vi.hoisted(() => ({
   count: 0 as number | null,
   failWith: null as string | null,
   calls: [] as Call[],
+  attemptsColumn: true,
 }));
+
+vi.mock("@/lib/analysis-attempts", () => ({ hasAnalysisAttempts: async () => state.attemptsColumn }));
 
 vi.mock("@/lib/session", () => ({ getSessionUserId: async () => state.userId }));
 vi.mock("@/lib/supabase", () => ({
@@ -84,6 +87,7 @@ beforeEach(() => {
   state.count = 7;
   state.failWith = null;
   state.calls = [];
+  state.attemptsColumn = true;
   vi.spyOn(console, "error").mockImplementation(() => {}); // apiError logs every rejection
 });
 afterEach(() => {
@@ -95,7 +99,7 @@ describe("GET /api/bookmarks", () => {
     const { status, json } = await get();
     expect(status).toBe(200);
     expect(json).toEqual({
-      bookmarks: FIXTURE,
+      bookmarks: FIXTURE.map((r) => ({ ...r, analysis_failed: false })),
       topics: [
         { name: "ai", count: 2 },
         { name: "mcp", count: 1 },
@@ -103,7 +107,26 @@ describe("GET /api/bookmarks", () => {
       ],
       library: 4,
       total: 7,
+      analysisFailed: 0,
     });
+  });
+
+  it("marks the posts the analysis gave up on, and counts them over the whole library, not the view", async () => {
+    const ingested_at = "2026-10-01T00:00:00Z";
+    state.rows = [
+      ...FIXTURE,
+      { ...row("e", "2026-10-04T00:00:00Z", null), ingested_at, analysis_attempts: 3 },
+      { ...row("f", "2026-08-01T00:00:00Z", null), ingested_at, analysis_attempts: 3 },
+      { ...row("g", "2026-10-04T00:00:00Z", null), ingested_at, analysis_attempts: 2 },
+      // Analysed wins over a count left behind.
+      { ...row("h", "2026-10-04T00:00:00Z", analysis(["ai"])), ingested_at, analysis_attempts: 3 },
+    ];
+    const { json } = await get("?from=2026-10-01");
+    const flags = Object.fromEntries(
+      (json.bookmarks as { tweet_id: string; analysis_failed: boolean }[]).map((b) => [b.tweet_id, b.analysis_failed])
+    );
+    expect(flags).toEqual({ a: false, b: false, d: false, e: true, g: false, h: false });
+    expect(json.analysisFailed).toBe(2); // "f" is outside the date range but still counted
   });
 
   it("asks for the user's visible bookmarks, newest post first, capped at 1000, and counts the whole library", async () => {
@@ -112,7 +135,7 @@ describe("GET /api/bookmarks", () => {
       [
         "select",
         "bookmarks",
-        "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, bookmark_analysis(topics, summary, content_type, credibility)",
+        "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, ingested_at, analysis_attempts, bookmark_analysis(topics, summary, content_type, credibility)",
         undefined,
       ],
       ["eq", "user_id", "user-1"],
@@ -122,6 +145,19 @@ describe("GET /api/bookmarks", () => {
       ["select", "bookmarks", "tweet_id", { count: "exact", head: true }],
       ["eq", "user_id", "user-1"],
     ]);
+  });
+
+  it("leaves analysis_attempts out of the query on a database without the column, and reports nothing failed", async () => {
+    state.attemptsColumn = false;
+    const { json } = await get();
+    expect(state.calls[0]).toEqual([
+      "select",
+      "bookmarks",
+      "tweet_id, author_handle, author_name, text, tweet_created_at, first_seen_at, public_metrics, ingested_at, bookmark_analysis(topics, summary, content_type, credibility)",
+      undefined,
+    ]);
+    expect(json.analysisFailed).toBe(0);
+    expect((json.bookmarks as { analysis_failed: boolean }[]).every((b) => b.analysis_failed === false)).toBe(true);
   });
 
   it("filters by the post's date, bounds inclusive to the end of the 'to' day, keeping undated posts", async () => {

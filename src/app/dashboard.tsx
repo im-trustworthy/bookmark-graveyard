@@ -5,11 +5,64 @@ import {
   useEffect,
   useEffectEvent,
   useMemo,
+  useReducer,
   useRef,
   useState,
   useSyncExternalStore,
 } from "react";
-import { describeSync, formatRange } from "@/lib/dashboard-text";
+import { describeAnalysisFailed, describeSync, formatRange, retryOutcome } from "@/lib/dashboard-text";
+import { readBackgroundOn, writeBackgroundOn } from "@/lib/state/ui/background-pref";
+import {
+  BANNER_NONE,
+  BRIEF_IDLE,
+  DRAFT_GONE_MESSAGE,
+  bannerControls,
+  briefErrorMessage,
+  briefFailureMessage,
+  briefFlowReducer,
+  briefProgress,
+  briefStageLabel,
+  draftFromStatus,
+  resumeBannerReducer,
+  resumeStartStage,
+  type BriefStage,
+  type DigestStatusResponse,
+} from "@/lib/state/ui/brief-flow";
+import {
+  TARGET_MINUTES,
+  resumeDraft,
+  runAudioStages,
+  type ResumeOutcome,
+} from "@/lib/state/ui/brief-runner";
+import {
+  FREE_UP_IDLE,
+  freeUpBusy as isFreeUpBusy,
+  freeUpLabel as freeUpButtonLabel,
+  freeUpMessage,
+  freeUpReducer,
+} from "@/lib/state/ui/free-up";
+import {
+  LIST_LOAD_FAILED_MESSAGE,
+  HIDE_FAILED_MESSAGE,
+  initialListLoad,
+  listAnalysisFailed,
+  listBookmarks,
+  listLibraryCount,
+  listLoadReducer,
+  listTopics,
+  type ListData,
+  type TopicCount,
+} from "@/lib/state/ui/list-load";
+import {
+  SYNC_IDLE,
+  syncBusy,
+  syncDoneMessage,
+  syncErrorMessage,
+  syncProgress as syncProgressOf,
+  syncReducer,
+  syncStageLabel,
+} from "@/lib/state/ui/sync-flow";
+import { runAnalysis, type AnalysisRunDeps } from "@/lib/state/ui/sync-runner";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import AssistantSettings from "./assistant-settings";
@@ -34,6 +87,8 @@ interface Bookmark {
   tweet_created_at: string | null;
   first_seen_at: string;
   bookmark_analysis: Analysis | Analysis[] | null;
+  // The app gave up analyzing this post after repeated failures; absent on older servers.
+  analysis_failed?: boolean;
 }
 
 interface Episode {
@@ -51,33 +106,17 @@ interface Episode {
   audio_pruned_at: string | null;
 }
 
-type ResumableStage = "needs_script" | "rendering" | "needs_finalize";
-
-interface ResumableDraft {
-  episodeId: string;
-  stage: ResumableStage;
-  totalLines: number;
-  nextCursor: number;
-  title?: string;
-  createdAt?: string;
-}
-
-interface DigestStatusResponse {
-  episodeId: string | null;
-  stage: ResumableStage | "ready" | "none";
-  totalLines: number;
-  nextCursor: number;
-  markdownReady: boolean;
-  title?: string;
-  createdAt?: string;
+// What the result card shows once a brief is published.
+interface BriefResult {
+  episode: Episode;
+  markdown?: string;
+  stats?: { considered: number; droppedAsStale: number; excludedAsMisleading: number };
 }
 
 function analysisOf(b: Bookmark): Analysis | null {
   if (!b.bookmark_analysis) return null;
   return Array.isArray(b.bookmark_analysis) ? (b.bookmark_analysis[0] ?? null) : b.bookmark_analysis;
 }
-
-type TopicCount = { name: string; count: number };
 
 function isoDaysAgo(days: number): string {
   const d = new Date();
@@ -108,13 +147,6 @@ interface PruneResponse {
   capacity: Capacity;
 }
 
-// The "Free up space" flow: preview (dry run) -> confirm -> prune.
-type FreeUp =
-  | { step: "idle" | "checking" | "pruning" | "empty" }
-  | { step: "confirm"; titles: string[] }
-  | { step: "done"; pct: number }
-  | { step: "error"; message: string };
-
 const percent = (m: CapacityMeter) => Math.round(m.ratio * 100);
 
 // Pruning only brings storage back down to this share of its limit (WARN_RATIO in
@@ -126,27 +158,6 @@ const PRUNE_TARGET_RATIO = 0.8;
 function formatBytes(bytes: number): string {
   const mb = bytes / (1024 * 1024);
   return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${mb.toFixed(1)} MB`;
-}
-
-// What the banner says about the Free up space flow, under the server's recommendation.
-function freeUpMessage(s: FreeUp): string | null {
-  switch (s.step) {
-    case "confirm": {
-      const n = s.titles.length;
-      const shown = s.titles.slice(0, 5).join(", ");
-      return `This removes the audio of ${n} older ${n === 1 ? "brief" : "briefs"} (markdown stays): ${shown}${n > 5 ? "…" : "."} Continue?`;
-    }
-    case "pruning":
-      return "Removing audio…";
-    case "empty":
-      return "Nothing to prune: your newest briefs are always kept.";
-    case "done":
-      return `Freed space: now ${s.pct}% used.`;
-    case "error":
-      return s.message;
-    default:
-      return null;
-  }
 }
 
 // The resumable banner's card, tinted by how full things are. "ok" only shows the
@@ -194,8 +205,8 @@ function AudioRemoved({ episode }: { episode: Episode }) {
 // useSyncExternalStore instead of being copied into state by an effect. The server render and
 // hydration use "on" (there is no localStorage there), and a saved "off" takes over right after
 // hydration. The first read is cached, so a change made in another tab is picked up on the next
-// page load, not partway through this one.
-const BG_STORAGE_KEY = "bb_bg";
+// page load, not partway through this one. Blocked storage reads as "on" and a failed save
+// still applies for this page load (see background-pref.ts).
 let bgOnCache: boolean | null = null;
 const bgListeners = new Set<() => void>();
 
@@ -207,7 +218,7 @@ function subscribeBackground(listener: () => void) {
 }
 
 function getBackgroundOn(): boolean {
-  bgOnCache ??= localStorage.getItem(BG_STORAGE_KEY) !== "off";
+  bgOnCache ??= readBackgroundOn(() => localStorage);
   return bgOnCache;
 }
 
@@ -216,8 +227,31 @@ const getBackgroundOnServer = () => true;
 function saveBackgroundOn(on: boolean) {
   bgOnCache = on;
   for (const listener of bgListeners) listener();
-  localStorage.setItem(BG_STORAGE_KEY, on ? "on" : "off");
+  writeBackgroundOn(() => localStorage, on);
 }
+
+// GET /api/digest/status for one draft: the body, or null on 404 (deleted, or never this user's).
+async function fetchDraftStatus(episodeId: string): Promise<DigestStatusResponse | null> {
+  const res = await fetch(`/api/digest/status?episodeId=${encodeURIComponent(episodeId)}`);
+  if (res.status === 404) return null;
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error ?? "Couldn't check brief status");
+  return body as DigestStatusResponse;
+}
+
+async function post(url: string, payload: Record<string, unknown>, fallbackError = `${url} failed`) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error ?? fallbackError);
+  return body;
+}
+
+// The analysis loop's requests keep the sync's own wording when the route gives no reason.
+const postEnrich = (url: string, payload: Record<string, unknown>) => post(url, payload, "Analysis failed");
 
 export default function Dashboard({
   user,
@@ -236,32 +270,28 @@ export default function Dashboard({
   const [to, setTo] = useState(isoDaysAgo(0));
   const [selectedTopics, setSelectedTopics] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [topicCounts, setTopicCounts] = useState<TopicCount[]>([]);
-  const [bookmarks, setBookmarks] = useState<Bookmark[]>([]);
-  const [libraryCount, setLibraryCount] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
-  const [syncStage, setSyncStage] = useState<string | null>(null);
-  const [syncProgress, setSyncProgress] = useState<{ done: number; total: number } | null>(null);
-  const [syncMessage, setSyncMessage] = useState<string | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [createStage, setCreateStage] = useState<string | null>(null);
-  const [createProgress, setCreateProgress] = useState<number | null>(null); // 0..1, null = indeterminate
-  const [createStartedAt, setCreateStartedAt] = useState<number | null>(null);
+  const [list, dispatchList] = useReducer(listLoadReducer<Bookmark>, undefined, initialListLoad<Bookmark>);
+  const [syncState, dispatchSync] = useReducer(syncReducer, SYNC_IDLE);
+  const [brief, dispatchBrief] = useReducer(briefFlowReducer<BriefResult>, BRIEF_IDLE);
+  const [banner, dispatchBanner] = useReducer(resumeBannerReducer, BANNER_NONE);
   const [elapsed, setElapsed] = useState(0);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [result, setResult] = useState<{
-    episode: Episode;
-    markdown?: string;
-    stats?: { considered: number; droppedAsStale: number; excludedAsMisleading: number };
-  } | null>(null);
   const [episodes, setEpisodes] = useState<Episode[]>([]);
-  const [resumable, setResumable] = useState<ResumableDraft | null>(null);
-  const [discarding, setDiscarding] = useState(false);
   const [capacity, setCapacity] = useState<Capacity | null>(null);
-  const [freeUp, setFreeUp] = useState<FreeUp>({ step: "idle" });
+  const [freeUp, dispatchFreeUp] = useReducer(freeUpReducer, FREE_UP_IDLE);
+  // Numbers each Free up space check or prune, so a superseded run's answer is ignored.
+  const freeUpRunRef = useRef(0);
   const bgVideoRef = useRef<HTMLVideoElement | null>(null);
   const bgOn = useSyncExternalStore(subscribeBackground, getBackgroundOn, getBackgroundOnServer);
+
+  const bookmarks = listBookmarks(list);
+  const topicCounts = listTopics(list);
+  const libraryCount = listLibraryCount(list);
+  const analysisFailed = listAnalysisFailed(list);
+  const loading = list.step === "loading";
+  const listSeq = list.seq;
+  const syncing = syncBusy(syncState);
+  const creating = brief.step === "working";
+  const briefStartedAt = brief.step === "working" ? brief.startedAt : null;
 
   // Keep the video paused while the background is off. This covers a saved "off" applied after
   // hydration, which also pauses the autoPlay that may have already kicked off.
@@ -289,48 +319,25 @@ export default function Dashboard({
     return params.toString();
   }, [from, to, selectedTopics]);
 
-  // A filter change shows the loading state in the same render, not a render later from the fetch
-  // effect (react.dev, "You Might Not Need an Effect": adjusting state when a prop changes).
-  // `loading` starts out true, so the first load needs nothing here.
+  // A filter change requests a new load in the same render, not a render later from the fetch
+  // effect (react.dev, "You Might Not Need an Effect": adjusting state when a prop changes), so
+  // the loading state shows at once. The initial state is already the first request.
   const [prevBookmarkQuery, setPrevBookmarkQuery] = useState(bookmarkQuery);
   if (bookmarkQuery !== prevBookmarkQuery) {
     setPrevBookmarkQuery(bookmarkQuery);
-    setLoading(true);
+    dispatchList({ type: "request", reason: "filter" });
   }
 
   // Unfiltered library size from the last successful load, null until one lands. Nothing renders
   // it: it only tells the first-visit auto-sync which load found the library empty, so it's a ref.
   const libraryTotalRef = useRef<number | null>(null);
 
-  // GET /api/bookmarks and show the result. Resolves to true when this load found the library empty
-  // and the previous successful load didn't (or there was none yet): the first-visit case.
-  // Like the other loaders the effects below call, it sets state only inside a .then callback:
-  // react-hooks/set-state-in-effect treats a setState after an await in an async function as
-  // synchronous, so an effect calling one would be flagged.
-  const fetchBookmarks = useCallback(
-    (query: string) =>
-      fetch(`/api/bookmarks?${query}`).then(async (res) => {
-        let becameEmpty = false;
-        if (res.ok) {
-          const body = await res.json();
-          const total: number = body.total ?? 0;
-          becameEmpty = total === 0 && libraryTotalRef.current !== 0;
-          libraryTotalRef.current = total;
-          setBookmarks(body.bookmarks ?? []);
-          setTopicCounts(body.topics ?? []);
-          setLibraryCount(body.library ?? total);
-        }
-        setLoading(false);
-        return becameEmpty;
-      }),
-    []
-  );
-
-  // Reloads the list for the current filters, after a sync step or a failed hide.
-  const loadBookmarks = useCallback(() => {
-    setLoading(true);
-    return fetchBookmarks(bookmarkQuery);
-  }, [fetchBookmarks, bookmarkQuery]);
+  // The date range as of the last commit. A sync names the range in its closing message, and
+  // should name the one on screen when it finishes, not the one from when it started.
+  const rangeRef = useRef({ from, to });
+  useEffect(() => {
+    rangeRef.current = { from, to };
+  }, [from, to]);
 
   const loadEpisodes = useCallback(
     () =>
@@ -359,19 +366,8 @@ export default function Dashboard({
       fetch("/api/digest/status")
         .then(async (res) => {
           if (!res.ok) return;
-          const body = (await res.json()) as DigestStatusResponse;
-          if (body.episodeId && (body.stage === "needs_script" || body.stage === "rendering" || body.stage === "needs_finalize")) {
-            setResumable({
-              episodeId: body.episodeId,
-              stage: body.stage,
-              totalLines: body.totalLines,
-              nextCursor: body.nextCursor,
-              title: body.title,
-              createdAt: body.createdAt,
-            });
-          } else {
-            setResumable(null);
-          }
+          const draft = draftFromStatus((await res.json()) as DigestStatusResponse);
+          dispatchBanner(draft ? { type: "found", draft } : { type: "cleared" });
         })
         .catch(() => {
           // Best-effort: the resume banner is a convenience, not the critical path.
@@ -379,59 +375,93 @@ export default function Dashboard({
     []
   );
 
-  const sync = useCallback(async () => {
-    setSyncing(true);
-    setSyncMessage(null);
-    setErrorMessage(null);
+  const analysisDeps: AnalysisRunDeps = {
+    post: postEnrich,
+    onProgress: (done, total) => dispatchSync({ type: "progress", done, total }),
+    onChunk: () => dispatchList({ type: "request", reason: "reload" }),
+  };
+
+  // Each list reload is a request the fetch effect below serves with the filters current when it
+  // runs, so a reload partway through a long sync never re-applies the filters the sync began with.
+  async function sync() {
+    if (syncBusy(syncState)) return;
+    dispatchSync({ type: "start" });
+    dispatchList({ type: "dismissHideError" }); // the user has moved on from a failed hide
     try {
       // Fast: fetch from X + store. Bookmarks appear immediately.
-      setSyncStage("Pulling bookmarks from X…");
-      setSyncProgress(null);
       const res = await fetch("/api/sync", { method: "POST" });
       const body = await res.json();
       if (!res.ok) throw new Error(body.error ?? "Sync failed");
-      await loadBookmarks();
+      dispatchList({ type: "request", reason: "reload" });
 
       // Then ingest sources + analyze in short chunks; tags fill in as chunks land.
-      let pending: number = body.pendingAnalysis ?? 0;
-      const toAnalyze = pending;
-      while (pending > 0) {
-        setSyncStage("Reading linked articles & media, tagging topics…");
-        setSyncProgress({ done: toAnalyze - pending, total: toAnalyze });
-        const enrichRes = await fetch("/api/enrich", { method: "POST" });
-        const enrichBody = await enrichRes.json();
-        if (!enrichRes.ok) throw new Error(enrichBody.error ?? "Analysis failed");
-        if (!enrichBody.enriched && !enrichBody.ingested && enrichBody.remaining > 0) {
-          throw new Error(`Analysis stalled with ${enrichBody.remaining} bookmarks left — try again`);
-        }
-        pending = enrichBody.remaining;
-        await loadBookmarks();
-      }
-      setSyncMessage(describeSync(body, from, to, toAnalyze));
+      const { analyzed } = await runAnalysis(body.pendingAnalysis ?? 0, analysisDeps);
+      const range = rangeRef.current;
+      dispatchSync({ type: "succeed", message: describeSync(body, range.from, range.to, analyzed) });
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Sync failed");
-    } finally {
-      setSyncing(false);
-      setSyncStage(null);
-      setSyncProgress(null);
+      dispatchSync({ type: "fail", message: err instanceof Error ? err.message : "Sync failed" });
     }
-  }, [loadBookmarks, from, to]);
+  }
+
+  // Retry: make the given-up posts candidates again and run only the analysis loop, through the
+  // same flow as a sync so the progress panel and the disabled "Check X for new" come with it.
+  async function retryFailedAnalysis() {
+    if (syncBusy(syncState) || analysisFailed === 0) return;
+    const total = analysisFailed;
+    dispatchSync({ type: "retry", total });
+    dispatchList({ type: "dismissHideError" }); // the user has moved on from a failed hide
+    try {
+      const { analyzed } = await runAnalysis(total, analysisDeps, { retryFailed: true });
+      dispatchSync(retryOutcome(analyzed, total));
+    } catch (err) {
+      dispatchSync({ type: "fail", message: err instanceof Error ? err.message : "Analysis failed" });
+    }
+  }
 
   // First visit: an empty library means nothing has been synced yet, so pull bookmarks
   // automatically instead of waiting for a click, unless a sync is already running. An Effect
-  // Event, so it sees the current `syncing` and `sync` without the fetch effect depending on them.
+  // Event, so it sees the current sync state and `sync` without the fetch effect depending on them.
   const onLibraryFoundEmpty = useEffectEvent(() => {
     if (!syncing) sync();
   });
 
+  // GET /api/bookmarks for the latest request: a filter change above, or a reload from sync, a
+  // failed hide or Retry. The response carries its request's number, and the reducer keeps only
+  // the latest, so an older answer arriving late can't replace a newer list. Like the other
+  // loaders the effects call, it dispatches only inside .then/.catch callbacks:
+  // react-hooks/set-state-in-effect treats a setState after an await in an async function as
+  // synchronous, so an effect calling one would be flagged.
   useEffect(() => {
-    fetchBookmarks(bookmarkQuery).then((becameEmpty) => {
-      if (becameEmpty) onLibraryFoundEmpty();
-    });
-  }, [fetchBookmarks, bookmarkQuery]);
+    // Cleared once a newer request (or an unmount) supersedes this one. It gates the
+    // first-visit check, which must only ever see the latest load.
+    let current = true;
+    fetch(`/api/bookmarks?${bookmarkQuery}`)
+      .then(async (res) => {
+        if (!res.ok) throw new Error(`Bookmarks load failed (${res.status})`);
+        const body = await res.json();
+        const total: number = body.total ?? 0;
+        const data: ListData<Bookmark> = {
+          bookmarks: body.bookmarks ?? [],
+          topics: body.topics ?? [],
+          library: body.library ?? total,
+          analysisFailed: body.analysisFailed ?? 0,
+        };
+        dispatchList({ type: "succeed", seq: listSeq, data });
+        if (!current) return;
+        // True when this load found the library empty and the previous successful load didn't
+        // (or there was none yet): the first-visit case.
+        const becameEmpty = total === 0 && libraryTotalRef.current !== 0;
+        libraryTotalRef.current = total;
+        if (becameEmpty) onLibraryFoundEmpty();
+      })
+      .catch(() => dispatchList({ type: "fail", seq: listSeq }));
+    return () => {
+      current = false;
+    };
+  }, [bookmarkQuery, listSeq]);
 
   useEffect(() => {
-    loadEpisodes();
+    loadEpisodes().catch(() => {}); // best-effort: a failed history load just leaves it empty
   }, [loadEpisodes]);
 
   useEffect(() => {
@@ -444,82 +474,44 @@ export default function Dashboard({
 
   // Ticking clock while a brief is being created, so it never looks frozen
   useEffect(() => {
-    if (!createStartedAt) return;
-    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - createStartedAt) / 1000)), 1000);
+    if (!briefStartedAt) return;
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - briefStartedAt) / 1000)), 1000);
     return () => clearInterval(timer);
-  }, [createStartedAt]);
+  }, [briefStartedAt]);
 
-  async function post(url: string, payload: Record<string, unknown>) {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    const body = await res.json();
-    if (!res.ok) throw new Error(body.error ?? `${url} failed`);
-    return body;
+  const onBriefStage = (stage: BriefStage) => dispatchBrief({ type: "stage", stage });
+
+  // Starting a create or resume clears only the brief flow's own errors.
+  function beginBrief(stage: BriefStage) {
+    dispatchBrief({ type: "start", startedAt: Date.now(), stage });
+    dispatchBanner({ type: "clearError" });
+    dispatchFreeUp({ type: "reset" }); // a new brief makes any earlier "Freed space" line stale
+    setElapsed(0);
   }
 
-  // Stages 2-4 (script -> render loop -> finalize), shared by a fresh
-  // generation and a resumed one. `cursor`/`skipScript` let a resume jump in
-  // partway: skipScript reuses an already-written script, and the render
-  // loop's own `while (cursor < totalLines)` guard means a cursor that's
-  // already at totalLines (the needs_finalize case) just falls through
-  // straight to finalize with no branching required.
-  async function runAudioStages(
-    episodeId: string,
-    opts: { skipScript?: boolean; totalLines?: number; cursor?: number } = {}
-  ) {
-    let totalLines = opts.totalLines ?? 0;
-    if (!opts.skipScript) {
-      setCreateStage("Writing the show script…");
-      setCreateProgress(null);
-      const scripted = await post("/api/digest/script", { episodeId, targetMinutes: 20 });
-      totalLines = scripted.totalLines;
-    }
-
-    let cursor = opts.cursor ?? 0;
-    setCreateProgress(totalLines > 0 ? Math.min(cursor / totalLines, 1) : 0);
-    while (cursor < totalLines) {
-      setCreateStage(`Recording audio — line ${cursor + 1} of ${totalLines}`);
-      const rendered = await post("/api/digest/render", { episodeId, cursor });
-      cursor = rendered.nextCursor;
-      setCreateProgress(Math.min(cursor / totalLines, 1));
-      if (rendered.done) break;
-    }
-
-    setCreateStage("Mixing & publishing…");
-    setCreateProgress(null);
-    return post("/api/digest/finalize", { episodeId });
+  // Once a brief is published, refreshing the history and the meter is best-effort: the brief is
+  // done, and a failure here must never turn the result into an error.
+  function refreshAfterBrief() {
+    loadCapacity();
+    loadEpisodes().catch(() => {});
   }
 
-  // On any stage failure the draft row is left in place on purpose (nothing
-  // here deletes it) so it's resumable — the error message says so whenever
-  // we got far enough to have a draft, and refreshes the banner immediately.
-  function reportCreateError(err: unknown, episodeId: string | undefined) {
-    const base = err instanceof Error ? err.message : "Generation failed";
-    setErrorMessage(
-      episodeId
-        ? `${base} — this brief is saved as a draft, so you can resume it instead of starting over.`
-        : base
-    );
-    if (episodeId) checkResumable();
+  // On any stage failure the draft row is left in place on purpose (nothing here deletes it) so
+  // it's resumable. The banner is re-checked on every failure, not only when the episode id is
+  // known: a prepare that timed out may still have created a draft whose id never reached us.
+  function reportBriefFailure(err: unknown, episodeId: string | undefined) {
+    dispatchBrief({ type: "fail", message: briefFailureMessage(err, episodeId) });
+    checkResumable();
     // Finalize answers 507 when storage is full and auto-prune is off: refresh the banner.
     loadCapacity();
   }
 
   async function createBrief() {
-    setCreating(true);
-    setErrorMessage(null);
-    setResult(null);
-    setFreeUp({ step: "idle" }); // a new brief makes any earlier "Freed space" line stale
-    setCreateStartedAt(Date.now());
-    setElapsed(0);
+    if (creating) return;
+    beginBrief({ step: "preparing" });
     let episodeId: string | undefined;
     try {
       // Stage 1: analyze, check freshness, outline, write the markdown brief
-      setCreateStage("Reading your posts & writing the brief…");
-      setCreateProgress(null);
       const prepared = await post("/api/digest/prepare", {
         format,
         from,
@@ -527,111 +519,122 @@ export default function Dashboard({
         topics: selectedTopics,
         // Hand-picked posts take precedence over date/topic filters
         tweetIds: selected.size > 0 ? [...selected] : undefined,
-        targetMinutes: 20,
+        targetMinutes: TARGET_MINUTES,
       });
       if (prepared.done) {
-        setResult(prepared);
-        loadCapacity();
-        await loadEpisodes();
-        return;
+        dispatchBrief({ type: "succeed", result: prepared });
+      } else {
+        episodeId = prepared.episode.id as string;
+        dispatchBanner({ type: "cleared" }); // starting fresh supersedes any stale resumable draft
+        const finalized = await runAudioStages<{ episode: Episode }>(episodeId, {
+          post,
+          onStage: onBriefStage,
+        });
+        dispatchBrief({
+          type: "succeed",
+          result: { episode: finalized.episode, markdown: prepared.markdown, stats: prepared.stats },
+        });
       }
-      episodeId = prepared.episode.id as string;
-      setResumable(null); // starting fresh supersedes any stale resumable draft
-
-      const finalized = await runAudioStages(episodeId);
-      setResult({ episode: finalized.episode, markdown: prepared.markdown, stats: prepared.stats });
-      loadCapacity();
-      await loadEpisodes();
     } catch (err) {
-      reportCreateError(err, episodeId);
-    } finally {
-      setCreating(false);
-      setCreateStage(null);
-      setCreateProgress(null);
-      setCreateStartedAt(null);
+      reportBriefFailure(err, episodeId);
+      return;
     }
+    refreshAfterBrief();
   }
 
+  // Resumes from the draft's stage as the server reports it now (another tab or the background
+  // job runner may have moved it on), not the stage cached when the banner was shown.
   async function resumeBrief() {
-    if (!resumable) return;
-    const { episodeId, stage, totalLines, nextCursor } = resumable;
-    setCreating(true);
-    setErrorMessage(null);
-    setResult(null);
-    setFreeUp({ step: "idle" });
-    setCreateStartedAt(Date.now());
-    setElapsed(0);
+    if (banner.step !== "available" || creating) return;
+    const draft = banner.draft;
+    beginBrief(resumeStartStage(draft));
+    let outcome: ResumeOutcome<{ episode: Episode }>;
     try {
-      const finalized = await runAudioStages(episodeId, {
-        skipScript: stage !== "needs_script",
-        totalLines,
-        cursor: nextCursor,
+      outcome = await resumeDraft<{ episode: Episode }>(draft.episodeId, {
+        post,
+        getStatus: fetchDraftStatus,
+        onStage: onBriefStage,
       });
-      setResult({ episode: finalized.episode });
-      setResumable(null);
-      loadCapacity();
-      await loadEpisodes();
     } catch (err) {
-      reportCreateError(err, episodeId);
-    } finally {
-      setCreating(false);
-      setCreateStage(null);
-      setCreateProgress(null);
-      setCreateStartedAt(null);
+      reportBriefFailure(err, draft.episodeId);
+      return;
+    }
+    dispatchBanner({ type: "cleared" });
+    switch (outcome.kind) {
+      case "published":
+        dispatchBrief({ type: "succeed", result: { episode: outcome.finalized.episode } });
+        refreshAfterBrief();
+        break;
+      case "finished":
+        // Finished elsewhere: nothing went wrong, and the history list will show it.
+        dispatchBrief({ type: "stop" });
+        refreshAfterBrief();
+        break;
+      case "gone":
+        dispatchBrief({ type: "fail", message: DRAFT_GONE_MESSAGE });
+        break;
+      default: {
+        const unreachable: never = outcome;
+        return unreachable;
+      }
     }
   }
 
   async function discardResumable() {
-    if (!resumable) return;
-    setDiscarding(true);
+    if (banner.step !== "available" || creating) return;
+    const { episodeId } = banner.draft;
+    dispatchBanner({ type: "discard" });
+    dispatchBrief({ type: "clearError" });
     try {
-      const res = await fetch(`/api/digest/status?episodeId=${resumable.episodeId}`, { method: "DELETE" });
+      const res = await fetch(`/api/digest/status?episodeId=${episodeId}`, { method: "DELETE" });
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.error ?? "Couldn't discard draft");
       }
-      setResumable(null);
+      dispatchBanner({ type: "discarded" });
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : "Couldn't discard draft");
-    } finally {
-      setDiscarding(false);
+      dispatchBanner({
+        type: "discardFailed",
+        message: err instanceof Error ? err.message : "Couldn't discard draft",
+      });
     }
   }
 
   // "Free up space": preview with a dry run, confirm, then prune for real. The server only ever
   // touches the caller's own audio and always keeps their newest briefs.
   async function startFreeUp() {
-    setFreeUp({ step: "checking" });
+    const run = ++freeUpRunRef.current;
+    dispatchFreeUp({ type: "check", run });
     try {
       const body: PruneResponse = await post("/api/capacity/prune", { dryRun: true });
-      setFreeUp(
-        body.pruned.length > 0
-          ? { step: "confirm", titles: body.pruned.map((p) => p.title) }
-          : { step: "empty" }
-      );
+      dispatchFreeUp({ type: "checked", run, titles: body.pruned.map((p) => p.title) });
     } catch (err) {
-      setFreeUp({
-        step: "error",
+      dispatchFreeUp({
+        type: "failed",
+        run,
         message: err instanceof Error ? err.message : "Couldn't check what can be removed",
       });
     }
   }
 
   async function confirmFreeUp() {
-    setFreeUp({ step: "pruning" });
+    const run = ++freeUpRunRef.current;
+    dispatchFreeUp({ type: "prune", run });
     try {
       const body: PruneResponse = await post("/api/capacity/prune", { dryRun: false });
       setCapacity(body.capacity); // show the new level now; the refetch below confirms it
-      setFreeUp(
-        body.pruned.length > 0
-          ? { step: "done", pct: percent(body.capacity.storage) }
-          : { step: "empty" }
-      );
+      dispatchFreeUp({
+        type: "pruned",
+        run,
+        removed: body.pruned.length,
+        pct: percent(body.capacity.storage),
+      });
       loadCapacity();
       loadEpisodes().catch(() => {}); // best-effort: the prune itself already succeeded
     } catch (err) {
-      setFreeUp({
-        step: "error",
+      dispatchFreeUp({
+        type: "failed",
+        run,
         message: err instanceof Error ? err.message : "Couldn't free up space",
       });
     }
@@ -641,6 +644,13 @@ export default function Dashboard({
     setSelectedTopics((prev) =>
       prev.includes(topic) ? prev.filter((t) => t !== topic) : [...prev, topic]
     );
+
+  // The sync's done message names the date range, so a range change retires it.
+  const changeRange = (bound: "from" | "to", value: string) => {
+    if (bound === "from") setFrom(value);
+    else setTo(value);
+    dispatchSync({ type: "dismiss" });
+  };
 
   // Chips come strictly from the posts loaded for the current date range. A
   // selected topic that drops to zero (e.g. after narrowing the dates) stays
@@ -661,20 +671,26 @@ export default function Dashboard({
 
   async function hideBookmark(tweetId: string) {
     // Optimistic: drop from the list immediately, persist in the background.
-    setBookmarks((prev) => prev.filter((b) => b.tweet_id !== tweetId));
+    dispatchList({ type: "hide", tweetId });
     setSelected((prev) => {
       const next = new Set(prev);
       next.delete(tweetId);
       return next;
     });
-    const res = await fetch("/api/bookmarks/hide", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ tweet_id: tweetId }),
-    });
-    if (!res.ok) {
-      setErrorMessage("Couldn't remove that bookmark — it may reappear on reload.");
-      await loadBookmarks();
+    let saved = false;
+    try {
+      const res = await fetch("/api/bookmarks/hide", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tweet_id: tweetId }),
+      });
+      saved = res.ok;
+    } catch {
+      // A network failure is handled like a refusal below.
+    }
+    if (!saved) {
+      dispatchList({ type: "hideFailed", message: HIDE_FAILED_MESSAGE });
+      dispatchList({ type: "request", reason: "reload" });
     }
   }
 
@@ -688,12 +704,29 @@ export default function Dashboard({
 
   const bannerTone = BANNER_TONES[capacity?.level ?? "ok"];
   const freeUpText = freeUpMessage(freeUp);
-  const freeUpBusy = freeUp.step === "checking" || freeUp.step === "pruning";
+  const freeUpBusy = isFreeUpBusy(freeUp);
   const canFreeUp = (capacity?.storage.ratio ?? 0) >= PRUNE_TARGET_RATIO;
-  let freeUpLabel = "Free up space";
-  if (freeUp.step === "checking") freeUpLabel = "Checking…";
-  else if (freeUp.step === "pruning") freeUpLabel = "Removing…";
-  else if (!canFreeUp) freeUpLabel = "Dismiss";
+  const freeUpLabel = freeUpButtonLabel(freeUp, canFreeUp);
+
+  // Every unanalyzed post in view is one the app gave up on, so "Check X for new" wouldn't
+  // analyze any of them; the Retry notice already explains.
+  const unanalyzed = bookmarks.filter((b) => !analysisOf(b));
+  const onlyGivenUpUnanalyzed = unanalyzed.length > 0 && unanalyzed.every((b) => b.analysis_failed === true);
+
+  const syncStage = syncStageLabel(syncState);
+  const syncProgress = syncProgressOf(syncState);
+  const syncMessage = syncDoneMessage(syncState);
+  // One error line per flow, so a failure in one never overwrites another's.
+  const errorLines = Object.entries({
+    sync: syncErrorMessage(syncState),
+    brief: briefErrorMessage(brief, banner),
+    list: list.hideError,
+  }).filter((line): line is [string, string] => line[1] !== null);
+  const createStage = brief.step === "working" ? briefStageLabel(brief.stage) : null;
+  const createProgress = brief.step === "working" ? briefProgress(brief.stage) : null; // 0..1, null = indeterminate
+  const result = brief.step === "succeeded" ? brief.result : null;
+  const resumable = banner.step === "none" ? null : banner.draft;
+  const resumeControls = bannerControls(banner, brief);
 
   // Byte counts are in the tooltip; the line itself stays tiny.
   const capacityLine = capacity && (
@@ -822,7 +855,23 @@ export default function Dashboard({
             </section>
           )}
           {syncMessage && <p className="text-sm text-emerald-400">{syncMessage}</p>}
-          {errorMessage && <p className="text-sm text-red-400">{errorMessage}</p>}
+          {analysisFailed > 0 && !syncing && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-sm text-amber-400">{describeAnalysisFailed(analysisFailed)}</p>
+              <button
+                onClick={retryFailedAnalysis}
+                disabled={syncing}
+                className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {errorLines.map(([flow, message]) => (
+            <p key={flow} className="text-sm text-red-400">
+              {message}
+            </p>
+          ))}
         </div>
 
         {/* Resumable draft banner */}
@@ -838,16 +887,17 @@ export default function Dashboard({
             <div className="flex shrink-0 items-center gap-2">
               <button
                 onClick={resumeBrief}
-                className="rounded-full bg-amber-500 px-4 py-1.5 text-sm font-medium text-zinc-950 transition hover:bg-amber-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+                disabled={resumeControls.resumeDisabled}
+                className="rounded-full bg-amber-500 px-4 py-1.5 text-sm font-medium text-zinc-950 transition hover:bg-amber-400 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
               >
                 Resume
               </button>
               <button
                 onClick={discardResumable}
-                disabled={discarding}
+                disabled={resumeControls.discardDisabled}
                 className="rounded-full border border-amber-800/60 px-4 py-1.5 text-sm text-amber-200 transition hover:border-amber-600 disabled:opacity-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-300 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
               >
-                {discarding ? "Discarding…" : "Discard"}
+                {resumeControls.discardLabel}
               </button>
             </div>
           </section>
@@ -880,7 +930,7 @@ export default function Dashboard({
                     {/* The prompt replaces the button that was just pressed, so focus is placed on
                         the safe choice instead of being dropped. */}
                     <button
-                      onClick={() => setFreeUp({ step: "idle" })}
+                      onClick={() => dispatchFreeUp({ type: "reset" })}
                       autoFocus
                       className={`${BANNER_BUTTON} ${bannerTone.secondary}`}
                     >
@@ -889,7 +939,7 @@ export default function Dashboard({
                   </>
                 ) : (
                   <button
-                    onClick={canFreeUp ? startFreeUp : () => setFreeUp({ step: "idle" })}
+                    onClick={canFreeUp ? startFreeUp : () => dispatchFreeUp({ type: "reset" })}
                     disabled={freeUpBusy}
                     className={`${BANNER_BUTTON} ${canFreeUp ? bannerTone.primary : bannerTone.secondary}`}
                   >
@@ -935,7 +985,7 @@ export default function Dashboard({
                   type="date"
                   aria-label="Posted on or after"
                   value={from}
-                  onChange={(e) => setFrom(e.target.value)}
+                  onChange={(e) => changeRange("from", e.target.value)}
                   className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
                 />
               </label>
@@ -945,7 +995,7 @@ export default function Dashboard({
                   type="date"
                   aria-label="Posted on or before"
                   value={to}
-                  onChange={(e) => setTo(e.target.value)}
+                  onChange={(e) => changeRange("to", e.target.value)}
                   className="ml-1 rounded-lg border border-white/15 bg-zinc-900/50 px-3 py-1.5 text-zinc-100 backdrop-blur-md [color-scheme:dark] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
                 />
               </label>
@@ -987,9 +1037,13 @@ export default function Dashboard({
                 ? "Topics fill in here as each batch is analyzed…"
                 : loading
                   ? "Loading topics…"
-                  : bookmarks.length === 0
+                  : list.step === "failed" && list.data === null
+                    ? ""
+                    : bookmarks.length === 0
                     ? "No posts in this date range, so no topics to show. Widen the dates to see more."
-                    : "No topics yet for these posts — use Check X for new to analyze them."}
+                    : onlyGivenUpUnanalyzed
+                      ? ""
+                      : "No topics yet for these posts — use Check X for new to analyze them."}
             </p>
           )}
         </section>
@@ -1118,7 +1172,9 @@ export default function Dashboard({
           </div>
           <p className="text-sm text-zinc-400" aria-live="polite">
             {libraryCount === null
-              ? "Loading…"
+              ? list.step === "failed"
+                ? ""
+                : "Loading…"
               : `Showing ${bookmarks.length} of ${libraryCount} posted ${formatRange(from, to)}`}
             {libraryCount !== null && selectedTopics.length > 0 && (
               <span className="text-zinc-500">
@@ -1138,7 +1194,18 @@ export default function Dashboard({
               ))}
             </ul>
           )}
-          {!loading && bookmarks.length === 0 && (
+          {list.step === "failed" && (
+            <div className="flex flex-wrap items-center gap-3">
+              <p className="text-sm text-red-400">{LIST_LOAD_FAILED_MESSAGE}</p>
+              <button
+                onClick={() => dispatchList({ type: "request", reason: "reload" })}
+                className="rounded-full border border-white/15 bg-white/5 px-4 py-2 text-sm backdrop-blur-md transition hover:border-white/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-zinc-950"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+          {list.step === "loaded" && bookmarks.length === 0 && (
             <p className="text-sm text-zinc-500">
               {syncing
                 ? "Pulling your bookmarks from X — they'll appear here in a few seconds…"
@@ -1191,10 +1258,10 @@ export default function Dashboard({
                   <div className="flex flex-wrap gap-1.5">
                     {!a && (
                       <span className="inline-flex items-center gap-1.5 rounded-full border border-dashed border-sky-400/40 px-2 py-0.5 text-[11px] text-sky-300/80">
-                        {syncing && (
+                        {syncing && !b.analysis_failed && (
                           <span className="inline-block h-1.5 w-1.5 rounded-full bg-sky-400 animate-pulse" />
                         )}
-                        {syncing ? "Analyzing…" : "Not analyzed yet"}
+                        {b.analysis_failed ? "Couldn't analyze" : syncing ? "Analyzing…" : "Not analyzed yet"}
                       </span>
                     )}
                     {(a?.topics ?? []).map((t) => (

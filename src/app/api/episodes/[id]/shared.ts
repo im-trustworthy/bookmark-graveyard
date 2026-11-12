@@ -2,6 +2,7 @@ import "server-only";
 import { NextResponse } from "next/server";
 import { getUserIdFromRequest } from "@/lib/auth";
 import { apiError } from "@/lib/errors";
+import { EPISODE_STATUS, audioAvailability } from "@/lib/state/episode";
 import { db } from "@/lib/supabase";
 
 // Stable links to a finished brief's files, for links that leave the app: an assistant pastes them into a
@@ -58,14 +59,15 @@ export async function redirectToEpisodeFile(
   if (error) return apiError(context, new Error(error.message), "Couldn't load the episode");
   const episode = data as EpisodeFiles | null;
   // Someone else's brief, a draft and a made-up id all look the same.
-  if (!episode || episode.status !== "ready") return apiError(context, "no ready episode", "Episode not found", 404);
+  if (!episode || episode.status !== EPISODE_STATUS.ready) return apiError(context, "no ready episode", "Episode not found", 404);
 
   let path: string | null;
   if (file === "audio") {
-    if (episode.audio_pruned_at) {
+    const audio = audioAvailability(episode);
+    if (audio === "pruned") {
       return apiError(context, "audio pruned", "This episode's audio was pruned to free space", 404);
     }
-    if (!episode.audio_path) return apiError(context, "no audio", "This episode has no audio", 404);
+    if (audio === "none" || !episode.audio_path) return apiError(context, "no audio", "This episode has no audio", 404);
     path = episode.audio_path;
   } else {
     path = episode.markdown_path;

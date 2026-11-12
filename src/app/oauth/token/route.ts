@@ -9,6 +9,7 @@ import {
   normalizeScopes,
   revokeClientTokens,
   revokeReusedRefreshToken,
+  revokeTokenRows,
   rotateOAuthToken,
 } from "@/lib/api-tokens";
 import type { ApiScope } from "@/lib/api-tokens";
@@ -44,9 +45,10 @@ import { db } from "@/lib/supabase";
 //    refresh token. A code works once: the request that flips used_at wins,
 //    a replay loses, and a replay of a code that already produced a token
 //    revokes that token (RFC 6749 §4.1.2: the code may have leaked). One
-//    connection per client per user: the client's earlier tokens for the
-//    user are revoked first, and the new token must fit under the account's
-//    MAX_ACTIVE_TOKENS like a dashboard token.
+//    connection per client per user: the new token must fit under the
+//    account's MAX_ACTIVE_TOKENS like a dashboard token, counting what remains
+//    once the client's earlier tokens for the user go, and only then are those
+//    revoked.
 //  refresh_token: rotates. The same row gets a new access token and a new
 //    refresh token, so the presented pair dies and the Assistants panel keeps
 //    one entry per connected client. Scopes may narrow, never widen. The
@@ -122,11 +124,7 @@ async function readParams(req: NextRequest): Promise<URLSearchParams | null | "t
  * the code. A failed revoke is logged; the replay is refused either way.
  */
 async function revokeTokenOfReplayedCode(tokenId: string): Promise<void> {
-  const { error } = await db()
-    .from("api_tokens")
-    .update({ revoked_at: new Date().toISOString() })
-    .eq("id", tokenId)
-    .is("revoked_at", null);
+  const { error } = await revokeTokenRows({ id: tokenId });
   if (error) {
     console.error(`POST /oauth/token: an authorization code was replayed; revoking token ${tokenId} failed:`, error.message);
   } else {
@@ -184,16 +182,19 @@ async function exchangeCode(params: URLSearchParams): Promise<Response> {
   const userId = String(row.user_id);
   if (!(await isUserAllowed(userId))) return fail("invalid_grant", "This account can no longer use this server");
 
-  // One connection per registered client per user: a client exchanging a fresh
-  // code has lost or dropped the tokens it had, so they go, and don't pile up.
-  await revokeClientTokens(userId, clientId);
-  // The same ceiling a dashboard token is created under.
-  if ((await countActiveApiTokens(userId)) >= MAX_ACTIVE_TOKENS) {
+  // The same ceiling a dashboard token is created under, counted as it will
+  // stand once this client's earlier tokens are replaced. Decided before
+  // anything is revoked, so a refusal leaves the client's connection (even an
+  // expired one it could still refresh) as it was.
+  if ((await countActiveApiTokens(userId, { exceptClientId: clientId })) >= MAX_ACTIVE_TOKENS) {
     return fail(
       "invalid_grant",
       "This account already has the maximum number of active tokens; revoke one in the Assistants panel"
     );
   }
+  // One connection per registered client per user: a client exchanging a fresh
+  // code has lost or dropped the tokens it had, so they go, and don't pile up.
+  await revokeClientTokens(userId, clientId);
 
   const scopes = normalizeScopes(
     (Array.isArray(row.scopes) ? row.scopes : []).filter((s: unknown): s is ApiScope => s === "read" || s === "write")
