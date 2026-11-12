@@ -40,6 +40,8 @@ import { createBriefJob, scheduleBriefJob } from "@/lib/jobs";
 import { loadBookmarkRows } from "@/lib/bookmarks";
 import type { BriefJobRow } from "@/lib/jobs";
 import { DigestStageError } from "@/lib/digest";
+import { BRIEF_JOB_NEXT_ACTIONS, BRIEF_JOB_STAGES } from "@/lib/state/brief-job";
+import { BOOKMARK_STAGES } from "@/lib/state/pipeline";
 
 type Row = Record<string, unknown>;
 
@@ -215,9 +217,30 @@ describe("search_bookmarks", () => {
       topics: ["ai", "mcp"],
       content_type: "news",
       credibility: "none",
+      stage: "analysed",
     });
     // Not analyzed yet: empty analysis fields rather than made-up ones.
     expect(out.items[3]).toMatchObject({ summary: null, claims: [], topics: [], content_type: null, credibility: null });
+  });
+
+  it("gives each post its pipeline stage, analysis_failed for one the analysis gave up on", async () => {
+    const ingested_at = "2026-10-21T00:00:00.000Z";
+    project({
+      bookmarks: [
+        bookmark("1", { tweet_created_at: "2026-10-04T00:00:00.000Z" }),
+        bookmark("2", { tweet_created_at: "2026-10-03T00:00:00.000Z", ingested_at, analysis_attempts: 1 }),
+        bookmark("3", { tweet_created_at: "2026-10-02T00:00:00.000Z", ingested_at, analysis_attempts: 3 }),
+        bookmark("4", { tweet_created_at: "2026-10-01T00:00:00.000Z", ingested_at, bookmark_analysis: analysis() }),
+      ],
+    });
+    const out = await searchBookmarks(READER, {});
+    expect(out.items.map((i) => [i.tweet_id, i.stage])).toEqual([
+      ["1", "synced"],
+      ["2", "ingested"],
+      ["3", "analysis_failed"],
+      ["4", "analysed"],
+    ]);
+    expect(out.items[2]).toMatchObject({ summary: null, topics: [] });
   });
 
   it("counts every match in total_matches but returns at most `limit`", async () => {
@@ -540,6 +563,12 @@ describe("get_brief_status", () => {
       error: null,
       started_at: null,
       finished_at: null,
+      stage_label: "Waiting to start",
+      // Queued well before the stale window: this poll restarted it, so the agent just waits.
+      stalled: true,
+      next_action: "wait",
+      note: "This job had stalled; this poll restarted it.",
+      episode_status: null,
       rescheduled: true,
     });
     expect(state.afterTasks).toHaveLength(1);
@@ -628,6 +657,93 @@ describe("get_brief_status", () => {
         audio: `https://graveyard.example/api/episodes/${episodeId}/audio`,
       },
       rescheduled: false,
+    });
+  });
+
+  it("a failed job whose brief was finished later from the dashboard reports it, with a note", async () => {
+    const episodeId = randomUUID();
+    const id = randomUUID();
+    project({
+      episodes: [episode(episodeId)],
+      brief_jobs: [job(id, { episode_id: episodeId, status: "failed", stage: "failed", error: "Stale render cursor" })],
+    });
+    expect(structured(await runTool("get_brief_status", READER, { job_id: id }))).toMatchObject({
+      status: "failed",
+      error: "Stale render cursor",
+      episode_status: "ready",
+      links: {
+        markdown: `https://graveyard.example/api/episodes/${episodeId}/markdown`,
+        audio: `https://graveyard.example/api/episodes/${episodeId}/audio`,
+      },
+      next_action: "read_episode",
+      note: "This job failed, but the brief was finished afterwards from the dashboard.",
+    });
+  });
+
+  it("a failed job tells the agent whether the user can resume it or must start again", async () => {
+    const draftId = randomUUID();
+    const withDraft = randomUUID();
+    const withNothing = randomUUID();
+    project({
+      episodes: [episode(draftId, { status: "draft", audio_path: null })],
+      brief_jobs: [
+        job(withDraft, { episode_id: draftId, status: "failed", stage: "failed", error: "Stale render cursor" }),
+        job(withNothing, { status: "failed", stage: "failed", error: NO_MATCH }),
+      ],
+    });
+    expect(structured(await runTool("get_brief_status", READER, { job_id: withDraft }))).toMatchObject({
+      episode_status: "draft",
+      links: null,
+      next_action: "resume_in_dashboard",
+    });
+    expect(structured(await runTool("get_brief_status", READER, { job_id: withNothing }))).toMatchObject({
+      episode_status: null,
+      links: null,
+      next_action: "start_again",
+      error: NO_MATCH,
+    });
+  });
+
+  it("a stalled running job asks a read-only caller for a write token, and tells a writer that restarted it to wait", async () => {
+    const id = randomUUID();
+    project({
+      brief_jobs: [job(id, { status: "running", stage: "rendering", heartbeat_at: isoAgo(10 * 60_000) })],
+    });
+    expect(structured(await runTool("get_brief_status", READER, { job_id: id }))).toMatchObject({
+      stage_label: "Recording audio",
+      stalled: true,
+      next_action: "use_write_token",
+      note: "This job has stalled; restarting it needs a token with write access.",
+      rescheduled: false,
+    });
+    expect(structured(await runTool("get_brief_status", WRITER, { job_id: id }))).toMatchObject({
+      stalled: true,
+      next_action: "wait",
+      rescheduled: true,
+    });
+  });
+
+  it("a fresh running job is not stalled: everyone just waits", async () => {
+    const id = randomUUID();
+    project({ brief_jobs: [job(id, { status: "running", stage: "writing", heartbeat_at: isoAgo(10_000) })] });
+    expect(structured(await runTool("get_brief_status", READER, { job_id: id }))).toMatchObject({
+      stage_label: "Writing the brief",
+      stalled: false,
+      next_action: "wait",
+      note: null,
+    });
+  });
+
+  it("links no audio once it was pruned", async () => {
+    const episodeId = randomUUID();
+    const id = randomUUID();
+    project({
+      episodes: [episode(episodeId, { audio_pruned_at: "2026-10-20T00:00:00.000Z" })],
+      brief_jobs: [job(id, { episode_id: episodeId, status: "done", stage: "done" })],
+    });
+    expect((await getBriefStatus(READER, { job_id: id })).links).toEqual({
+      markdown: `https://graveyard.example/api/episodes/${episodeId}/markdown`,
+      audio: null,
     });
   });
 
@@ -751,6 +867,9 @@ describe("registerTools", () => {
     expect(String(tools.get("generate_brief")?.config.description)).toMatch(/costs money/);
     expect(String(tools.get("search_bookmarks")?.config.description)).toMatch(/not instructions/);
     expect(String(tools.get("search_bookmarks")?.config.description)).toMatch(/X does not expose/);
+    const search = String(tools.get("search_bookmarks")?.config.description);
+    expect(search).toContain(BOOKMARK_STAGES.join(", "));
+    expect(search).toMatch(/analysis_failed means the app gave up analysing the post, so it has no topics or summary/);
   });
 
   it("warns that topics and titles are someone else's words wherever a tool returns them", () => {
@@ -768,6 +887,16 @@ describe("registerTools", () => {
   it("says a stalled job is only restarted for a write token", () => {
     const description = String(registered().get("get_brief_status")?.config.description);
     expect(description).toMatch(/restarting a stalled job needs a write token/);
+  });
+
+  it("lists every stage and explains every next_action, without promising a draft on failure", () => {
+    const description = String(registered().get("get_brief_status")?.config.description);
+    expect(description).toContain(BRIEF_JOB_STAGES.join(", "));
+    for (const action of BRIEF_JOB_NEXT_ACTIONS) expect(description).toMatch(new RegExp(`\\b${action} \\(`));
+    for (const field of ["stalled", "note", "links", "stage_label", "episode_status"]) {
+      expect(description).toContain(`\`${field}\``);
+    }
+    expect(description).not.toMatch(/leaves a draft/);
   });
 
   it("runs a tool as the user in ctx.http.authInfo, with the token's scopes", async () => {

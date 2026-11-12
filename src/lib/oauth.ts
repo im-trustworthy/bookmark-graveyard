@@ -974,9 +974,6 @@ export function isRefreshIdle(lastUsedAt: string, now = Date.now()): boolean {
   return !(now - last < REFRESH_IDLE_DAYS * 24 * 60 * 60 * 1000);
 }
 
-/** Whether the user still exists and is still on the allowlist. Throws only when the database can't be asked. */
-export async function isUserAllowed(userId: string): Promise<boolean> {
-  const { data, error } = await db().from("users").select("is_allowed").eq("id", userId).maybeSingle();
-  if (error) throw new Error(`User lookup failed: ${error.message}`);
-  return !!data?.is_allowed;
-}
+// The allowlist check lives in its own module so api-tokens.ts can use it
+// without importing this file; re-exported for the routes that import it here.
+export { isUserAllowed } from "./allowlist";

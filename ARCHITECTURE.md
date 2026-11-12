@@ -16,6 +16,7 @@ sign in.
 - [Features by subsystem](#features-by-subsystem)
 - [Pipeline](#pipeline)
 - [Data model](#data-model)
+- [State machines](#state-machines)
 - [Grok model blend](#grok-model-blend)
 - [Voice provider interface](#voice-provider-interface)
 - [Capacity and pruning](#capacity-and-pruning)
@@ -69,6 +70,7 @@ Repository map:
 | --- | --- |
 | `src/app/` | Pages, the dashboard (`dashboard.tsx`), the Voices and Assistants panels (`voice-settings.tsx`, `assistant-settings.tsx`), API routes under `api/`, OAuth sign-in for assistants under `oauth/` and `.well-known/` |
 | `src/lib/` | All the logic: `x.ts` (X API), `sync.ts`, `ingest.ts`, `brain.ts` (Grok prompts), `grok.ts`, `tts.ts`, `voice/` (providers), `capacity.ts`, `limits.ts`, `crypto.ts`, `session.ts`, and for assistants `mcp/` (the tools), `api-tokens.ts`, `oauth.ts`, `jobs.ts` (background briefs) and `digest.ts` (the four brief stages) |
+| `src/lib/state/` | The lifecycles as pure data and functions, one module each (`episode.ts`, `brief-job.ts`, `token.ts`, `pipeline.ts`), and under `ui/` the dashboard's and Assistants panel's flows. See [State machines](#state-machines) |
 | `src/proxy.ts` | The optional site-wide password gate, which leaves the assistant endpoints open |
 | `supabase/migrations/` | The database schema, the source of truth |
 | `scripts/` | `setup.mjs` (`npm run setup`), `community-notes-sync.mjs`, plus two maintenance scripts |
@@ -109,10 +111,13 @@ Repository map:
 
 ### Enrichment and taxonomy (`src/lib/brain.ts`)
 
-- Batches of 20 posts (3 batches concurrently) go through the FAST Grok model to tag topics, write a
-  one-sentence summary, extract up to 3 key claims, and classify `content_type` (news, evergreen,
-  opinion or other). The model sees the full dossier (post, quoted post, ingested article and media
-  content), not just the tweet text.
+- Batches of up to 20 posts (3 batches concurrently) go through the FAST Grok model to tag topics,
+  write a one-sentence summary, extract up to 3 key claims, and classify `content_type` (news,
+  evergreen, opinion or other). The model sees the full dossier (post, quoted post, ingested article
+  and media content), not just the tweet text.
+- A post whose analysis fails because of its own content is retried in a smaller batch and given up
+  after three attempts, so one bad post cannot keep the backlog from draining. See
+  [Bookmark pipeline](#bookmark-pipeline).
 - Topic tags strongly prefer reusing your existing taxonomy. A new tag is only coined when nothing
   fits, so the topic list stays navigable instead of exploding.
 
@@ -174,11 +179,13 @@ a brief on demand.
    immediately, with no analysis yet.
 2. **Ingest** (`ingestPending`). Up to 15 not-yet-ingested bookmarks per call: fetch linked
    articles, describe images, transcribe video. 3-way concurrent.
-3. **Enrich** (`enrichNewBookmarks`). Up to 60 ingested-but-unanalyzed bookmarks per call, batched
-   20 at a time through the FAST model for topics, summary, claims and content type.
+3. **Enrich** (`enrichNewBookmarks`). Up to 60 ingested-but-unanalyzed bookmarks per call, in at
+   most 12 model calls, batched up to 20 at a time through the FAST model for topics, summary, claims
+   and content type. Posts the analysis has given up on are skipped.
 
 The dashboard calls `/api/enrich` in a loop until `remaining` hits zero, updating the status line
-with a live count each pass. That is why sync feels instant and tags "fill in" a few seconds later
+with a live count each pass. A pass that moves nothing while work remains stops the loop with an
+error instead of repeating it. That is why sync feels instant and tags "fill in" a few seconds later
 instead of arriving as one long blocking request. Every call to X's bookmarks API and every Grok
 batch happens inside a request designed to finish well under the 300-second ceiling.
 
@@ -196,9 +203,10 @@ batch happens inside a request designed to finish well under the 300-second ceil
    `cursor / totalLines` progress bar.
 4. **`/api/digest/finalize`**. Downloads every chunk and concatenates them. Chunks share one CBR
    encoding (MP3, 44.1 kHz, 128 kbps) whichever provider rendered them, with per-clip ID3 and Xing
-   headers stripped, so byte concatenation is valid. Uploads the final `brief.mp3`, deletes the
-   chunk files, and flips the episode to `status: "ready"`. It first makes room in Storage if the
-   upload would pass the capacity ceiling.
+   headers stripped, so byte concatenation is valid. It first makes room in Storage if the upload
+   would pass the capacity ceiling, then uploads the final `brief.mp3`, flips the episode to
+   `status: "ready"`, and only then deletes the chunk files, so until the episode is published the
+   chunks are still there for a retry.
 
 Audio rendering is the slowest and most timeout-prone step, since it makes one TTS call per line of
 dialogue. So it is the one broken into the smallest chunks (12 lines) with the most granular
@@ -216,7 +224,7 @@ browser has no direct database access. Only the server's service-role client tou
 | Table or object | What it holds |
 | --- | --- |
 | `users` | One row per X account: handle, encrypted access and refresh tokens, `is_allowed` flag |
-| `bookmarks` | Raw synced posts (text, author, metrics, entities, media, quoted-post context, raw JSON), deduped by `(user_id, tweet_id)`, plus `hidden` and `ingested_at` |
+| `bookmarks` | Raw synced posts (text, author, metrics, entities, media, quoted-post context, raw JSON), deduped by `(user_id, tweet_id)`, plus `hidden`, `ingested_at` and `analysis_attempts` (failed analysis attempts) |
 | `bookmark_sources` | Ingested article, image and video content, one row per source, with a status of `ok`, `failed` or `skipped` |
 | `bookmark_analysis` | Topics, summary, claims, `content_type`, credibility (`none`, `disputed`, `misleading`) |
 | `topics` | The user's growing tag taxonomy |
@@ -234,6 +242,261 @@ browser has no direct database access. Only the server's service-role client tou
 | `prune_oauth_clients()` | Postgres function that deletes registrations unused after an hour and fully revoked ones after 30 days, and returns how many remain |
 | `evict_oauth_client()` | Postgres function that deletes the oldest registration with no live token, to make room at the 1,000-client ceiling |
 | Storage bucket `episodes` | The markdown and MP3 files themselves. Private, served to the browser via 24-hour signed URLs, and to assistants through stable links that mint a fresh one-hour URL on each visit |
+
+## State machines
+
+Each lifecycle in the app has one definition, in `src/lib/state/`. A state is a named value in a
+`const` array, not something implied by a flag, a nullable column or a bare string. The legal moves
+between states sit in one table beside it, and a pure function derives the state where it is inferred
+from several stored fields. So adding a state is a compile error in every switch and table that must
+handle it, and every legal move can be read in one place.
+
+These modules are pure: no database, no network, no React. The server, the client components and the
+tests all import the same vocabulary. They share one pattern: a `X_STATES` array with the type derived
+from it, an `X_TRANSITIONS` table with a `canMoveX` function, exhaustive `switch` statements that end
+in a `never` check, and, for the browser flows, a discriminated union keyed by `step` that only a pure
+reducer changes.
+
+| Machine | Models | Module | States | Stored in | Moved by |
+| --- | --- | --- | --- | --- | --- |
+| Episode status | Whether a brief is unfinished or published | `state/episode.ts` | `draft`, `ready`, `failed` (nothing writes `failed`) | `episodes.status` | `prepareBrief`, `finalizeBrief`, discard |
+| Digest stage | Where a podcast draft stands in being made | `state/episode.ts` | `none`, `needs_script`, `rendering`, `needs_finalize`, `ready` | Derived from `status`, `script` and the chunk files in Storage (`resumePointFor`) | `scriptBrief`, `renderChunk`, `finalizeBrief`, discard |
+| Audio availability | Whether an episode's MP3 can be played | `state/episode.ts` | `none`, `available`, `pruned` | Derived from `audio_path` and `audio_pruned_at` | `finalizeBrief`, capacity pruning |
+| Brief job | A background brief an assistant started | `state/brief-job.ts` | Status `queued`, `running`, `done`, `failed`; stage `queued`, `syncing`, `selecting`, `writing`, `scripting`, `rendering`, `publishing`, `done`, `failed` | `brief_jobs.status` and `brief_jobs.stage` | `claim_brief_job` and the runner in `jobs.ts` |
+| API token | Whether a token can be used or refreshed | `state/token.ts` | `active`, `expired`, `revoked` | Derived from `api_tokens.revoked_at` and `expires_at` | Time passing, an OAuth refresh, a revoke |
+| Bookmark pipeline | How far a bookmark has been processed | `state/pipeline.ts` | `synced`, `ingested`, `analysed`, `analysis_failed` | Derived from `bookmarks.ingested_at`, `bookmarks.analysis_attempts` and whether a `bookmark_analysis` row exists | `syncUser`, `ingestPending`, `enrichNewBookmarks`, the retry in `/api/enrich` |
+| Brief creation flow | The dashboard's "Create my brief" run | `state/ui/brief-flow.ts` | `idle`, `working` (stage `preparing`, `scripting`, `rendering` or `publishing`), `succeeded`, `failed` | In the browser | `briefFlowReducer`, driven by `brief-runner.ts` |
+| Resume banner | The offer to finish an interrupted draft | `state/ui/brief-flow.ts` | `none`, `available`, `discarding` | In the browser | `resumeBannerReducer` |
+| Sync flow | The "Check X for new" run | `state/ui/sync-flow.ts` | `idle`, `pulling`, `analyzing`, `done`, `failed` | In the browser | `syncReducer` |
+| List load | The bookmark list loading, with stale answers dropped | `state/ui/list-load.ts` | `loading`, `loaded`, `failed` | In the browser | `listLoadReducer` |
+| Free up space | The capacity banner's preview, confirm and prune | `state/ui/free-up.ts` | `idle`, `checking`, `confirm`, `pruning`, `done`, `empty`, `error` | In the browser | `freeUpReducer` |
+| Token create | Making a token and showing it once | `state/ui/token-panel.ts` | `closed`, `form`, `creating`, `revealed` | In the browser | `createReducer` |
+| Token revoke | Confirming and revoking a token | `state/ui/token-panel.ts` | `idle`, `confirming`, `revoking`, `error` | In the browser | `revokeReducer` |
+| Background preference | The "Stop background" toggle | `state/ui/background-pref.ts` | on, off | `localStorage` key `bb_bg` | `readBackgroundOn`, `writeBackgroundOn` |
+
+### Episode
+
+An episode has two layers. The row's `status` says whether it is unfinished (`draft`) or published
+(`ready`); the database also admits `failed`, but nothing writes it, because a brief that fails midway
+stays a `draft` so it can be resumed or discarded. The digest stage says where a draft stands, and it
+is derived rather than stored: `deriveDigestStage` reads the status, the script's length and the chunk
+files already in Storage, and `resumePointFor` in `src/lib/episodes.ts` is the one place that lists
+Storage to feed it. The status route (the dashboard's Resume banner) and the job runner both resume
+from it, so they always agree.
+
+```
+none            -> needs_script | ready     prepare (a podcast draft, or a markdown-only brief, ready at once)
+needs_script    -> rendering                script
+rendering       -> rendering | needs_finalize   render (one chunk per call)
+needs_finalize  -> ready                    finalize
+any draft stage -> none                     discard (the draft row and its files are deleted)
+ready           -> (nothing)
+```
+
+Resuming re-renders the last chunk on record rather than skipping it, because a chunk that was
+mid-upload when the run was cut off may be partial. A client can resume from the three stages in
+`RESUMABLE_STAGES`: `needs_script`, `rendering` and `needs_finalize`.
+
+- **Publish before cleanup.** `finalizeBrief` uploads `brief.mp3`, flips the row to `ready`, and only
+  then removes the chunk files. Until the row is published the chunks are the only copy a retry can
+  stitch from. A crash between the two leaves chunk files beside a published brief, which nothing
+  reads and which only take space.
+- **The script is write-once.** `scriptBrief` saves only onto a draft whose `script` is still null,
+  in one conditional update, so of two writers exactly one lands and the other returns the winner's
+  script. Chunks are matched to the script by line index alone, so a second script under the first's
+  chunks would publish mismatched audio.
+- **Discard and finalize are compare-and-set on `status`.** Both write only where the row is still a
+  `draft`, so when they race, exactly one decides the row's fate. A finalize that loses to a discard
+  removes the audio it uploaded; one that loses to another finalize returns the published episode.
+  The render cursor is a forward-only high-water mark in the same way.
+
+### Brief job
+
+`brief_jobs.status` is CHECK-constrained to four values. `brief_jobs.stage` is the finer position the
+runner reports, and each stage has a label, whether it needs an episode to exist (`scripting`,
+`rendering` and `publishing` do) and whether it is final.
+
+```
+status   queued -> running                  the first claim
+         running -> running                 a stale lease taken over by a new claim
+         running -> done | failed           the runner's outcome write
+
+stage    queued -> syncing (sync_first) | selecting
+         syncing -> selecting
+         selecting -> writing
+         writing -> scripting (a podcast) | done (a markdown-only brief)
+         scripting -> rendering | publishing
+         rendering -> publishing
+         publishing -> done
+         any stage that is not final -> failed
+```
+
+Besides these forward moves, a run cut off and claimed again writes its own stage again, goes back
+through `selecting` if it died in `writing` before recording an episode, and jumps forward to the
+episode's resume point (`scripting`, `rendering`, `publishing` or `done`, never back to an earlier audio
+stage) once the job carries an episode, since the user may have moved the draft on from the dashboard
+meanwhile. `BRIEF_JOB_STAGE_TRANSITIONS` lists every such move, and a move it does not list is logged.
+
+- **The lease.** `claim_brief_job` flips `queued` to `running`, or takes over a `running` job whose
+  heartbeat is older than the stale window, in one statement and with a fresh `lease_id`. Every write
+  the runner makes is filtered on that `lease_id`, so a runner that was taken over finds its next
+  write matching nothing and stops. See [Background brief jobs](#background-brief-jobs).
+- **An unlisted stage move is logged, never fatal.** Before each stage write the runner checks the
+  move against the table and logs `unexpected stage move` if it is not listed, then makes it anyway.
+  The table is a check on the runner, not a gate, so a bookkeeping gap cannot stop a job the user has
+  paid for.
+- **`next_action` is derived, not stored.** `briefJobOutlook` turns the job and its episode into what
+  an agent should do, and `get_brief_status` returns it with `stalled`, `note` and `episode_status`.
+  A `done` job is `read_episode`. A `failed` job is `read_episode` if its episode is `ready` (the
+  user finished it from the dashboard), `resume_in_dashboard` if the episode is still a `draft`, and
+  `start_again` if there is no episode. A `queued` or `running` job is `wait`, unless it has gone quiet
+  longer than the stale window (a running job by its heartbeat, a queued one by its creation time):
+  then a poll that restarted it still says `wait`, and a poll that could not restart it says
+  `use_write_token`. The tool description lists the actions from the same array, so a new one is
+  documented to agents without a second edit.
+
+### API token
+
+A token row has no status column. `tokenStatus` reads `revoked_at` and `expires_at`: `revoked` if the
+first is set, `expired` if the second has passed, otherwise `active`.
+
+```
+active  -> expired | revoked
+expired -> active | revoked     (an OAuth refresh rotates the row in place with a fresh expiry)
+revoked -> (nothing)
+```
+
+Two accepted sets say which states each reader allows: `BEARER_USABLE_STATUSES` (only `active`) for an
+API call or a slot under the per-user token ceiling, and `REFRESHABLE_STATUSES` (`active` and
+`expired`) for a refresh token, since refreshing an expired access token is what refreshing is for.
+Revocation is final: every revoke goes through `revokeTokenRows`, and each write is conditional on
+`revoked_at` still being null. Whether the owner is still allowed is a separate question, answered
+fresh by `isUserAllowed` in `src/lib/allowlist.ts`, because it can change back and a revocation never
+does.
+
+### Bookmark pipeline
+
+```
+synced -> ingested -> analysed
+          ingested -> analysis_failed
+analysis_failed -> ingested     (an explicit retry)
+analysed -> (nothing)
+```
+
+A bookmark is `synced` once stored and `ingested` once `ingested_at` is set. It is `analysed` once its
+`bookmark_analysis` row exists, which wins over every other fact. It is `analysis_failed` when it is
+ingested, has no analysis and `analysis_attempts` has reached `MAX_ANALYSIS_ATTEMPTS` (3).
+
+- **What charges an attempt.** `enrichNewBookmarks` charges every post in a batch when the model
+  answers with something that is not JSON or the provider refuses the request itself (HTTP 400, 413
+  or 422), and charges a post the model leaves out of an otherwise good answer. Outages, timeouts,
+  rate limits, authentication errors and 5xx answers charge nothing, so a provider outage cannot give
+  up on good posts. A post that gets its analysis row starts again from 0.
+- **Smaller batches.** Posts are grouped by how many attempts they have failed. A fresh post goes in
+  a batch of up to 20, a post on its second try in a batch of 5, and a post on its last try alone
+  (`analysisBatchSize`), so a post the model keeps failing on ends up by itself and stops taking
+  others down with it. Posts with the fewest attempts go first.
+- **Given up.** A post at the limit is skipped by the analysis pass, no longer counts in `remaining`
+  or in the sync's `pendingAnalysis`, and stays in the library without topics or a summary. The
+  bookmarks route flags it (`analysis_failed`) and counts the library's given-up posts as
+  `analysisFailed`; the dashboard shows a notice with a **Retry** button, and `search_bookmarks`
+  reports its `stage`.
+- **Retry.** `POST /api/enrich` with `{"retryFailed": true}` sets `analysis_attempts` back to 0 for
+  every post that has a failed attempt on record, then runs the usual chunk. The dashboard sends it
+  only on the first call of a retry, since repeating it would reset posts that just failed again.
+- **A chunk is bounded by calls as well as posts.** `PIPELINE_CHUNK` holds the shared sizes: 15
+  bookmarks ingested, and 60 analysed in at most 12 model calls. Smaller retry batches would
+  otherwise make a chunk of one-post calls too long for the request. Batches past the call limit are
+  not attempted, nothing is charged for them, and the next chunk takes them.
+- **The stall rule.** `pipelineProgress` reports `remaining` (the larger of the two backlogs) and
+  `stalled`, which is true when a chunk ingested nothing, analysed nothing and charged no attempt
+  while work remains. A charged attempt (`missed`) counts as progress, because a post can only be
+  charged three times before it leaves the backlog. Each driver reacts to `stalled` in its own way:
+  the dashboard stops and shows the user an error, `scripts/run-pipeline.ts` throws, and the job
+  runner logs it and carries on writing the brief with the bookmarks that are analysed.
+- **Without the column.** `analysis_attempts` arrives with a migration. `src/lib/analysis-attempts.ts`
+  checks whether it can be read, and where it cannot, nothing is counted, nothing is given up and a
+  failed batch stays pending. The check asks again on every call until it succeeds, so a running
+  server starts counting once the migration is applied.
+
+`bookmarkStage` runs in the app: the bookmarks route and `search_bookmarks` call it through `stageOf`
+and `isAnalysisFailed` in `src/lib/bookmarks.ts`. The transitions table and `canMoveBookmarkStage`
+are not called by the running app.
+
+### Browser-side flows
+
+The dashboard and the Assistants panel keep their multi-step interactions in reducers from
+`src/lib/state/ui/`, consumed with `useReducer`. Each flow is a discriminated union keyed by `step`,
+and a pure reducer is the only thing that changes it. An event that is illegal in the current state
+returns the same state object, so a response that arrives after the user moved on changes nothing.
+
+| Component | Reducers it uses |
+| --- | --- |
+| `src/app/dashboard.tsx` | `briefFlowReducer` and `resumeBannerReducer` (brief creation and the Resume banner), `syncReducer` (with its retry), `listLoadReducer`, `freeUpReducer`, and the `background-pref` helpers |
+| `src/app/assistant-settings.tsx` | `createReducer` and `revokeReducer` (the token panel) |
+
+The async drivers take their I/O as arguments, so the tests run them against fakes without a DOM or
+a network, and the dashboard passes its real fetch wrapper and a dispatch.
+
+`brief-runner.ts` drives a brief's audio stages (script, the render loop, finalize), shared by a
+fresh generation and a resumed one. It takes a `post` function, an `onStage` callback and, for
+resuming, a `getStatus` function. `sync-runner.ts` drives the analysis loop (`POST /api/enrich`, one
+chunk per call) for a sync once its pull lands and for **Retry**; it takes a `post` function and
+progress callbacks, and throws when `pipelineProgress` says the loop has stalled. Retry dispatches
+the sync flow's `retry` event, which goes straight to `analyzing` and skips the pull. It
+refuses to loop when a render response neither advances the cursor nor says it is done, and a resume
+reads the draft's stage from the server again first, since another tab or a background job may have
+finished it.
+
+### Adding a state
+
+1. Add the value to the module's `STATES` array (or the union, for a browser flow). The type follows
+   from it.
+2. Run `npx tsc --noEmit`. The compiler points at every exhaustive `switch` and every
+   `Record<State, ...>` table that must handle it.
+3. Add the state's row to the module's transitions table, with where it can go, and make sure some
+   state leads to it.
+4. Extend the matching `src/lib/__tests__/state-*.test.ts`. They enumerate every from and to pair, or
+   every step and event pair, so a new state fails them until its moves are decided.
+   The `state-conformance-*.test.ts` files (and the state block in `jobs.test.ts`) drive the real
+   functions and check every move they make against the tables, and every table entry is either
+   observed or named, with its reason, in the test's not-exercised list.
+5. If the state is stored in a column with a CHECK constraint (`episodes.status`,
+   `brief_jobs.status`, `brief_jobs.stage`), add a migration that replaces the constraint. Apply it
+   before the code that writes the new value is deployed, or the write is rejected.
+   `state-schema.test.ts` reads each constraint out of the migrations and fails if it lists
+   different values from its array.
+6. If agents see it, check the text they read. The `get_brief_status` description builds its stage and
+   `next_action` lists from `BRIEF_JOB_STAGES` and `BRIEF_JOB_NEXT_ACTIONS`, so a new value reaches it
+   on its own. The explanation of what each `next_action` means is a `Record` in
+   `src/lib/mcp/tools.ts` that the compiler makes complete, and [docs/MCP.md](docs/MCP.md) lists the
+   values for people and agents, so update it by hand.
+
+### Deliberately not modelled
+
+- **Capacity levels** (`src/lib/capacity.ts`): `ok`, `warn` and `critical` are recomputed from the
+  measured storage and database sizes on every call, and nothing is stored or moved between calls.
+- **Usage caps** (`src/lib/limits.ts`): `record_usage()` counts the rolling 24 hours of
+  `usage_events` on each call, so there is no state between calls to define.
+- **The voice preview player** (`src/app/voice-settings.tsx`): a small hook around one shared audio
+  element, an abort controller and a run counter that already discards late responses, with its
+  phases local to that element.
+- **The settings and token list loads**: each is one fetch per retry, aborted when superseded and
+  held as data (or null) plus an error, so there are no overlapping answers to reconcile. (The
+  bookmark list, whose requests do overlap, is the `list-load` flow.)
+- **Credibility flags** (`none`, `disputed`, `misleading`): a classification computed from a
+  bookmark's Community Notes when it is analysed, not a lifecycle that moves through steps.
+
+### Known limits
+
+- A job runner cut off after creating a draft but before recording its id on the job has no
+  `episode_id` to resume from, so it prepares again on the next claim.
+- The job lease fences writes to the job row, not to the episode, so the dashboard and a background
+  job can both work on one draft. The compare-and-set writes keep that from corrupting it, but a
+  chunk can be rendered twice.
+- The analysis attempt count is read, then written back as that value plus one, with no atomic
+  increment, so two overlapping passes can charge a post once instead of twice and cost it one
+  extra retry.
 
 ## Grok model blend
 
@@ -441,7 +704,7 @@ says what it costs, what its dates mean and that post text is content.
 | `list_topics` | read | The dashboard's topic chips with counts, for an optional date range. Names cut to 120 characters. |
 | `list_episodes` | read | Ready briefs, newest first, with stable `links`. Titles cut to 120 characters. |
 | `get_episode` | read | One ready brief, with its markdown (cut at 60,000 characters, with a `truncated` flag) and optionally the script. |
-| `get_brief_status` | read | A background job's status, stage and progress, or the newest job for an episode. With a write token it also restarts a stalled job and says so in `rescheduled`; a read-only token only gets the report, since restarting resumes paid work. |
+| `get_brief_status` | read | A background job's status, stage (with a plain-words `stage_label`) and progress, or the newest job for an episode, plus `stalled`, `next_action`, `note` and `episode_status` (see [Background brief jobs](#background-brief-jobs)). With a write token it also restarts a stalled job and says so in `rescheduled`; a read-only token only gets the report, since restarting resumes paid work. |
 | `generate_brief` | write | Validates like the prepare route, runs the free selection check (an empty match answers at once and spends nothing), queues a job and returns a `job_id`. |
 | `hide_bookmark` | write | The same update as `POST /api/bookmarks/hide`. |
 
@@ -486,16 +749,18 @@ around them, with the same guards and caps), and `src/lib/jobs.ts` drives them o
   brief was revoked" or "This account can no longer use this server", so revoking a token stops the
   briefs it started too.
 - **Resume from persisted state.** A re-claimed job works out where to continue from the episode,
-  the way the dashboard's Resume banner does (`deriveDigestStage`). No script yet means write one.
+  the way the dashboard's Resume banner does (`resumePointFor`, which applies `deriveDigestStage`). No
+  script yet means write one.
   Some chunks rendered means continue from the last one. All chunks rendered means finalize. So it
   never pays twice for a script or a chunk that landed. A run cut off after syncing does not sync
   again, and a job whose draft was discarded fails instead of starting, and billing, a new brief.
   One window remains: a job that dies between the Grok writing pass and the episode insert pays for
   that pass again, a gap of a few hundred milliseconds.
-- **Stages and status.** `syncing` (only with `sync_first`), `selecting`, `writing`, `scripting`,
-  `rendering`, `publishing`, then `done` or `failed`. A failed job carries the same public message the
-  `/api/digest/*` routes would show, and leaves the episode as a `draft` for the dashboard's Resume
-  banner. `brief_jobs.token_id` records which token started a job and has no foreign key, so a job
+- **Stages and status.** A job starts at `queued`, then moves through `syncing` (only with
+  `sync_first`), `selecting`, `writing`, `scripting`, `rendering` and `publishing`, and ends at `done`
+  or `failed`. A failed job carries the same public message the `/api/digest/*` routes would show, and
+  leaves the episode as a `draft` for the dashboard's Resume banner. A status report also says what to
+  do next; see [State machines](#state-machines). `brief_jobs.token_id` records which token started a job and has no foreign key, so a job
   record outlives a revoked token.
 - **Dashboard interplay.** A job works on its own episode row, so it never collides with a brief
   generated in a tab. A job that is mid-render shows up as a draft in the Resume banner.
@@ -631,6 +896,14 @@ article and video ingestion, MP3 header stripping and stitching, TTS chunking, v
 resolution, listing and error mapping, per-user voice settings, capacity and pruning arithmetic, the
 prepare, render and finalize routes, episode shaping, dashboard text, and the setup script's
 parsing and migration logic.
+
+The lifecycles in [State machines](#state-machines) have one test file each, `state-*.test.ts`, which
+enumerate every from and to pair of the transitions tables and every step and event pair of the
+browser reducers, so a state added without deciding its moves fails them. `state-schema.test.ts`
+reads the CHECK constraint of each lifecycle column (`episodes.status`, `brief_jobs.status` and
+`brief_jobs.stage`) from the migrations and proves it allows exactly the values of its array.
+Conformance tests drive the real stage, token, job and pipeline functions against the fake database and
+check every move they make against the tables, and every table entry is either observed or named, with its reason, in the test's not-exercised list.
 
 The connector has its own tests: tokens, the tools against the fake database, the OAuth endpoints, the
 job runner (the lease, resuming, failures) and the proxy's open paths. One drives a real MCP

@@ -2,8 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/lib/supabase";
 import { getSessionUserId } from "@/lib/session";
 import { apiError } from "@/lib/errors";
-import { deriveDigestStage, episodeBasePath, listChunkStarts, deleteEpisodeFolder } from "@/lib/episodes";
-import type { DigestStage } from "@/lib/episodes";
+import { deleteEpisodeFolder, episodeBasePath, resumePointFor } from "@/lib/episodes";
+import { EPISODE_STATUS } from "@/lib/state/episode";
+import type { DigestStage } from "@/lib/state/episode";
 
 export const maxDuration = 30;
 
@@ -56,7 +57,7 @@ async function loadEpisode(userId: string, episodeId: string | null): Promise<Ep
     .from("episodes")
     .select(columns)
     .eq("user_id", userId)
-    .eq("status", "draft")
+    .eq("status", EPISODE_STATUS.draft)
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -68,20 +69,7 @@ async function buildStatus(userId: string, episodeId: string | null): Promise<St
   const episode = await loadEpisode(userId, episodeId);
   if (!episode) return null;
 
-  const scriptLength = Array.isArray(episode.script) ? episode.script.length : 0;
-
-  // Only worth listing storage when there's a script to check chunk progress
-  // against, and the episode isn't already finalized.
-  const chunkStarts =
-    episode.status !== "ready" && scriptLength > 0 && episode.markdown_path
-      ? await listChunkStarts(episodeBasePath(episode.markdown_path))
-      : [];
-
-  const { stage, totalLines, nextCursor } = deriveDigestStage({
-    status: episode.status,
-    scriptLength,
-    chunkStarts,
-  });
+  const { stage, totalLines, nextCursor } = await resumePointFor(episode);
 
   return {
     episodeId: episode.id,
@@ -144,31 +132,38 @@ export async function DELETE(req: NextRequest) {
   if (!episodeId) return NextResponse.json({ error: "episodeId required" }, { status: 400 });
 
   try {
-    const { data: episode, error } = await db()
-      .from("episodes")
-      .select("id, status, markdown_path, audio_path")
-      .eq("user_id", userId)
-      .eq("id", episodeId)
-      .maybeSingle();
-    if (error) throw new Error(`Episode lookup failed: ${error.message}`);
-    if (!episode) return NextResponse.json({ error: "Episode not found" }, { status: 404 });
-    if (episode.status !== "draft") {
-      return NextResponse.json({ error: "Only draft episodes can be discarded" }, { status: 400 });
-    }
-
-    if (episode.markdown_path) {
-      await deleteEpisodeFolder(episodeBasePath(episode.markdown_path), [
-        episode.markdown_path,
-        episode.audio_path,
-      ]);
-    }
-
-    const { error: delErr } = await db()
+    // The row goes first, in one statement filtered on draft: a finalize that publishes the episode
+    // between a lookup and a delete can no longer lose its finished brief to a discard. Only a row this
+    // call actually deleted has its files removed.
+    const { data: deleted, error: delErr } = await db()
       .from("episodes")
       .delete()
       .eq("user_id", userId)
-      .eq("id", episodeId);
+      .eq("id", episodeId)
+      .eq("status", EPISODE_STATUS.draft)
+      .select("markdown_path, audio_path")
+      .maybeSingle();
     if (delErr) throw new Error(`Episode delete failed: ${delErr.message}`);
+
+    if (!deleted) {
+      // Nothing deleted: answer as before, from what is there.
+      const { data: episode, error } = await db()
+        .from("episodes")
+        .select("id, status")
+        .eq("user_id", userId)
+        .eq("id", episodeId)
+        .maybeSingle();
+      if (error) throw new Error(`Episode lookup failed: ${error.message}`);
+      if (!episode) return NextResponse.json({ error: "Episode not found" }, { status: 404 });
+      return NextResponse.json({ error: "Only draft episodes can be discarded" }, { status: 400 });
+    }
+
+    if (deleted.markdown_path) {
+      await deleteEpisodeFolder(episodeBasePath(deleted.markdown_path), [
+        deleted.markdown_path,
+        deleted.audio_path,
+      ]);
+    }
 
     return NextResponse.json({ deleted: true });
   } catch (err) {

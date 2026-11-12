@@ -433,6 +433,17 @@ async function ingestOne(
   return rows;
 }
 
+/** Stamps a bookmark ingested. Only a stamp that stuck counts as done, so `remaining` stays truthful and the next chunk retries the rest. */
+async function markIngested(userId: string, tweetId: string): Promise<boolean> {
+  const { error } = await db()
+    .from("bookmarks")
+    .update({ ingested_at: new Date().toISOString() })
+    .eq("user_id", userId)
+    .eq("tweet_id", tweetId);
+  if (error) console.error(`Ingest failed for ${tweetId}: could not mark ingested:`, error.message);
+  return !error;
+}
+
 /** Ingests source material for bookmarks not yet processed. Client loops on remaining. */
 export async function ingestPending(
   userId: string,
@@ -466,21 +477,11 @@ export async function ingestPending(
             const { error } = await db().from("bookmark_sources").upsert(rows);
             if (error) throw new Error(error.message);
           }
-          await db()
-            .from("bookmarks")
-            .update({ ingested_at: new Date().toISOString() })
-            .eq("user_id", userId)
-            .eq("tweet_id", b.tweet_id);
-          done++;
+          if (await markIngested(userId, b.tweet_id)) done++;
         } catch (err) {
           console.error(`Ingest failed for ${b.tweet_id}:`, err);
           // Mark done anyway — a permanently broken link shouldn't wedge the pipeline
-          await db()
-            .from("bookmarks")
-            .update({ ingested_at: new Date().toISOString() })
-            .eq("user_id", userId)
-            .eq("tweet_id", b.tweet_id);
-          done++;
+          if (await markIngested(userId, b.tweet_id)) done++;
         }
       }
     })

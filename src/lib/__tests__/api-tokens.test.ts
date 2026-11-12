@@ -17,6 +17,7 @@ import {
   revokeApiToken,
   revokeClientTokens,
   revokeReusedRefreshToken,
+  revokeTokenRows,
   rotateOAuthToken,
   verifyApiToken,
 } from "@/lib/api-tokens";
@@ -232,6 +233,57 @@ describe("listApiTokens / countActiveApiTokens / revokeApiToken", () => {
     expect(await revokeApiToken("u2", theirs.record.id)).toBe(true);
     expect(await revokeApiToken("u2", theirs.record.id)).toBe(false); // already revoked
     expect(await revokeApiToken("u2", "00000000-0000-4000-8000-000000000000")).toBe(false);
+  });
+
+  it("leaves one client's tokens out of the count when asked, and keeps dashboard tokens in", async () => {
+    const CLIENT = "c".repeat(43);
+    await mintApiToken("u1", { name: "dashboard", scopes: ["read"] });
+    await mintOAuthToken("u1", { clientId: CLIENT, name: "Claude", scopes: ["read"], expiresInDays: 30 });
+    await mintOAuthToken("u1", { clientId: "d".repeat(43), name: "Other", scopes: ["read"], expiresInDays: 30 });
+    expect(await countActiveApiTokens("u1")).toBe(3);
+    expect(await countActiveApiTokens("u1", { exceptClientId: CLIENT })).toBe(2);
+    expect(await countActiveApiTokens("u1", { exceptClientId: "e".repeat(43) })).toBe(3);
+  });
+});
+
+describe("revokeTokenRows", () => {
+  it("revokes only unrevoked matching rows and keeps the first revocation time", async () => {
+    const a = await mintApiToken("u1", { name: "a", scopes: ["read"] });
+    const b = await mintApiToken("u1", { name: "b", scopes: ["read"] });
+    expect(await revokeTokenRows({ id: a.record.id })).toEqual({ revokedIds: [a.record.id], error: null });
+    vi.setSystemTime(T0.getTime() + DAY);
+    expect(await revokeTokenRows({ id: a.record.id })).toEqual({ revokedIds: [], error: null });
+    expect(rowFor(a.record.id).revoked_at).toBe(T0.toISOString());
+    expect(rowFor(b.record.id).revoked_at).toBeUndefined();
+  });
+
+  it("refuses a match that would cover the whole table", async () => {
+    await mintApiToken("u1", { name: "a", scopes: ["read"] });
+    await expect(revokeTokenRows({} as never)).rejects.toThrow(/needs a non-empty id/);
+    await expect(revokeTokenRows({ id: "" })).rejects.toThrow(/needs a non-empty id/);
+    expect(rows().every((r) => r.revoked_at === undefined)).toBe(true);
+  });
+});
+
+describe("owner lookup", () => {
+  it("keeps the 'Token owner lookup failed' message when the users table can't be asked", async () => {
+    const { token } = await mintApiToken("u1", { name: "Grok", scopes: ["read"] });
+    const { refreshToken } = await mintOAuthToken("u1", {
+      clientId: "c".repeat(43),
+      name: "Claude",
+      scopes: ["read"],
+      expiresInDays: 30,
+    });
+    const realFrom = fake.from.bind(fake);
+    vi.spyOn(fake, "from").mockImplementation((table) =>
+      table === "users"
+        ? Object.assign(realFrom(table), {
+            maybeSingle: () => Promise.resolve({ data: null, error: { message: "connection refused" } }),
+          })
+        : realFrom(table)
+    );
+    await expect(verifyApiToken(token)).rejects.toThrow(/^Token owner lookup failed: connection refused$/);
+    await expect(findRefreshGrant(refreshToken)).rejects.toThrow(/^Token owner lookup failed: connection refused$/);
   });
 });
 

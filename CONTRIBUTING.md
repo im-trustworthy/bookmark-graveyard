@@ -22,7 +22,9 @@ npm run dev                    # http://localhost:3000
 This is Next.js 16, which has breaking changes from older versions. Before you touch framework-level
 code, read the matching guide in `node_modules/next/dist/docs/` (see [AGENTS.md](AGENTS.md)).
 
-A map of the code and the pipeline is in [ARCHITECTURE.md](ARCHITECTURE.md).
+A map of the code and the pipeline is in [ARCHITECTURE.md](ARCHITECTURE.md). Where a brief, a job, a
+token or a bookmark is in its lifecycle is defined in `src/lib/state/`; see its
+[State machines](ARCHITECTURE.md#state-machines) section before adding a state.
 
 ## Checks to run before you open a pull request
 

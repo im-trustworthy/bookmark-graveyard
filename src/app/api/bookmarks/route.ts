@@ -6,6 +6,7 @@ import {
   countLibrary,
   filterByDateRange,
   filterByTopics,
+  isAnalysisFailed,
   loadBookmarkRows,
   topicCounts,
 } from "@/lib/bookmarks";
@@ -55,10 +56,13 @@ export async function GET(req: NextRequest) {
   const total = await countLibrary(userId);
 
   return NextResponse.json({
-    bookmarks: rows,
+    bookmarks: rows.map((row) => ({ ...row, analysis_failed: isAnalysisFailed(row) })),
     topics: chips,
     // Non-hidden posts the user could reach by widening the filters ("Showing X of Y")
     library: loaded.length,
     total,
+    // Posts the analysis pass gave up on, over the whole loaded library rather than this view, so the
+    // dashboard can offer one retry for all of them.
+    analysisFailed: loaded.filter(isAnalysisFailed).length,
   });
 }

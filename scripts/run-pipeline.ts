@@ -16,6 +16,7 @@ async function main() {
   const { syncUser } = await import("../src/lib/sync");
   const { ingestPending } = await import("../src/lib/ingest");
   const { enrichNewBookmarks } = await import("../src/lib/brain");
+  const { PIPELINE_CHUNK, pipelineProgress } = await import("../src/lib/state/pipeline");
 
   const { data: users } = await db().from("users").select("id, handle").eq("is_allowed", true);
   if (!users?.length) throw new Error("No users in DB");
@@ -35,14 +36,20 @@ async function main() {
 
     let round = 0;
     for (;;) {
-      const ingest = await ingestPending(user.id, 15);
-      const enrich = await enrichNewBookmarks(user.id, 60);
-      const remaining = Math.max(ingest.remaining, enrich.remaining);
+      const ingest = await ingestPending(user.id, PIPELINE_CHUNK.ingest);
+      const enrich = await enrichNewBookmarks(user.id, PIPELINE_CHUNK.enrich, PIPELINE_CHUNK.enrichCalls);
+      const { remaining, stalled } = pipelineProgress({
+        ingested: ingest.ingested,
+        enriched: enrich.enriched,
+        missed: enrich.missed,
+        ingestRemaining: ingest.remaining,
+        enrichRemaining: enrich.remaining,
+      });
       console.log(
-        `  round ${++round}: ingested=${ingest.ingested} enriched=${enrich.enriched} remaining=${remaining}`
+        `  round ${++round}: ingested=${ingest.ingested} enriched=${enrich.enriched} missed=${enrich.missed} remaining=${remaining}`
       );
       if (remaining === 0) break;
-      if (!ingest.ingested && !enrich.enriched) throw new Error("Pipeline stalled");
+      if (stalled) throw new Error("Pipeline stalled");
     }
 
     const { data: sourceStats } = await db()

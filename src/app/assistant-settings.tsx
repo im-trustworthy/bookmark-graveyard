@@ -1,7 +1,24 @@
 "use client";
 
-import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import type { FormEvent, ReactNode, RefObject } from "react";
+import { isExpired, tokenStatus } from "@/lib/state/token";
+import {
+  CREATE_CLOSED,
+  REVOKE_IDLE,
+  canClosePanel,
+  canSubmitCreate,
+  confirmingId,
+  createError,
+  createReducer,
+  isCreating,
+  isPanelOpen,
+  isRevokeBusy,
+  isRevokingToken,
+  revealedToken,
+  revokeErrorFor,
+  revokeReducer,
+} from "@/lib/state/ui/token-panel";
 
 // The Assistants panel: the MCP connector URL and the personal access tokens an
 // AI assistant uses to reach this account. Talks only to the same-origin
@@ -153,8 +170,6 @@ const subscribeNever = () => () => {};
 const getOrigin = () => window.location.origin;
 const getServerOrigin = () => "";
 
-const isExpired = (t: TokenRecord, now: number) => !!t.expires_at && Date.parse(t.expires_at) <= now;
-
 function formatDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return "unknown date";
@@ -167,7 +182,7 @@ function describeToken(t: TokenRecord, now: number): string {
   const used = t.last_used_at ? `Last used ${formatDate(t.last_used_at)}` : "Never used";
   const expiry = !t.expires_at
     ? "No expiry"
-    : isExpired(t, now)
+    : isExpired(t.expires_at, now)
       ? `Expired ${formatDate(t.expires_at)}`
       : `Expires ${formatDate(t.expires_at)}`;
   return [scope, `Created ${formatDate(t.created_at)}`, used, expiry].join(" · ");
@@ -280,24 +295,20 @@ export default function AssistantSettings() {
   const revealCopyRef = useRef<HTMLButtonElement | null>(null);
   const keepRef = useRef<HTMLButtonElement | null>(null);
   // Where focus goes after the next render that removes the focused control.
-  const pendingFocus = useRef<"toggle" | "list" | "name" | "reveal" | `revoke:${string}` | null>(null);
+  const pendingFocus = useRef<"toggle" | "list" | "name" | `revoke:${string}` | null>(null);
 
   const [tokens, setTokens] = useState<TokenRecord[] | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const [now, setNow] = useState(() => Date.now()); // refreshed on each load and change, for expiry labels
 
-  const [open, setOpen] = useState(false);
+  // The create flow and the revoke flow are state machines (src/lib/state/ui/token-panel.ts);
+  // what remains here is the form's field values.
+  const [create, dispatchCreate] = useReducer(createReducer, CREATE_CLOSED);
+  const [revokeState, dispatchRevoke] = useReducer(revokeReducer, REVOKE_IDLE);
   const [name, setName] = useState("");
   const [scope, setScope] = useState<Scope>("read");
   const [expires, setExpires] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [createError, setCreateError] = useState<string | null>(null);
-  const [revealed, setRevealed] = useState<{ token: string; name: string } | null>(null);
-
-  const [confirming, setConfirming] = useState<string | null>(null);
-  const [revoking, setRevoking] = useState<string | null>(null);
-  const [revokeError, setRevokeError] = useState<{ id: string; message: string } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
   // Load the token list once (and again on Retry) so the collapsed summary is accurate.
@@ -333,19 +344,29 @@ export default function AssistantSettings() {
     if (target === "toggle") toggleRef.current?.focus();
     else if (target === "list") listHeadingRef.current?.focus();
     else if (target === "name") nameRef.current?.focus();
-    else if (target === "reveal") revealCopyRef.current?.focus();
     else document.getElementById(`${uid}-revoke-${target.slice("revoke:".length)}`)?.focus();
   });
+
+  const open = isPanelOpen(create);
+  const creating = isCreating(create);
+  const revealed = revealedToken(create);
+  const confirming = confirmingId(revokeState);
 
   // The "Keep" button is the safe default while a revoke is being confirmed.
   useEffect(() => {
     if (confirming) keepRef.current?.focus();
   }, [confirming]);
 
+  // A new token's Copy button takes focus when the reveal appears; the form it replaces held it.
+  const showingReveal = revealed !== null;
+  useEffect(() => {
+    if (showingReveal) revealCopyRef.current?.focus();
+  }, [showingReveal]);
+
   // --- Derived state -------------------------------------------------------
 
-  const shown = (tokens ?? []).filter((t) => !t.revoked_at);
-  const live = shown.filter((t) => !isExpired(t, now));
+  const shown = (tokens ?? []).filter((t) => tokenStatus(t, now) !== "revoked");
+  const live = shown.filter((t) => tokenStatus(t, now) === "active");
   const connectorUrl = `${origin}/api/mcp`;
   const trimmedName = name.trim();
 
@@ -354,26 +375,23 @@ export default function AssistantSettings() {
   function openPanel() {
     setNotice(null);
     setNow(Date.now());
-    setOpen(true);
+    dispatchCreate({ type: "open" });
   }
 
   function closePanel() {
-    setOpen(false);
-    setRevealed(null); // the plaintext goes with the panel
+    if (!canClosePanel(create)) return; // a create in flight would answer into a closed panel
+    dispatchCreate({ type: "close" }); // the plaintext goes with the panel
+    dispatchRevoke({ type: "reset" });
     setName("");
     setScope("read");
     setExpires(false);
-    setCreateError(null);
-    setConfirming(null);
-    setRevokeError(null);
     pendingFocus.current = "toggle";
   }
 
   async function onCreate(e: FormEvent<HTMLFormElement>) {
     e.preventDefault();
-    if (creating || !trimmedName) return;
-    setCreating(true);
-    setCreateError(null);
+    if (!canSubmitCreate(create) || !trimmedName) return;
+    dispatchCreate({ type: "submit" });
     try {
       const { token, record } = await createToken({
         name: trimmedName,
@@ -382,50 +400,45 @@ export default function AssistantSettings() {
       });
       setTokens((prev) => [record, ...(prev ?? []).filter((t) => t.id !== record.id)]);
       setNow(Date.now());
-      setRevealed({ token, name: record.name });
-      setName("");
-      setScope("read");
-      setExpires(false);
-      pendingFocus.current = "reveal";
+      // The token exists server-side whatever the panel is doing now, so the list always gets it;
+      // the reducer reveals the plaintext only if this create is still the one in flight.
+      dispatchCreate({ type: "created", token, name: record.name });
     } catch (err) {
-      setCreateError(messageOf(err, "Couldn't create the token."));
-    } finally {
-      setCreating(false);
+      dispatchCreate({ type: "failed", message: messageOf(err, "Couldn't create the token.") });
     }
   }
 
   function dismissReveal() {
-    setRevealed(null);
+    dispatchCreate({ type: "dismissReveal" });
+    setName("");
+    setScope("read");
+    setExpires(false);
     pendingFocus.current = "name";
   }
 
   function askRevoke(id: string) {
-    setRevokeError(null);
-    setConfirming(id);
+    dispatchRevoke({ type: "ask", id });
   }
 
   function keepToken(id: string) {
-    setConfirming(null);
+    dispatchRevoke({ type: "cancel" });
     pendingFocus.current = `revoke:${id}`;
   }
 
   async function revoke(token: TokenRecord) {
-    if (revoking) return;
-    setRevoking(token.id);
-    setRevokeError(null);
+    if (isRevokeBusy(revokeState)) return;
+    dispatchRevoke({ type: "confirm" });
     try {
       await requestJson(`/api/tokens/${encodeURIComponent(token.id)}`, "DELETE");
     } catch (err) {
       // 404: already revoked elsewhere (another tab) — the outcome the person wanted.
       if (!(err instanceof RequestError && err.status === 404)) {
-        setRevokeError({ id: token.id, message: messageOf(err, "Couldn't revoke the token.") });
-        setRevoking(null);
+        dispatchRevoke({ type: "failed", id: token.id, message: messageOf(err, "Couldn't revoke the token.") });
         return;
       }
     }
     setTokens((prev) => (prev ?? []).filter((t) => t.id !== token.id));
-    setConfirming(null);
-    setRevoking(null);
+    dispatchRevoke({ type: "revoked", id: token.id });
     setNotice(`Revoked “${token.name}”. Assistants using it are cut off.`);
     pendingFocus.current = "list";
   }
@@ -461,6 +474,7 @@ export default function AssistantSettings() {
             type="button"
             onClick={open ? closePanel : openPanel}
             aria-expanded={open}
+            disabled={!canClosePanel(create)}
             className={`${secondaryButton} shrink-0`}
           >
             {open ? "Close" : live.length > 0 ? "Manage" : "Set up"}
@@ -516,8 +530,8 @@ export default function AssistantSettings() {
               <ul aria-labelledby={listHeadingId} className="space-y-2">
                 {shown.map((t) => {
                   const asking = confirming === t.id;
-                  const busy = revoking === t.id;
-                  const expired = isExpired(t, now);
+                  const busy = isRevokingToken(revokeState, t.id);
+                  const expired = isExpired(t.expires_at, now);
                   return (
                     <li
                       key={t.id}
@@ -548,7 +562,7 @@ export default function AssistantSettings() {
                             id={`${uid}-revoke-${t.id}`}
                             type="button"
                             onClick={() => askRevoke(t.id)}
-                            disabled={revoking !== null}
+                            disabled={isRevokeBusy(revokeState)}
                             aria-label={`Revoke ${t.name}`}
                             className={`${secondaryButton} shrink-0`}
                           >
@@ -584,7 +598,7 @@ export default function AssistantSettings() {
                           </button>
                         </div>
                       )}
-                      <Live tone="error">{revokeError?.id === t.id ? revokeError.message : null}</Live>
+                      <Live tone="error">{revokeErrorFor(revokeState, t.id)}</Live>
                     </li>
                   );
                 })}
@@ -698,7 +712,7 @@ export default function AssistantSettings() {
                 <button type="submit" disabled={creating || !trimmedName} className={primaryButton}>
                   {creating ? "Creating…" : "Create token"}
                 </button>
-                <Live tone="error">{createError}</Live>
+                <Live tone="error">{createError(create)}</Live>
               </div>
             </form>
           )}

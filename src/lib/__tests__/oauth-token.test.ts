@@ -20,7 +20,7 @@ const state = vi.hoisted(() => ({ db: null as unknown }));
 vi.mock("@/lib/supabase", () => ({ db: () => state.db }));
 
 import { OPTIONS, POST } from "@/app/oauth/token/route";
-import { verifyApiToken } from "@/lib/api-tokens";
+import { countActiveApiTokens, verifyApiToken } from "@/lib/api-tokens";
 import type { ApiScope } from "@/lib/api-tokens";
 import { issueAuthorizationCode } from "@/lib/oauth";
 
@@ -338,6 +338,49 @@ describe("grant_type=authorization_code", () => {
     const again = await newCode();
     expect((await token(exchangeFields(again.code, again.verifier))).status).toBe(200);
     expect(tokens().find((t) => t.id === "live-0")!.revoked_at).toBe(T0.toISOString());
+  });
+
+  // The ceiling is decided before this client's tokens are revoked, counting what will remain.
+  const elsewhere = (count: number) =>
+    Array.from({ length: count }, (_, i) => ({
+      id: `elsewhere-${i}`,
+      user_id: USER_ID,
+      client_id: i % 2 ? OTHER_CLIENT_ID : null,
+      revoked_at: null,
+      expires_at: null,
+    }));
+
+  it("at the ceiling with this client's own live token, replaces it and stays at the ceiling", async () => {
+    const first = await connect();
+    fake.tables.api_tokens.push(...elsewhere(24));
+    expect(await countActiveApiTokens(USER_ID)).toBe(25);
+
+    vi.setSystemTime(T0.getTime() + MINUTE);
+    const second = await connect();
+    expect(await verifyApiToken(first.access_token)).toBeNull();
+    expect(await verifyApiToken(second.access_token)).toMatchObject({ userId: USER_ID });
+    expect(await countActiveApiTokens(USER_ID)).toBe(25);
+  });
+
+  it("at the ceiling with only other tokens, refuses without revoking this client's refreshable connection", async () => {
+    const first = await connect();
+    // Its access token has expired, so it doesn't count, but its refresh token still works.
+    vi.setSystemTime(T0.getTime() + 31 * DAY);
+    fake.tables.api_tokens.push(...elsewhere(25));
+    const { code, verifier } = await newCode();
+    const { status, json } = await read(await token(exchangeFields(code, verifier)));
+    expect(status).toBe(400);
+    expect(json.error_description).toBe(
+      "This account already has the maximum number of active tokens; revoke one in the Assistants panel"
+    );
+    const mine = tokens().filter((t) => t.client_id === CLIENT_ID);
+    expect(mine).toHaveLength(1);
+    expect(mine[0].revoked_at ?? null).toBeNull();
+
+    const refreshed = await read(
+      await token({ grant_type: "refresh_token", refresh_token: first.refresh_token, client_id: CLIENT_ID })
+    );
+    expect(refreshed.status).toBe(200);
   });
 
   it("prunes codes that expired more than a day ago", async () => {

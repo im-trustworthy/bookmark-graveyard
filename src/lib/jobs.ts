@@ -1,15 +1,27 @@
 import "server-only";
 import { after } from "next/server";
 import { db } from "./supabase";
-import { isExpired } from "./api-tokens";
+import { isUserAllowed } from "./allowlist";
 import { enrichNewBookmarks, selectBookmarksForDigest } from "./brain";
 import { CapacityError } from "./capacity";
 import { DigestStageError, finalizeBrief, prepareBrief, renderChunk, scriptBrief, validatePrepareInput } from "./digest";
 import type { PrepareRequest, SignedEpisode } from "./digest";
 import { appUrl } from "./env";
-import { deriveDigestStage, episodeBasePath, listChunkStarts } from "./episodes";
+import { resumePointFor } from "./episodes";
 import { ingestPending } from "./ingest";
 import { checkUsage, UsageLimitError } from "./limits";
+import {
+  BRIEF_JOB_STAGE_INFO,
+  BRIEF_JOB_STAGES,
+  briefJobOutlook,
+  briefJobStalled,
+  canMoveBriefJobStage,
+  isBriefJobStage,
+} from "./state/brief-job";
+import type { BriefJobNextAction, BriefJobStage, BriefJobState } from "./state/brief-job";
+import { audioAvailability, EPISODE_STATUS } from "./state/episode";
+import { PIPELINE_CHUNK, pipelineProgress } from "./state/pipeline";
+import { BEARER_USABLE_STATUSES, tokenStatusIn } from "./state/token";
 import { syncUser } from "./sync";
 import { InvalidVoiceKeyError, VoiceConfigError, VoiceVendorError } from "./voice";
 
@@ -32,19 +44,11 @@ import { InvalidVoiceKeyError, VoiceConfigError, VoiceVendorError } from "./voic
 // Before each paid step (sync, prepare, script, every rendered chunk, finalize) the runner also checks
 // that the token which started the job is still live and the user still allowed, so revoking a token in
 // the Assistants panel, or taking someone off the allowlist, stops their running briefs too.
+//
+// The states, stages and their legal moves live in src/lib/state/brief-job.ts; the types are re-exported
+// here so existing imports keep working.
 
-export type BriefJobState = "queued" | "running" | "done" | "failed";
-
-export type BriefJobStage =
-  | "queued"
-  | "syncing"
-  | "selecting"
-  | "writing"
-  | "scripting"
-  | "rendering"
-  | "publishing"
-  | "done"
-  | "failed";
+export type { BriefJobStage, BriefJobState };
 
 /** A validated generate request, as stored in `brief_jobs.params`. */
 export interface BriefJobParams extends PrepareRequest {
@@ -79,11 +83,24 @@ export interface BriefJobStatus {
   progress: { rendered_lines: number; total_lines: number };
   episode_id: string | null;
   title: string | null;
-  /** Stable links to the finished brief, only once the job is done; `audio` is null without audio. */
+  /**
+   * Stable links to the brief whenever its episode is ready (so also for a failed job whose draft the
+   * user finished later); `audio` is null without playable audio (markdown-only, or pruned).
+   */
   links: { markdown: string; audio: string | null } | null;
   error: string | null;
   started_at: string | null;
   finished_at: string | null;
+  /** The stage in words, for the agent to pass on. */
+  stage_label: string;
+  /** A queued or running job that has gone quiet longer than the stale window. */
+  stalled: boolean;
+  /** What the agent should do next (see briefJobOutlook). */
+  next_action: BriefJobNextAction;
+  /** A sentence explaining an outcome the other fields don't, or null. */
+  note: string | null;
+  /** The status of the episode the job drives; null when it has none. */
+  episode_status: "draft" | "ready" | null;
 }
 
 export const DEFAULT_BRIEF_JOB_STALE_SECONDS = 90;
@@ -172,6 +189,12 @@ class JobAccessError extends Error {
   }
 }
 
+/** What a job reports when the draft it drives was discarded from the dashboard before it finished. */
+const DRAFT_DISCARDED_MESSAGE = "This brief's draft was discarded before it finished";
+
+/** What a job reports when the episode it drives is in a state no stage will act on. */
+const DRAFT_UNFINISHABLE_MESSAGE = "This brief's draft can no longer be finished";
+
 /** A fenced write matched no row: another runner claimed the job, and this one must stop. */
 class LeaseLostError extends Error {
   constructor(jobId: string) {
@@ -186,6 +209,11 @@ interface JobRun {
   leaseId: string;
   userId: string;
   tokenId: string | null;
+  /**
+   * The stage this run last wrote, seeded from the claimed row: what setStage checks each move against
+   * BRIEF_JOB_STAGE_TRANSITIONS from. A string, since the column has no CHECK.
+   */
+  stage: string;
 }
 
 /**
@@ -199,17 +227,22 @@ interface JobRun {
 export async function runBriefJob(jobId: string): Promise<void> {
   const job = await claimBriefJob(jobId);
   if (!job) return;
-  const run: JobRun = { jobId, leaseId: job.lease_id!, userId: job.user_id, tokenId: job.token_id };
+  const run: JobRun = { jobId, leaseId: job.lease_id!, userId: job.user_id, tokenId: job.token_id, stage: job.stage };
 
   const stopHeartbeat = startHeartbeat(run);
   try {
     try {
       await ensureJobMayContinue(run);
       await driveJob(run, job);
+      // Checked before the write, recorded only once it lands: a done write that fails leaves this run at
+      // its last stage, so the failure that follows is checked from there, not from a done it never reached.
+      checkStageMove(run, "done");
       await updateJob(run, { status: "done", stage: "done", error: null, finished_at: new Date().toISOString() });
+      run.stage = "done";
     } catch (err) {
       if (err instanceof LeaseLostError) throw err;
       console.error(`Brief job ${jobId} failed:`, err);
+      noteStageMove(run, "failed");
       await updateJob(run, {
         status: "failed",
         stage: "failed",
@@ -252,15 +285,10 @@ async function ensureJobMayContinue(run: JobRun): Promise<void> {
       .eq("id", run.tokenId)
       .maybeSingle();
     if (error) throw new Error(`Token lookup failed: ${error.message}`);
-    if (!token || token.revoked_at || isExpired(token.expires_at)) throw new JobAccessError(TOKEN_REVOKED_MESSAGE);
+    // A token gone from the table reads as revoked: it can't be used either way.
+    if (!token || !tokenStatusIn(BEARER_USABLE_STATUSES, token)) throw new JobAccessError(TOKEN_REVOKED_MESSAGE);
   }
-  const { data: user, error: userError } = await db()
-    .from("users")
-    .select("is_allowed")
-    .eq("id", run.userId)
-    .maybeSingle();
-  if (userError) throw new Error(`User lookup failed: ${userError.message}`);
-  if (!user?.is_allowed) throw new JobAccessError(USER_NOT_ALLOWED_MESSAGE);
+  if (!(await isUserAllowed(run.userId))) throw new JobAccessError(USER_NOT_ALLOWED_MESSAGE);
 }
 
 /** A stage transition (fenced, so it also confirms the lease) followed by the access check: the gate before a paid step. */
@@ -272,7 +300,9 @@ async function beginPaidStage(run: JobRun, stage: BriefJobStage, extra: JobPatch
 // Stages that only run once the episode exists. A job past them with no episode_id lost its episode
 // (the user discarded the draft, and the foreign key cleared the id): preparing again would start and
 // bill a whole new brief.
-const EPISODE_STAGES = new Set<BriefJobStage>(["scripting", "rendering", "publishing"]);
+const EPISODE_STAGES: ReadonlySet<string> = new Set<BriefJobStage>(
+  BRIEF_JOB_STAGES.filter((stage) => BRIEF_JOB_STAGE_INFO[stage].needsEpisode)
+);
 
 async function driveJob(run: JobRun, job: BriefJobRow): Promise<void> {
   const { user_id: userId, params } = job;
@@ -280,7 +310,7 @@ async function driveJob(run: JobRun, job: BriefJobRow): Promise<void> {
 
   if (!episodeId) {
     if (EPISODE_STAGES.has(job.stage)) {
-      throw new DigestStageError(409, "This brief's draft was discarded before it finished", "episode gone");
+      throw new DigestStageError(409, DRAFT_DISCARDED_MESSAGE, "episode gone");
     }
     // A run cut off after syncing (stage selecting or writing) doesn't spend another sync slot.
     if (params.syncFirst && (job.stage === "queued" || job.stage === "syncing")) {
@@ -315,21 +345,18 @@ async function finishAudio(run: JobRun, episodeId: string, targetMinutes?: numbe
     .eq("id", episodeId)
     .maybeSingle();
   if (error) throw new Error(`Episode lookup failed: ${error.message}`);
-  if (!episode) throw new DigestStageError(404, "This brief's draft was discarded before it finished", "episode gone");
+  if (!episode) throw new DigestStageError(404, DRAFT_DISCARDED_MESSAGE, "episode gone");
 
-  // As /api/digest/status does: chunk progress only matters for an unfinished episode with a script.
-  const scriptLength = Array.isArray(episode.script) ? episode.script.length : 0;
-  const chunkStarts =
-    episode.status !== "ready" && scriptLength > 0 && episode.markdown_path
-      ? await listChunkStarts(episodeBasePath(episode.markdown_path))
-      : [];
-  const resume = deriveDigestStage({ status: episode.status, scriptLength, chunkStarts });
+  const resume = await resumePointFor(episode);
   if (resume.stage === "ready") return; // finished by an earlier run (or a markdown-only brief)
+  // A row no stage will act on (a failed episode): without this the zero-line resume point would fall
+  // through to publishing and ask finalize, a paid stage, only to be refused.
+  if (resume.stage === "none") throw new DigestStageError(409, DRAFT_UNFINISHABLE_MESSAGE, "episode not resumable");
 
   let { totalLines, nextCursor: cursor } = resume;
   if (resume.stage === "needs_script") {
     await beginPaidStage(run, "scripting");
-    ({ totalLines } = await scriptBrief(userId, episodeId, targetMinutes));
+    ({ totalLines } = await draftStillThere(() => scriptBrief(userId, episodeId, targetMinutes)));
     cursor = 0;
   }
 
@@ -341,7 +368,7 @@ async function finishAudio(run: JobRun, episodeId: string, targetMinutes?: numbe
       // Every chunk spends voice credits: check access before each, not only at the loop's start.
       if (!first) await ensureJobMayContinue(run);
       first = false;
-      const rendered = await renderChunk(userId, episodeId, cursor);
+      const rendered = await draftStillThere(() => renderChunk(userId, episodeId, cursor));
       cursor = rendered.nextCursor;
       totalLines = rendered.totalLines;
       await updateJob(run, {
@@ -354,7 +381,23 @@ async function finishAudio(run: JobRun, episodeId: string, targetMinutes?: numbe
   }
 
   await beginPaidStage(run, "publishing", { rendered_lines: totalLines, total_lines: totalLines });
-  await finalizeBrief(userId, episodeId);
+  await draftStillThere(() => finalizeBrief(userId, episodeId));
+}
+
+/**
+ * Runs one audio stage call, reading its 404 as what it means here: the user discarded the draft from the
+ * dashboard while the job worked on it. The stage functions answer 404 with their own wording ("Episode
+ * not found", "Episode has no script"), which is about a request, not about this job.
+ */
+async function draftStillThere<T>(call: () => Promise<T>): Promise<T> {
+  try {
+    return await call();
+  } catch (err) {
+    if (err instanceof DigestStageError && err.status === 404) {
+      throw new DigestStageError(404, DRAFT_DISCARDED_MESSAGE, `episode gone: ${err.logDetail ?? err.publicMessage}`);
+    }
+    throw err;
+  }
 }
 
 /**
@@ -369,11 +412,17 @@ async function syncBookmarks(run: JobRun): Promise<void> {
   let pending = pendingAnalysis;
   while (pending > 0) {
     await checkUsage(userId, "enrich");
-    const ingest = await ingestPending(userId, 15);
-    const enrich = await enrichNewBookmarks(userId, 60);
+    const ingest = await ingestPending(userId, PIPELINE_CHUNK.ingest);
+    const enrich = await enrichNewBookmarks(userId, PIPELINE_CHUNK.enrich, PIPELINE_CHUNK.enrichCalls);
     await updateJob(run, { heartbeat_at: new Date().toISOString() });
-    const remaining = Math.max(ingest.remaining, enrich.remaining);
-    if (ingest.ingested === 0 && enrich.enriched === 0 && remaining > 0) {
+    const { remaining, stalled } = pipelineProgress({
+      ingested: ingest.ingested,
+      enriched: enrich.enriched,
+      missed: enrich.missed,
+      ingestRemaining: ingest.remaining,
+      enrichRemaining: enrich.remaining,
+    });
+    if (stalled) {
       // The dashboard stops here too. The posts still unanalyzed are selected all the same, untagged.
       console.error(`Brief job ${jobId}: analysis stalled with ${remaining} bookmarks left; continuing`);
       break;
@@ -405,8 +454,30 @@ async function updateJob(run: JobRun, patch: JobPatch): Promise<void> {
 }
 
 /** A stage transition, which is also a heartbeat. */
-function setStage(run: JobRun, stage: BriefJobStage, extra: JobPatch = {}): Promise<void> {
-  return updateJob(run, { stage, heartbeat_at: new Date().toISOString(), ...extra });
+async function setStage(run: JobRun, stage: BriefJobStage, extra: JobPatch = {}): Promise<void> {
+  noteStageMove(run, stage);
+  await updateJob(run, { stage, heartbeat_at: new Date().toISOString(), ...extra });
+}
+
+/** The line noteStageMove logs, so a test can look for it. */
+export const UNEXPECTED_STAGE_MOVE = "unexpected stage move";
+
+/**
+ * Records the stage this run moves to, and logs a move BRIEF_JOB_STAGE_TRANSITIONS doesn't list. It never
+ * throws: the table is an observability check on the runner, not a gate, and a job stopped over a
+ * bookkeeping gap would cost the user a brief they paid for.
+ */
+function noteStageMove(run: JobRun, to: BriefJobStage): void {
+  checkStageMove(run, to);
+  run.stage = to;
+}
+
+/** The table check alone, for a move recorded only after its write lands. */
+function checkStageMove(run: JobRun, to: BriefJobStage): void {
+  const from = run.stage;
+  if (!isBriefJobStage(from) || !canMoveBriefJobStage(from, to)) {
+    console.error(`Brief job ${run.jobId}: ${UNEXPECTED_STAGE_MOVE} ${from} -> ${to}`);
+  }
 }
 
 /**
@@ -493,27 +564,59 @@ export async function findBriefJob(userId: string, lookup: BriefJobLookup): Prom
   return null;
 }
 
-/** A job row as a status report: the episode's title once there is one, and its links once it's done. */
-export async function describeBriefJob(job: BriefJobRow): Promise<BriefJobStatus> {
+export interface DescribeBriefJobOptions {
+  /** The caller may restart a stalled job (its token has write access). Default false. */
+  canRestart?: boolean;
+  /** This poll just scheduled a new runner for the job (maybeRescheduleBriefJob said so). Default false. */
+  rescheduled?: boolean;
+}
+
+/**
+ * A job row as a status report: the episode's title once there is one, its links whenever it is ready,
+ * and what the caller should do next (briefJobOutlook), from the job and its episode together.
+ */
+export async function describeBriefJob(job: BriefJobRow, opts: DescribeBriefJobOptions = {}): Promise<BriefJobStatus> {
   let title: string | null = null;
   let links: BriefJobStatus["links"] = null;
+  let episodeStatus: BriefJobStatus["episode_status"] = null;
   if (job.episode_id) {
-    const { data: episode, error } = await db()
+    const { data, error } = await db()
       .from("episodes")
-      .select("id, title, audio_path")
+      .select("id, title, status, audio_path, audio_pruned_at")
       .eq("user_id", job.user_id)
       .eq("id", job.episode_id)
       .maybeSingle();
     if (error) throw new Error(`Episode lookup failed: ${error.message}`);
+    const episode = data as {
+      id: string;
+      title: string | null;
+      status: string;
+      audio_path: string | null;
+      audio_pruned_at?: string | null;
+    } | null;
     if (episode) {
       title = episode.title ?? null;
-      if (job.status === "done") {
+      // Only the two statuses a job can leave behind; nothing writes a failed episode.
+      if (episode.status === EPISODE_STATUS.draft || episode.status === EPISODE_STATUS.ready) episodeStatus = episode.status;
+      if (episode.status === EPISODE_STATUS.ready) {
         // The stable routes, which mint a fresh signed URL on every visit, so a link in a chat keeps working.
         const base = `${appUrl()}/api/episodes/${episode.id}`;
-        links = { markdown: `${base}/markdown`, audio: episode.audio_path ? `${base}/audio` : null };
+        const playable =
+          audioAvailability({ audio_path: episode.audio_path, audio_pruned_at: episode.audio_pruned_at ?? null }) === "available";
+        links = { markdown: `${base}/markdown`, audio: playable ? `${base}/audio` : null };
       }
     }
   }
+  const outlook = briefJobOutlook({
+    status: job.status,
+    heartbeat_at: job.heartbeat_at,
+    created_at: job.created_at,
+    episodeStatus,
+    staleSeconds: briefJobStaleSeconds(),
+    now: Date.now(),
+    canRestart: opts.canRestart ?? false,
+    rescheduled: opts.rescheduled ?? false,
+  });
   return {
     job_id: job.id,
     status: job.status,
@@ -525,6 +628,12 @@ export async function describeBriefJob(job: BriefJobRow): Promise<BriefJobStatus
     error: job.error,
     started_at: job.started_at,
     finished_at: job.finished_at,
+    // The column has no CHECK; a stage this code doesn't know is shown as it is stored.
+    stage_label: isBriefJobStage(job.stage) ? BRIEF_JOB_STAGE_INFO[job.stage].label : String(job.stage),
+    stalled: outlook.stalled,
+    next_action: outlook.next_action,
+    note: outlook.note,
+    episode_status: episodeStatus,
   };
 }
 
@@ -533,9 +642,13 @@ export async function describeBriefJob(job: BriefJobRow): Promise<BriefJobStatus
  * A status tool that should also keep the job moving uses findBriefJob, then maybeRescheduleBriefJob,
  * then describeBriefJob.
  */
-export async function getBriefJobStatus(userId: string, lookup: BriefJobLookup): Promise<BriefJobStatus | null> {
+export async function getBriefJobStatus(
+  userId: string,
+  lookup: BriefJobLookup,
+  opts: DescribeBriefJobOptions = {}
+): Promise<BriefJobStatus | null> {
   const job = await findBriefJob(userId, lookup);
-  return job ? describeBriefJob(job) : null;
+  return job ? describeBriefJob(job, opts) : null;
 }
 
 /**
@@ -545,10 +658,9 @@ export async function getBriefJobStatus(userId: string, lookup: BriefJobLookup):
  * claimed loses the claim and stops, so calling it on every status poll is safe.
  */
 export function maybeRescheduleBriefJob(job: Pick<BriefJobRow, "id" | "status" | "heartbeat_at">): boolean {
-  const stale =
-    job.status === "running" &&
-    job.heartbeat_at !== null &&
-    Date.now() - Date.parse(job.heartbeat_at) > briefJobStaleSeconds() * 1000;
+  // Queued always (its runner may still be about to start, and a second one just loses the claim); running
+  // only once briefJobStalled, the same rule a status report's `stalled` uses, says its heartbeat is stale.
+  const stale = job.status === "running" && briefJobStalled(job, briefJobStaleSeconds(), Date.now());
   if (job.status !== "queued" && !stale) return false;
   scheduleBriefJob(job.id);
   return true;

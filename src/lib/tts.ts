@@ -2,10 +2,8 @@ import type { ScriptLine } from "./brain";
 import { getVoiceProvider } from "./voice";
 import type { VoiceProvider } from "./voice";
 
-// Script lines rendered per /api/digest/render call (and per uploaded chunk file).
-// Shared with the render route and the status route's resume-cursor math — keep
-// them importing this instead of redeclaring the number so they can't drift.
-export const LINES_PER_CALL = 12;
+// The chunk width lives with the rest of the episode vocabulary; re-exported so existing imports keep working.
+export { LINES_PER_CALL } from "./state/episode";
 
 /**
  * Renders dialogue lines with each host's voice and stitches the segments.

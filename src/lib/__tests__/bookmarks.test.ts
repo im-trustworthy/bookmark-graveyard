@@ -3,7 +3,9 @@ import {
   analysisOf,
   filterByDateRange,
   filterByTopics,
+  isAnalysisFailed,
   matchesQuery,
+  stageOf,
   topicCounts,
 } from "@/lib/bookmarks";
 import type { BookmarkAnalysis, BookmarkRow } from "@/lib/bookmarks";
@@ -167,5 +169,25 @@ describe("matchesQuery", () => {
     expect(matchesQuery(bare, "hello")).toBe(true);
     expect(matchesQuery(bare, "null")).toBe(false);
     expect(matchesQuery(bare, "undefined")).toBe(false);
+  });
+});
+
+describe("stageOf and isAnalysisFailed", () => {
+  const ingested_at = "2026-10-06T00:00:00Z";
+
+  it("reads the stage from ingested_at, the analysis join and the attempt count", () => {
+    expect(stageOf(post("1"))).toBe("synced");
+    expect(stageOf(post("2", { ingested_at }))).toBe("ingested");
+    expect(stageOf(post("3", { ingested_at, analysis_attempts: 2 }))).toBe("ingested");
+    expect(stageOf(post("4", { ingested_at, analysis_attempts: 3 }))).toBe("analysis_failed");
+    expect(stageOf(post("5", { ingested_at, analysis_attempts: 3, bookmark_analysis: [analysis(["ai"])] }))).toBe("analysed");
+    expect(stageOf(post("6", { ingested_at, bookmark_analysis: [] }))).toBe("ingested");
+  });
+
+  it("is failed only for a given-up post", () => {
+    expect(isAnalysisFailed(post("1", { ingested_at, analysis_attempts: 3 }))).toBe(true);
+    expect(isAnalysisFailed(post("2", { ingested_at, analysis_attempts: 1 }))).toBe(false);
+    expect(isAnalysisFailed(post("3", { ingested_at, analysis_attempts: 3, bookmark_analysis: analysis([]) }))).toBe(false);
+    expect(isAnalysisFailed(post("4", { analysis_attempts: 3 }))).toBe(false); // not ingested
   });
 });
